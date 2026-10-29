@@ -1,5 +1,10 @@
 # N-04: preserve JSON string identity before cJSON parsing
 
+This records the original N-04 batch and its test counts. The subsequent
+[N-06 durable repair](DURABLE_JSON_IDENTITY_2026-10-29.md) extends the shared
+guard to malformed Unicode escapes and the protocol suite to 166 cases / 266
+checks, and completes the preservation-aware local pack/journal follow-up.
+
 Baseline: firmware `2410a6b`. SDK cJSON exposes decoded string values and member
 names as NUL-terminated pointers without their decoded lengths. A JSON value
 `"req\u0000shadow"` therefore becomes `"req"` when copied to `std::string` or

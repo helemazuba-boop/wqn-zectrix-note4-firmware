@@ -1,8 +1,9 @@
 # N-06, part 1: pack text framing and JSON identity
 
-Baseline: firmware `47836e7`. N-06 is confirmed and only partly repaired by
-this batch. The Word/Note/Problem pack paths are repaired locally; the problem
-outbox and sync journal require a separate preservation-aware repair.
+Baseline: firmware `47836e7`. This document records the pack portion of N-06.
+The Word/Note/Problem pack paths were repaired in this batch; the subsequent
+[durable repair](DURABLE_JSON_IDENTITY_2026-10-29.md) completes local remediation
+of the Problem outbox and sync-journal paths. Device acceptance remains pending.
 
 The dedicated host harness compiles the actual three bounded line readers,
 row parsers and complete pack-to-index scans with SDK cJSON. Synthetic pack
@@ -73,12 +74,12 @@ newlib latency and task high-water marks still need device acceptance. This
 batch does not claim a throughput improvement or prove physical power-loss
 recovery, download SHA verification or renderer behavior.
 
-Separately archived probes establish remaining N-06 impact using actual durable
+Separately archived probes established the remaining N-06 impact at this batch using actual durable
 codecs and transactions. Four Problem outbox cases (request value/key, problem
 ID and timestamp) decode/peek as the truncated prefix; an ACK for that prefix
 removes the original raw record during rewrite. Two sync-journal cases load a
 NUL-aliased cursor key or truncated blocked-image value and subsequently rotate
-that primary as if valid. These are observations of unfixed behavior. The
+that primary as if valid. These record the then-unfixed behavior. The
 existing outbox and journal regression suites still pass 4,716 and 34 checks;
 their green status does not validate NUL identity or close N-06. The standalone
 probes are archived rather than committed as tests that bless the bad result.
@@ -90,7 +91,8 @@ so merely replacing its depth-only guard would be insufficient. That remaining
 repair must distinguish unrepresentable records from known corrupt frames and
 preserve durable bytes through all query/ACK/park/append/recovery paths. This
 batch changes neither `problem_store.cpp` nor `storage.cpp` and does not mark
-the overall follow-up repaired.
+the overall follow-up repaired at this batch. The linked durable repair supplies
+the subsequent implementation, preservation policy and verification.
 
 Logs, probe adapters and source/build identities are under
 `/home/unknow/projects/doc/robustness-remediation-20261029/n06/`. All inputs are

@@ -23,7 +23,9 @@ def main():
                                              'unchecked-action','unchecked-time','leak-encoder',
                                              'parse-null-is-malformed','parse-null-is-unavailable',
                                              'ignore-read-oom','ignore-commit-oom','ignore-peek-oom',
-                                             'ignore-remove-oom','ignore-snapshot-oom','ignore-suspend-oom'))
+                                             'ignore-remove-oom','ignore-snapshot-oom','ignore-suspend-oom',
+                                             'accept-opaque','drop-read-opaque','drop-ack-opaque',
+                                             'hide-opaque-count','truncate-producer-time'))
     parser.add_argument('--idf-path',type=Path,default=Path(os.environ.get('IDF_PATH','/home/unknow/esp/esp-idf-v5.5')))
     args=parser.parse_args()
     cjson=args.idf_path/'components/json/cJSON'
@@ -34,7 +36,23 @@ def main():
         raise SystemExit('gcc/g++ unavailable')
     body=args.source.read_text()
     if args.mutation:
-        if args.mutation.startswith('parse-null-is-'):
+        if args.mutation in ('accept-opaque','drop-read-opaque','drop-ack-opaque','hide-opaque-count','truncate-producer-time'):
+            if args.mutation=='accept-opaque':
+                old,new='if (!wqn::protocol::JsonStringsRepresentable(line.data(), line.size()))','if (false)'
+            elif args.mutation=='drop-read-opaque':
+                old,new='''if (decoded == ObservationDecode::kValid ||
+                    decoded == ObservationDecode::kPreserved)''','if (decoded == ObservationDecode::kValid)'
+            elif args.mutation=='drop-ack-opaque':
+                old,new='''if (decoded == ObservationDecode::kPreserved) {
+            retained.push_back(line);''','''if (false) {
+            retained.push_back(line);'''
+            elif args.mutation=='hide-opaque-count':
+                old,new='''if (decoded == ObservationDecode::kPreserved) {
+            ++suspended;''','''if (false) {
+            ++suspended;'''
+            else:
+                old,new="observation.occurred_at.find('\\0') == std::string::npos",'true'
+        elif args.mutation.startswith('parse-null-is-'):
             old = '''return ObservationJsonSyntax(line).Complete()
             ? ObservationDecode::kUnavailable : ObservationDecode::kMalformed;'''
             new = ('return ObservationDecode::kMalformed;' if args.mutation.endswith('malformed')
@@ -87,6 +105,7 @@ def main():
     action=section(names,'const char* ReviewActionName(', '\nbool ParseProblemStatus(')
     fixture=fixture[:a]+'''#include "problem_store.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_syntax_probe.h"
 #include "cJSON.h"
 namespace wqn::protocol::problem_study_v1 {
 '''+action+'\n}\n'+fixture[b:]
@@ -108,19 +127,23 @@ namespace wqn::protocol::problem_study_v1 {
     for marker,value in parts.items():
         assert fixture.count(marker)==1,marker
         fixture=fixture.replace(marker,value)
+    identity=(root/'scripts/testdata/problem_outbox_identity.cpp').read_text()
+    fixture=fixture.replace('int main(int argc, char** argv) {',identity+'\nint main(int argc, char** argv) {')
+    fixture=fixture.replace('    DecoderAllocationCases();','    DecoderAllocationCases();\n    IdentityPreservationCases();')
     with tempfile.TemporaryDirectory(prefix='note4-problem-recovery-') as tmp:
         directory=Path(tmp); (directory/'esp_err.h').write_text(ERR)
         unit=directory/'problem.cpp'; unit.write_text(fixture)
-        flags=['-fsanitize=address,undefined','-fno-omit-frame-pointer']
+        flags=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer','-fno-pie']
         subprocess.run([cc,'-std=c99',*flags,'-I',str(cjson),'-c',str(cjson/'cJSON.c'),'-o',str(directory/'cJSON.o')],check=True,timeout=30)
         binary=directory/'test'
-        subprocess.run([cxx,'-std=c++17','-Wall','-Wextra','-Werror','-fno-builtin',*flags,
+        subprocess.run([cxx,'-std=c++17','-Wall','-Wextra','-Werror','-fno-builtin',*flags,'-no-pie',
                         '-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="host"','-DWQN_PROBLEM_STUDY_SCHEMA_SHA256="host"',
                         '-I',str(directory),'-I',str(root/'main'),'-I',str(root/'components/device_protocol/include'),
                         '-I',str(cjson),str(unit),str(directory/'cJSON.o'),'-o',str(binary),
                         '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=cJSON_CreateObject,--wrap=cJSON_ParseWithOpts'],
                        check=True,timeout=60)
-        return subprocess.run([str(binary),tmp],timeout=30).returncode
+        return subprocess.run([str(binary),tmp],timeout=30,env=dict(os.environ,
+                              ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1')).returncode
 
 
 if __name__=='__main__':

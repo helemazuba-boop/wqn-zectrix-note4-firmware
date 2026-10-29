@@ -12,6 +12,7 @@
 #include <vector>
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_syntax_probe.h"
 #include "storage.h"
 #include "services/sync_service.h"
 using wqn::SyncJournal;
@@ -298,6 +299,14 @@ int main() {
     Reset(); load_error=ESP_FAIL; g_sync_journal_loaded=false; g_control_state_loaded=false;
     Check(EnsureControlStateLoaded()!=ESP_OK && !g_control_state_loaded,
         "invalid journal does not silently fall back to legacy NVS");
+    for(const int error:{ESP_ERR_NOT_SUPPORTED,ESP_ERR_NO_MEM}) {
+        Reset();load_error=error;g_sync_journal_loaded=false;g_control_state_loaded=false;
+        Check(EnsureControlStateLoaded()==error && !g_control_state_loaded && !g_sync_journal_loaded &&
+              rpc_ids.empty(),"preservation/decode-memory errors cannot mark sync ready or invoke a control RPC");
+        load_error=ESP_OK;
+        Check(EnsureControlStateLoaded()==ESP_OK && g_control_state_loaded,
+              "control startup retries normally after checkpoint recovery");
+    }
     Reset(); durable_journal.problem_packs.phase=wqn::SyncJournalPhase::kInstalling;
     durable_journal.problem_packs.desired_revision=7;
     g_sync_journal_loaded=false; fail_journal_calls={1};

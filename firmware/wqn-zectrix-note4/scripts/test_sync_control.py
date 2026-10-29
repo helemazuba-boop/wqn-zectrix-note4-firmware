@@ -33,6 +33,7 @@ def main():
         (sync, 'esp_err_t EnsureControlStateLoaded()', '\nstd::string RandomControlId('),
         (sync, 'wqn::protocol::v3::RequestMetadata MakeControlMetadata()', '\nstd::string DeviceHardwareId('),
         (store, 'esp_err_t JsonToString(', '\nesp_err_t ReadStorageTextFile('),
+        (store, 'bool SyncJournalHasUnrepresentableStrings(', '\nesp_err_t ParseSyncJournalPayload(const std::string& payload, wqn::SyncJournal* journal);'),
         (store, 'void AddJournalContentState(', '\nesp_err_t RemovePrototypeProblemFile('),
         (store, 'std::string g_sync_journal_durable_payload;', '\nstruct SyncJournalSaveContext'),
         (sync, 'TickType_t SchedulerWaitDelay()', '\nuint32_t FullSyncFailureRetryMs('),

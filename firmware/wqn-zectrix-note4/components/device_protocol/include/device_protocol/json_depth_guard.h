@@ -46,8 +46,9 @@ inline bool JsonNestingWithinLimit(const char* data, std::size_t length,
 
 // cJSON exposes decoded names/values as NUL-terminated pointers, without a
 // length. A JSON U+0000 therefore aliases its prefix at subsequent key/ID/enum
-// comparisons. Inspect the original bounded bytes, including raw NULs after
-// an otherwise complete document, before cJSON can erase that distinction.
+// comparisons. Malformed hex escapes also decode to zero in cJSON. Inspect
+// the bounded bytes, including raw NULs after an otherwise complete document,
+// before cJSON can erase that distinction.
 inline bool JsonStringsRepresentable(const char* data, std::size_t length)
 {
     if (data == nullptr) return length == 0;
@@ -56,9 +57,18 @@ inline bool JsonStringsRepresentable(const char* data, std::size_t length)
         const char c = data[i];
         if (c == '\0') return false;
         if (escaped) {
-            if (c == 'u' && length - i > 4 && data[i + 1] == '0' &&
-                data[i + 2] == '0' && data[i + 3] == '0' && data[i + 4] == '0') {
-                return false;
+            if (c == 'u') {
+                if (length - i <= 4) return false;
+                unsigned value = 0;
+                for (std::size_t digit = 1; digit <= 4; ++digit) {
+                    const char hex = data[i + digit];
+                    value <<= 4;
+                    if (hex >= '0' && hex <= '9') value += hex - '0';
+                    else if (hex >= 'a' && hex <= 'f') value += hex - 'a' + 10;
+                    else if (hex >= 'A' && hex <= 'F') value += hex - 'A' + 10;
+                    else return false; // cJSON maps malformed hex escapes to zero.
+                }
+                if (value == 0) return false;
             }
             escaped = false;
         } else if (c == '\\') {
@@ -68,9 +78,9 @@ inline bool JsonStringsRepresentable(const char* data, std::size_t length)
     return true;
 }
 
-// External protocol boundary: depth and cJSON string representability only.
-// The JSON parser still owns syntax validation. Local persistence decoders
-// retain their independent repair/preservation policy and depth-only helper.
+// Depth and cJSON string representability; the parser owns other syntax.
+// Durable decoders must separately define preservation/recovery for rejected
+// strings rather than treating every guard failure as disposable corruption.
 inline bool JsonInputWithinLimits(const char* data, std::size_t length,
                                   std::size_t max_depth = kMaxJsonNestingDepth)
 {

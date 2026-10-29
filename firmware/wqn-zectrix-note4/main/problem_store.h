@@ -23,8 +23,8 @@ struct DurableProblemObservation {
 
 struct ProblemOutboxSnapshot {
     size_t pending_count = 0;
-    // Verdicts parked by SuspendPendingProblemObservation: excluded from the
-    // upload queue but still resident on device awaiting intervention.
+    // Parked verdicts and complete records whose strings cJSON cannot safely
+    // decode: excluded from upload, retained on device awaiting intervention.
     size_t suspended_count = 0;
     size_t capacity = 0;
 };

@@ -104,7 +104,7 @@ extern "C" size_t __wrap_fwrite(const void* data, size_t size, size_t count, FIL
 std::string EncodeObservationLine(const Observation& value) {
     return value.request_id + '|' + value.problem_id + '|' + value.occurred_at;
 }
-enum class ObservationDecode { kValid, kMalformed, kUnavailable };
+enum class ObservationDecode { kValid, kMalformed, kUnavailable, kPreserved };
 ObservationDecode DecodeObservationLine(const std::string& line, Observation* out) {
     const size_t a = line.find('|'), b = line.find('|', a + 1);
     if (a == std::string::npos || b == std::string::npos) return ObservationDecode::kMalformed;
@@ -421,8 +421,10 @@ static void DecoderAllocationCases() {
         const auto decoded = DecodeObservationLine(line, &out);
         encode_allocations = false;
         const unsigned sites = encoder_allocations;
-        Check(decoded == ObservationDecode::kValid && out.request_id == a.request_id,
-              "legacy JSON syntax remains readable with extra fields and BOM/whitespace");
+        const bool representable = wqn::protocol::JsonStringsRepresentable(line.data(), line.size());
+        Check(representable ? decoded == ObservationDecode::kValid && out.request_id == a.request_id
+                            : decoded != ObservationDecode::kValid && out.request_id.empty(),
+              "representable legacy JSON stays readable; zero-decoding strings stay opaque");
         for (unsigned site = 0; site < sites; ++site) {
             encode_allocations = true; encoder_allocations = 0; fail_encoder_at = static_cast<int>(site); encoder_denials = 0;
             const auto result = DecodeObservationLine(line, &out);

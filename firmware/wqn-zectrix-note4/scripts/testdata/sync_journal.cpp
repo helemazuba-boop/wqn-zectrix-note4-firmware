@@ -5,10 +5,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <unistd.h>
 #include "storage.h"
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_syntax_probe.h"
 using wqn::SyncJournal;
 using wqn::SyncJournalContentState;
 constexpr const char* kTag="host-journal";

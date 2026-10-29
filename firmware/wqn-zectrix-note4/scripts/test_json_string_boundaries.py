@@ -21,7 +21,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--before')
     parser.add_argument('--cases-json',type=Path)
-    parser.add_argument('--mutation',choices=('raw-nul','escaped-nul','escape-parity','word-boundary','sse-boundary','portal-boundary'))
+    parser.add_argument('--mutation',choices=('raw-nul','escaped-nul','escape-parity','bad-hex','word-boundary','sse-boundary','portal-boundary'))
     args=parser.parse_args()
 
     def source(name):
@@ -70,6 +70,10 @@ def main():
         add(kind,base,'raw-tail-nul',False,wire=json.dumps(base)+'\0ignored')
         alias=copy.deepcopy(base); alias['extension']=r'\u0000'; add(kind,base,'literal-backslash-u0000',True,alias)
         alias=copy.deepcopy(base); alias['extension']='\x01\n\t中文😀'; add(kind,base,'representable-controls-and-unicode',True,alias)
+        wire=json.dumps(base,ensure_ascii=True,separators=(',',':'))
+        add(kind,base,'malformed-unicode-value',False,wire=wire.replace(base['request_id'],base['request_id']+r'\u0z00shadow',1))
+        add(kind,base,'malformed-unicode-key',False,wire=wire.replace('"request_id":',r'"request_id\uZZZZshadow":',1))
+        add(kind,base,'malformed-unicode-unknown',False,wire=wire.replace('{',r'{"extra":"x\uxxxxy",',1))
         # A full JSON string value must not become its valid enum/ID prefix.
         alias=copy.deepcopy(base)
         def suffix_first(value):
@@ -122,12 +126,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wqn-json-boundary-') as directory:
         tmp=Path(directory); (tmp/'device_protocol').mkdir()
         guard=source('components/device_protocol/include/device_protocol/json_depth_guard.h')
-        if args.mutation in ('raw-nul','escaped-nul','escape-parity'):
+        if args.mutation in ('raw-nul','escaped-nul','escape-parity','bad-hex'):
             start=guard.index('inline bool JsonStringsRepresentable(')
             prefix,tail=guard[:start],guard[start:]
             changes={'raw-nul':("if (c == '\\0') return false;","if (false && c == '\\0') return false;"),
-                     'escaped-nul':("if (c == 'u' &&","if (false && c == 'u' &&"),
-                     'escape-parity':('            escaped = false;',"            escaped = c == '\\\\';")}
+                     'escaped-nul':("if (c == 'u')","if (false && c == 'u')"),
+                     'escape-parity':('            escaped = false;',"            escaped = c == '\\\\';"),
+                     'bad-hex':('else return false; // cJSON maps malformed hex escapes to zero.',
+                                 'else value = 1; // mutation: accept malformed hex as nonzero.')}
             old,new=changes[args.mutation]; assert tail.count(old)==1
             guard=prefix+tail.replace(old,new)
         flags.append('-DHAS_JSON_INPUT_GUARD='+str(int('inline bool JsonInputWithinLimits(' in guard)))

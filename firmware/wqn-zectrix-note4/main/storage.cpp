@@ -16,6 +16,7 @@
 
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "device_protocol/json_syntax_probe.h"
 #include "config.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -573,10 +574,38 @@ esp_err_t ReadStorageTextFile(const char* path, std::string* output)
     return std::fclose(file) == 0 ? ESP_OK : ESP_FAIL;
 }
 
+// Raw zero bytes retain the existing corrupt-frame policy. Active or malformed
+// Unicode escapes that cJSON would collapse must preserve their durable source.
+bool SyncJournalHasUnrepresentableStrings(const std::string& payload)
+{
+    return payload.find('\0') == std::string::npos &&
+        !wqn::protocol::JsonStringsRepresentable(payload.data(), payload.size());
+}
+
 esp_err_t ParseSyncJournalPayload(const std::string& payload, wqn::SyncJournal* journal);
 
 esp_err_t WriteSyncJournalFileAtomic(const std::string& payload)
 {
+    // Classify durable sources before creating/truncating a staging file.
+    // Unsupported strings and decode OOM are not permission to remove a
+    // checkpoint, fall back to an older identity, or overwrite its backup.
+    std::string previous_payload;
+    wqn::SyncJournal previous;
+    const esp_err_t read_result = ReadStorageTextFile(kSyncJournalPath, &previous_payload);
+    const esp_err_t parse_result = read_result == ESP_OK
+        ? ParseSyncJournalPayload(previous_payload, &previous) : read_result;
+    if (parse_result == ESP_ERR_NOT_SUPPORTED || parse_result == ESP_ERR_NO_MEM) return parse_result;
+    if (read_result != ESP_OK && read_result != ESP_ERR_NOT_FOUND &&
+        read_result != ESP_ERR_INVALID_STATE) return ESP_FAIL;
+    const bool primary_valid = parse_result == ESP_OK;
+    std::string backup_payload;
+    const esp_err_t backup_read = ReadStorageTextFile(kSyncJournalBackupPath, &backup_payload);
+    if (backup_read == ESP_OK && SyncJournalHasUnrepresentableStrings(backup_payload)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (backup_read != ESP_OK && backup_read != ESP_ERR_NOT_FOUND &&
+        backup_read != ESP_ERR_INVALID_STATE) return ESP_FAIL;
+
     FILE* file = std::fopen(kSyncJournalTempPath, "wb");
     if (file == nullptr) {
         return ESP_FAIL;
@@ -587,19 +616,6 @@ esp_err_t WriteSyncJournalFileAtomic(const std::string& payload)
         ::fsync(fileno(file)) == 0;
     const bool closed = std::fclose(file) == 0;
     if (!complete || !flushed || !closed) {
-        std::remove(kSyncJournalTempPath);
-        return ESP_FAIL;
-    }
-    // Never rotate a corrupt primary over the valid backup we recovered from.
-    // Until the new primary is published, retain at least the previous valid
-    // source. API-call fault seams verify this ordering, not NOR power safety.
-    std::string previous_payload;
-    wqn::SyncJournal previous;
-    const esp_err_t read_result = ReadStorageTextFile(kSyncJournalPath, &previous_payload);
-    const bool primary_valid = read_result == ESP_OK &&
-        ParseSyncJournalPayload(previous_payload, &previous) == ESP_OK;
-    if (read_result != ESP_OK && read_result != ESP_ERR_NOT_FOUND &&
-        read_result != ESP_ERR_INVALID_STATE) {
         std::remove(kSyncJournalTempPath);
         return ESP_FAIL;
     }
@@ -820,10 +836,13 @@ esp_err_t ParseSyncJournalPayload(
     if (payload.empty() || payload.find('\0') != std::string::npos) {
         return ESP_ERR_INVALID_STATE;
     }
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(
-                      payload.data(), payload.size())
-        ? cJSON_ParseWithOpts(payload.c_str(), nullptr, true)
-        : nullptr;
+    if (SyncJournalHasUnrepresentableStrings(payload)) return ESP_ERR_NOT_SUPPORTED;
+    if (!wqn::protocol::JsonNestingWithinLimit(payload.data(), payload.size())) return ESP_ERR_INVALID_STATE;
+    cJSON* root = cJSON_ParseWithOpts(payload.c_str(), nullptr, true);
+    if (root == nullptr) {
+        return wqn::protocol::JsonSyntaxProbe(payload).Complete()
+            ? ESP_ERR_NO_MEM : ESP_ERR_INVALID_STATE;
+    }
     if (!cJSON_IsObject(root)) {
         cJSON_Delete(root);
         return ESP_ERR_INVALID_STATE;
@@ -1246,6 +1265,10 @@ esp_err_t LoadSyncJournal(SyncJournal* journal)
         primary_result = ParseSyncJournalPayload(payload, journal);
         if (primary_result == ESP_OK) {
             return ESP_OK;
+        }
+        if (primary_result == ESP_ERR_NOT_SUPPORTED || primary_result == ESP_ERR_NO_MEM) {
+            ESP_LOGW(kTag, "primary sync journal requires preservation: %s", esp_err_to_name(primary_result));
+            return primary_result;
         }
         ESP_LOGW(kTag, "primary sync journal invalid; trying backup");
     } else if (primary_result != ESP_ERR_NOT_FOUND) {
