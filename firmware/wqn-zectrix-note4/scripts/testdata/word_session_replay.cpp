@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <new>
 #include <string>
+#include <utility>
 #include <vector>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -17,6 +19,7 @@ constexpr esp_err_t ESP_ERR_INVALID_STATE = 0x103;
 constexpr esp_err_t ESP_ERR_INVALID_SIZE = 0x104;
 constexpr esp_err_t ESP_ERR_NOT_FOUND = 0x105;
 constexpr esp_err_t ESP_ERR_NO_MEM = 0x101;
+constexpr esp_err_t ESP_ERR_TIMEOUT = 0x107;
 constexpr const char* kTag = "replay-fixture";
 @@BATCH_ENABLED@@
 void FixtureLog(const char*, const char*, ...) {}
@@ -236,21 +239,30 @@ enum class SleepBlocker { kStorage };
 int active_leases = 0, acquired_leases = 0, released_leases = 0;
 bool lease_allowed = true;
 struct SleepLease {
-    bool held;
+    bool held=false;
+    SleepLease()=default;
     explicit SleepLease(bool acquired) : held(acquired) {
         if (held) { ++active_leases; ++acquired_leases; }
     }
     SleepLease(const SleepLease&) = delete;
-    ~SleepLease() { if (held) { --active_leases; ++released_leases; } }
+    SleepLease(SleepLease&& other) : held(std::exchange(other.held,false)) {}
+    ~SleepLease() { Reset(); }
+    void Reset() { if (held) { held=false; --active_leases; ++released_leases; } }
     explicit operator bool() const { return held; }
     static SleepLease TryAcquire(SleepBlocker, const char*, const char*, int) {
         return SleepLease(lease_allowed);
+    }
+    static SleepLease TryAcquireStoragePreparation(uint32_t generation, const char*, const char*, int) {
+        return SleepLease(generation!=0);
     }
 };
 }
 namespace wqn::services {
 esp_err_t ExecuteForegroundStorageTransaction(esp_err_t (*)(void*), void*, const char*);
 using StorageTransaction = esp_err_t (*)(void*);
+using StorageContextCleanup = void (*)(void*);
+esp_err_t ExecuteOwnedStorageTransactionUntil(StorageTransaction,void*,StorageContextCleanup,const char*,int64_t);
+int owned_dispatches=0;
 int dispatches = 0, inject_at = 0, fail_dispatch_at = 0;
 bool lease_expected = true, lease_continuous = true;
 std::function<void()> interleave;
@@ -265,6 +277,13 @@ esp_err_t ExecuteStorageTransactionNamed(StorageTransaction transaction, void* c
 }
 @@MAINTENANCE_DRIVER@@
 namespace wqn::services {
+esp_err_t ExecuteOwnedStorageTransactionUntil(StorageTransaction transaction,void* context,
+        StorageContextCleanup cleanup,const char*,int64_t deadline) {
+    ++owned_dispatches;
+    const auto result=transaction(context);
+    cleanup(context);
+    return esp_timer_get_time()>=deadline ? ESP_ERR_TIMEOUT : result;
+}
 esp_err_t ExecuteForegroundStorageTransaction(esp_err_t (*transaction)(void*), void* context, const char* owner) {
     return ExecuteStorageTransactionNamed(transaction, context, owner);
 }
@@ -300,6 +319,7 @@ void Reset() {
     wqn::runtime::active_leases = wqn::runtime::acquired_leases = wqn::runtime::released_leases = 0;
     wqn::runtime::lease_allowed = true;
     wqn::services::dispatches = wqn::services::inject_at = wqn::services::fail_dispatch_at = 0;
+    wqn::services::owned_dispatches=0;
     wqn::services::lease_expected = wqn::services::lease_continuous = true;
     wqn::services::interleave = {}; wqn::services::owners.clear();
     io_order.clear();
@@ -580,13 +600,24 @@ void TestMaintenanceDriver() {
           "maintenance dispatch failure does not lose the durable ACK and still reports an error");
 
     DueMaintenance(); wqn::runtime::lease_allowed = false; wqn::services::lease_expected = false;
+#if FIXTURE_OWNED_SLEEP
+    Check(wqn::PrepareWordObservationOutboxForSleep(1000000,42) == ESP_OK && compactions == 1 &&
+          wqn::services::dispatches == 8 && wqn::services::owned_dispatches == 1 &&
+          wqn::runtime::acquired_leases == 1 && wqn::runtime::released_leases == 1,
+          "sleep preparation owns its payload and generation-authorized lease across all owner steps");
+    DueMaintenance(); wqn::services::lease_expected = false;
+    Check(wqn::PrepareWordObservationOutboxForSleep(1,42) == ESP_ERR_TIMEOUT && compactions == 0 && reads == 0 &&
+          cache.acknowledged.size() == 1 && wqn::services::dispatches == 0,
+          "expired public sleep preparation returns timeout before starting maintenance");
+#else
     Check(wqn::PrepareWordObservationOutboxForSleep(0) == ESP_OK && compactions == 1 &&
           wqn::services::dispatches == 8 && wqn::runtime::acquired_leases == 0,
-          "sleep quiesce path uses owner steps directly without trying to acquire a rejected new lease");
+          "legacy sleep preparation directly dispatches caller-owned context");
     DueMaintenance(); wqn::services::lease_expected = false;
     Check(wqn::PrepareWordObservationOutboxForSleep(1) == ESP_OK && compactions == 0 && reads == 0 &&
           cache.acknowledged.size() == 1 && wqn::services::dispatches == 1,
-          "public sleep maintenance checks the absolute deadline inside the dispatched owner step");
+          "legacy sleep maintenance defers on its in-step deadline check");
+#endif
 }
 #endif
 

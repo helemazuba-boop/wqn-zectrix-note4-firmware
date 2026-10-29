@@ -72,10 +72,19 @@ public:
         const char* file = "unknown",
         int line = 0);
 
+    // Only storage work explicitly started by the current sleep preparation
+    // may acquire while quiescing. A stale/zero generation is rejected. This
+    // lease survives a timed-out caller and blocks a new normal sleep attempt.
+    static SleepLease TryAcquireStoragePreparation(
+        uint32_t generation, const char* holder, const char* file, int line);
+
     explicit operator bool() const { return active_; }
     void Reset();
 
 private:
+    static SleepLease TryAcquireInternal(
+        SleepBlocker blocker, const char* holder, const char* file, int line,
+        uint32_t preparation_generation);
     explicit SleepLease(SleepBlocker blocker, uint8_t slot, uint32_t lease_id)
         : blocker_(blocker), slot_(slot), lease_id_(lease_id), active_(true)
     {

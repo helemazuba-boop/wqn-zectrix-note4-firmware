@@ -215,6 +215,6 @@ esp_err_t SuspendPendingWordObservation(
     const std::string& request_id,
     OutboxSuspendReason reason);
 esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot);
-esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us);
+esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us, uint32_t generation);
 
 }  // namespace wqn

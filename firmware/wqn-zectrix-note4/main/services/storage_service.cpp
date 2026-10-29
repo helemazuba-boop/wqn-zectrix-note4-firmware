@@ -60,7 +60,33 @@ struct StorageCompletion {
     uint32_t request_id = 0;
     esp_err_t result = ESP_FAIL;
     std::atomic<uint32_t> state{kCompletionQueued};
+    // Non-null only for independently owned deadline requests. One reference
+    // belongs to the caller and one to the enqueued command, including across
+    // semaphore publication. Legacy stack-context transactions do not use it.
+    wqn::services::StorageContextCleanup owned_cleanup = nullptr;
+    void* owned_context = nullptr;
+    std::atomic<uint32_t> owned_references{2};
+    int64_t deadline_us = 0;
 };
+
+void ReleaseOwnedCompletion(StorageCompletion* completion)
+{
+    if (completion->owned_references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        completion->owned_cleanup(completion->owned_context);
+        delete completion;
+    }
+}
+
+TickType_t RemainingStorageDeadlineTicks(int64_t deadline_us)
+{
+    const int64_t now_us = esp_timer_get_time();
+    if (deadline_us <= now_us) return 0;
+    constexpr uint64_t tick_us = 1000000 / configTICK_RATE_HZ;
+    const uint64_t remaining_us = static_cast<uint64_t>(deadline_us - now_us);
+    const uint64_t ticks = remaining_us / tick_us + (remaining_us % tick_us != 0);
+    // Never turn a finite absolute deadline into an infinite RTOS wait.
+    return ticks >= portMAX_DELAY ? portMAX_DELAY - 1 : static_cast<TickType_t>(ticks);
+}
 
 StaticQueue_t g_background_queue_storage;
 uint8_t g_background_queue_buffer[
@@ -139,7 +165,8 @@ void StorageServiceTask(void*)
                 static_cast<unsigned long>(command.request_id),
                 command.owner == nullptr ? "unknown" : command.owner,
                 static_cast<long long>(queue_wait_ms));
-            delete completion;
+            if (completion->owned_cleanup != nullptr) ReleaseOwnedCompletion(completion);
+            else delete completion;
             continue;
         }
         esp_err_t result = ESP_FAIL;
@@ -148,9 +175,13 @@ void StorageServiceTask(void*)
             // run at the 40 MHz DFS floor. Boost for this transaction (which
             // has no running-time bound); idle operation may downclock.
             auto cpu_lease = wqn::runtime::CpuPerformanceLease::TryAcquire();
-            result = command.transaction == nullptr
-                ? ESP_ERR_INVALID_ARG
-                : command.transaction(command.context);
+            if (completion->deadline_us > 0 && esp_timer_get_time() >= completion->deadline_us) {
+                result = ESP_ERR_TIMEOUT;
+            } else {
+                result = command.transaction == nullptr
+                    ? ESP_ERR_INVALID_ARG
+                    : command.transaction(command.context);
+            }
         }
         const int64_t completed_us = esp_timer_get_time();
         const int64_t elapsed_ms = (completed_us - started_us) / 1000;
@@ -183,9 +214,14 @@ void StorageServiceTask(void*)
                 static_cast<long long>(started_us),
                 static_cast<long long>(completed_us));
         }
+        // Capture before signalling: a legacy caller may delete its completion
+        // as soon as Give returns to that caller. Owned requests retain the
+        // command reference until after Give has finished accessing semaphore.
+        const bool owned = completion->owned_cleanup != nullptr;
         completion->result = result;
         completion->state.store(kCompletionDone, std::memory_order_release);
         xSemaphoreGive(completion->semaphore);
+        if (owned) ReleaseOwnedCompletion(completion);
         // [watchdog] SPIFFS lookups are CPU-bound directory scans that never
         // block, so a boot scan or pack-sync burst runs back-to-back
         // transactions for longer than the 5 s IDLE0 window and task_wdt
@@ -324,6 +360,72 @@ esp_err_t ExecuteStorageTransactionInternal(
 }  // namespace
 
 namespace wqn::services {
+
+esp_err_t ExecuteOwnedStorageTransactionUntil(
+    StorageTransaction transaction, void* context, StorageContextCleanup cleanup,
+    const char* owner, int64_t deadline_us)
+{
+    if (cleanup == nullptr) return ESP_ERR_INVALID_ARG;
+    if (transaction == nullptr || context == nullptr || deadline_us <= 0) {
+        cleanup(context);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (IsStorageServiceTask() || g_background_queue == nullptr || g_task == nullptr) {
+        cleanup(context);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (RemainingStorageDeadlineTicks(deadline_us) == 0) {
+        cleanup(context);
+        return ESP_ERR_TIMEOUT;
+    }
+    auto* completion = new (std::nothrow) StorageCompletion();
+    if (completion == nullptr) {
+        cleanup(context);
+        return ESP_ERR_NO_MEM;
+    }
+    completion->owned_cleanup = cleanup;
+    completion->owned_context = context;
+    completion->deadline_us = deadline_us;
+    completion->semaphore = xSemaphoreCreateBinaryStatic(&completion->semaphore_storage);
+    if (completion->semaphore == nullptr) {
+        ReleaseOwnedCompletion(completion);
+        ReleaseOwnedCompletion(completion);
+        return ESP_ERR_NO_MEM;
+    }
+    completion->request_id = NextRequestId();
+    StorageCommand command;
+    command.transaction = transaction;
+    command.context = context;
+    command.request_id = completion->request_id;
+    command.owner = owner == nullptr ? "owned-storage" : owner;
+    command.completion = completion;
+    command.queued_at_us = esp_timer_get_time();
+    const TickType_t admission_ticks = RemainingStorageDeadlineTicks(deadline_us);
+    if (admission_ticks == 0 ||
+        xQueueSend(g_background_queue, &command, admission_ticks) != pdTRUE) {
+        ReleaseOwnedCompletion(completion);
+        ReleaseOwnedCompletion(completion);
+        return ESP_ERR_TIMEOUT;
+    }
+    xTaskNotifyGive(g_task);
+    // Recompute after admission. Queue and completion share one deadline.
+    const TickType_t observation_ticks = RemainingStorageDeadlineTicks(deadline_us);
+    esp_err_t result = ESP_ERR_TIMEOUT;
+    if (observation_ticks > 0 && xSemaphoreTake(completion->semaphore, observation_ticks) == pdTRUE) {
+        result = esp_timer_get_time() >= deadline_us ? ESP_ERR_TIMEOUT : completion->result;
+    } else {
+        uint32_t expected = kCompletionQueued;
+        completion->state.compare_exchange_strong(expected, kCompletionAbandoned,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        // Queued: owner skips it. Running/done: owner retains payload and
+        // completion independently; no caller stack or semaphore can expire.
+        ESP_LOGW(kTag, "owned storage observation timed out: request=%lu owner=%s state=%lu",
+                 static_cast<unsigned long>(command.request_id), command.owner,
+                 static_cast<unsigned long>(expected));
+    }
+    ReleaseOwnedCompletion(completion);
+    return result;
+}
 
 esp_err_t StartStorageService()
 {

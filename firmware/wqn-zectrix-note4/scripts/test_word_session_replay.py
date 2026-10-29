@@ -49,7 +49,8 @@ def main():
             if line.startswith('constexpr size_t kRuntimeCompactAckThreshold =')),
         '@@BATCH_ENABLED@@': (
             '#define FIXTURE_BATCH ' + str(int('struct CommitBatchContext {' in source)) +
-            '\nconstexpr size_t kOutboxAppendBatchCapacity = 10;\n'),
+            '\nconstexpr size_t kOutboxAppendBatchCapacity = 10;\n' +
+            '#define FIXTURE_OWNED_SLEEP ' + str(int('SleepOutboxMaintenanceRequest' in source)) + '\n'),
         '@@SESSION_GENERATION@@': next(
             (line for line in source.splitlines()
              if line.startswith('uint64_t g_session_mutation_generation =')),

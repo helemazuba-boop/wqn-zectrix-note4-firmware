@@ -248,8 +248,27 @@ SleepLease SleepLease::TryAcquire(
     const char* file,
     int line)
 {
+    return TryAcquireInternal(blocker, holder, file, line, 0);
+}
+
+SleepLease SleepLease::TryAcquireStoragePreparation(
+    uint32_t generation, const char* holder, const char* file, int line)
+{
+    if (generation == 0) return {};
+    return TryAcquireInternal(SleepBlocker::kStorage, holder, file, line, generation);
+}
+
+SleepLease SleepLease::TryAcquireInternal(
+    SleepBlocker blocker, const char* holder, const char* file, int line,
+    uint32_t preparation_generation)
+{
+    const auto admission_open = [preparation_generation]() {
+        const bool quiescing = g_quiescing.load(std::memory_order_acquire);
+        return preparation_generation == 0 ? !quiescing
+            : quiescing && g_quiesce_generation.load(std::memory_order_acquire) == preparation_generation;
+    };
     const size_t index = BlockerIndex(blocker);
-    if (index >= kBlockerCount || g_quiescing.load(std::memory_order_acquire)) {
+    if (index >= kBlockerCount || !admission_open()) {
         return {};
     }
 
@@ -258,7 +277,7 @@ SleepLease SleepLease::TryAcquire(
     bool acquire_pm_lock = false;
     const int64_t acquired_us = esp_timer_get_time();
     taskENTER_CRITICAL(&g_lease_lock);
-    if (!g_quiescing.load(std::memory_order_acquire)) {
+    if (admission_open()) {
         for (size_t i = 0; i < g_lease_records.size(); ++i) {
             if (g_lease_records[i].active) {
                 continue;
@@ -292,7 +311,7 @@ SleepLease SleepLease::TryAcquire(
     }
     taskEXIT_CRITICAL(&g_lease_lock);
     if (slot == UINT8_MAX) {
-        if (!g_quiescing.load(std::memory_order_acquire)) {
+        if (admission_open()) {
             ESP_LOGE(kTag,
                      "sleep lease registry exhausted: blocker=%s holder=%s "
                      "high_water=%u/%u at=%s:%d",

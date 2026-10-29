@@ -2377,7 +2377,7 @@ esp_err_t LoadWifiCredentials(std::string* ssid, std::string* password)
     return ESP_OK;
 }
 
-esp_err_t PrepareStorageForSleep(int64_t deadline_us)
+esp_err_t PrepareStorageForSleep(int64_t deadline_us, uint32_t generation)
 {
     if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
         return ESP_ERR_TIMEOUT;
@@ -2385,7 +2385,7 @@ esp_err_t PrepareStorageForSleep(int64_t deadline_us)
     if (runtime::ActiveSleepBlockerCount(runtime::SleepBlocker::kStorage) != 0) {
         return ESP_ERR_INVALID_STATE;
     }
-    return PrepareWordObservationOutboxForSleep(deadline_us);
+    return PrepareWordObservationOutboxForSleep(deadline_us, generation);
 }
 
 void RollbackStorageAfterSleepAbort()

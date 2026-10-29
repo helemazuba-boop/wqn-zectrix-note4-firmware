@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1443,14 +1444,17 @@ esp_err_t OutboxMaintenanceStepTransaction(void* opaque)
     auto* context = static_cast<OutboxMaintenanceContext*>(opaque);
     if (context == nullptr) return ESP_ERR_INVALID_ARG;
     if (context->done) return ESP_OK;
-    if (context->deadline_us > 0 && esp_timer_get_time() >= context->deadline_us) {
+    const auto deadline_reached = [context]() {
+        if (context->deadline_us <= 0 || esp_timer_get_time() < context->deadline_us) return false;
         context->done = context->deferred = true;
         ESP_LOGI(kTag, "word outbox maintenance deferred: reason=deadline step=%u",
                  static_cast<unsigned>(context->next_mode));
-        return ESP_OK;
-    }
+        return true;
+    };
+    if (deadline_reached()) return ESP_OK;
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load outbox maintenance step");
+    if (deadline_reached()) return ESP_OK;
     if (!context->started) {
         if (!context->force_compact && (context->for_sleep
                 ? scan->ack_records < kRuntimeCompactAckThreshold && !scan->partial_tail && !scan->backup_source &&
@@ -1498,6 +1502,7 @@ esp_err_t OutboxMaintenanceStepTransaction(void* opaque)
                  static_cast<unsigned>(context->next_mode));
         return ESP_OK;
     }
+    if (deadline_reached()) return ESP_OK;
     constexpr size_t mode_count = sizeof(kPersistedSessionModes) / sizeof(kPersistedSessionModes[0]);
     if (context->next_mode < mode_count) {
         const auto mode = kPersistedSessionModes[context->next_mode];
@@ -2259,6 +2264,35 @@ esp_err_t ExecuteWithOutboxMaintenance(
 }
 
 
+struct SleepOutboxMaintenanceRequest {
+    OutboxMaintenanceContext maintenance;
+    wqn::runtime::SleepLease lease;
+
+    SleepOutboxMaintenanceRequest(wqn::runtime::SleepLease&& hold, int64_t deadline_us)
+        : lease(std::move(hold))
+    {
+        maintenance.for_sleep = true;
+        maintenance.deadline_us = deadline_us;
+    }
+};
+
+esp_err_t SleepOutboxMaintenanceTransaction(void* opaque)
+{
+    auto* request = static_cast<SleepOutboxMaintenanceRequest*>(opaque);
+    const esp_err_t result = RunOutboxMaintenance(
+        &request->maintenance, "word-outbox-sleep-compact");
+    // All VFS work has returned. Release before completion publication, so a
+    // Ready result cannot race a still-held preparation blocker. Queued and
+    // detached requests instead retain it until their owned cleanup runs.
+    request->lease.Reset();
+    return result;
+}
+
+void CleanupSleepOutboxMaintenance(void* opaque)
+{
+    delete static_cast<SleepOutboxMaintenanceRequest*>(opaque);
+}
+
 }  // namespace
 
 namespace wqn {
@@ -2527,15 +2561,19 @@ esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot)
     return ExecuteWithStorageLease("word-outbox-snapshot", SnapshotTransaction, snapshot);
 }
 
-esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us)
+esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us, uint32_t generation)
 {
-    OutboxMaintenanceContext context;
-    context.for_sleep = true;
-    context.deadline_us = deadline_us;
-    // Sleep quiescing rejects new SleepLeases. PowerCoordinator calls this
-    // only after existing storage blockers are drained, so submit directly to
-    // the sole storage owner.
-    return RunOutboxMaintenance(&context, "word-outbox-sleep-compact");
+    if (deadline_us <= 0 || esp_timer_get_time() >= deadline_us) return ESP_ERR_TIMEOUT;
+    auto lease = runtime::SleepLease::TryAcquireStoragePreparation(
+        generation, "word-outbox-sleep-compact", __FILE__, __LINE__);
+    if (!lease) return ESP_ERR_INVALID_STATE;
+    auto* request = new (std::nothrow) SleepOutboxMaintenanceRequest(std::move(lease), deadline_us);
+    if (request == nullptr) return ESP_ERR_NO_MEM;
+    // Neither payload nor completion refers to this caller's stack. The owner
+    // retains both and the blocker when a running VFS step outlives the wait.
+    return services::ExecuteOwnedStorageTransactionUntil(
+        SleepOutboxMaintenanceTransaction, request, CleanupSleepOutboxMaintenance,
+        "word-outbox-sleep-compact", deadline_us);
 }
 
 }  // namespace wqn

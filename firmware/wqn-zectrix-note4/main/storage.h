@@ -274,7 +274,9 @@ esp_err_t SetWifiCredentialForRole(
 // actually changes, to bound NVS wear.
 // PowerCoordinator boundary. Writes are serialized by StorageService and each
 // accepted transaction holds kStorage, so Ready means every commit is durable.
-esp_err_t PrepareStorageForSleep(int64_t deadline_us);
+// A preparation transaction owns its context/blocker beyond caller timeout;
+// only the current quiesce generation can start it. Timeout is never Ready.
+esp_err_t PrepareStorageForSleep(int64_t deadline_us, uint32_t generation);
 void RollbackStorageAfterSleepAbort();
 
 }  // namespace wqn

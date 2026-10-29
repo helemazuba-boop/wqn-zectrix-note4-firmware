@@ -31,6 +31,7 @@ constexpr int ESP_ERR_NOT_FOUND = 262;
 constexpr int pdTRUE = 1, pdFALSE = 0;
 constexpr TickType_t portMAX_DELAY = UINT32_MAX;
 #define pdMS_TO_TICKS(ms) (ms)
+#define configTICK_RATE_HZ 1000
 #define portENTER_CRITICAL(mux) ((void)(mux))
 #define portEXIT_CRITICAL(mux) ((void)(mux))
 void Log(const char*, const char*, ...) {}
@@ -77,6 +78,7 @@ struct CpuPerformanceLease {
 }
 namespace services {
 using StorageTransaction = esp_err_t (*)(void*);
+using StorageContextCleanup = void (*)(void*);
 bool IsStorageServiceTask() { return on_storage_owner; }
 esp_err_t ExecuteForegroundStorageTransaction(StorageTransaction, void*, const char*);
 }

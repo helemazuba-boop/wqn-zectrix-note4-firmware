@@ -1025,7 +1025,7 @@ static power::PrepareSleepResults BroadcastPrepareSleep(const power::PrepareSlee
                 });
     run_service(power::SleepService::kStorage,
                 [](const power::PrepareSleepCommand& scoped) {
-                    return PrepareStorageForSleep(scoped.deadline_us);
+                    return PrepareStorageForSleep(scoped.deadline_us, scoped.generation);
                 });
     run_service(power::SleepService::kAudio,
                 [](const power::PrepareSleepCommand& scoped) {
