@@ -15,6 +15,10 @@
 #include "device_protocol/json_syntax_probe.h"
 #include "storage.h"
 #include "services/sync_service.h"
+#include "services/server_error_codes.h"
+#include "device_protocol/word_study.h"
+#include "outbox_suspend_reason.h"
+@@WORD_TYPES@@
 using wqn::SyncJournal;
 using wqn::SyncJournalContentState;
 
@@ -35,6 +39,7 @@ constexpr const char* kTag="host-audit";
 constexpr uint32_t kFullRetryMagic=0x57514E52;
 constexpr std::time_t kMinScheduleUnixTime=1704067200;
 @@OUTBOX_RETRY_CONFIG@@
+@@GAP_CONFIG@@
 constexpr uint32_t kWordPacksRefreshBit=1,kNotePacksRefreshBit=2,kProblemPacksRefreshBit=4;
 constexpr uint32_t kClaimRetryBaseMs=15000;
 enum class OutboxRetryCause:uint8_t { kNone,kTransport,kServer,kLocalStorage };
@@ -180,6 +185,7 @@ int BootstrapDeviceControlV3(const std::string&,const protocol::v3::RequestMetad
 }
 
 wqn::protocol::v3::RequestMetadata MutableSyncMetadata();
+@@WORD_PORTS@@
 @@PRODUCTION@@
 
 wqn::protocol::v3::RequestMetadata MutableSyncMetadata() {
@@ -217,6 +223,7 @@ void Reset() {
     g_sync_journal_durable_payload_valid=false;
     journal_calls=0; attempted_payloads.clear(); committed_payloads.clear();
 }
+@@WORD_CASES@@
 int main() {
     Reset(); transport_failures=1;
     Check(SyncControlPlaneV3("host-placeholder")!=ESP_OK,"transport failure is propagated");
@@ -421,6 +428,7 @@ int main() {
     const int before_target=journal_calls; SyncControlPlaneV3("host-placeholder");
     Check(journal_calls==before_target+1 && durable_journal.problem_packs.desired_revision==7,
         "new control target needs one bundled write, never a separate intent rotation");
+    RunWordGapCases();
     Check(lock_errors==0 && mock_lock_depth==0,"every save holds one non-recursive mutation/commit lock, released on all exits");
     std::printf("%d PASS / %d FAIL (production control paths; NOT HIL)\n",checks-failures,failures);
     return failures?1:0;

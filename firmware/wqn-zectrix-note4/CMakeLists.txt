@@ -23,6 +23,19 @@ list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.defaults" "sdkconfig.ai-local.defaults
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(wqn-zectrix-note4)
 
+# Opt in to a product contract after Kconfig has resolved all overrides. Custom
+# diagnostic/feature-off builds do not silently inherit the ai-local contract.
+set(WQN_BUILD_PROFILE "" CACHE STRING "Resolved profile contract: ai-local or ai-local-agent-off")
+if(NOT WQN_BUILD_PROFILE STREQUAL "")
+    add_custom_target(
+        wqn_profile_check ALL
+        COMMAND ${PYTHON} ${CMAKE_CURRENT_LIST_DIR}/scripts/check_firmware_profile.py
+            --config ${CMAKE_CURRENT_BINARY_DIR}/config/sdkconfig.json
+            --profile ${WQN_BUILD_PROFILE}
+        COMMENT "Verifying resolved firmware profile (not HIL)"
+        VERBATIM)
+endif()
+
 # [ui-stack] Check compiled entry frames too: lexical scoping of a 4 KiB
 # UiFrame did not prevent the 1009.4 overflow. Disabled UI builds have no
 # DeviceUiTask symbol, so only the enabled S3 profile runs this gate.

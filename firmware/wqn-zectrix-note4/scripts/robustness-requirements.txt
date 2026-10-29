@@ -1,0 +1,3 @@
+# Match the locally validated Draft2020-12 / date-time checker environment.
+jsonschema==4.10.3
+rfc3339-validator==0.1.4
