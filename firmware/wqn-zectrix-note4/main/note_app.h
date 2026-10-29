@@ -108,7 +108,9 @@ struct NoteAppState {
 
     NotePackIndex pack_index;
     // A cloud refresh never mutates the content backing an active browse; it
-    // becomes current only after returning to the notebook list.
+    // becomes current only after returning to the notebook list. A newer
+    // targeted aggregate retires an older pending result; older deliveries
+    // cannot replace the active index or overwrite a newer pending result.
     NotePackIndex pending_pack_index;
     bool pending_pack_index_ready = false;
 

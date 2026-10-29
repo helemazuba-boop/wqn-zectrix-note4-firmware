@@ -179,11 +179,34 @@ bool SnapshotMatches(
     return true;
 }
 
+bool NotePackIndexIsOlder(const wqn::NotePackIndex& candidate,
+                          const wqn::NotePackIndex& current)
+{
+    return candidate.delivery_generation < current.delivery_generation;
+}
+
+bool NotePackIndexDeliveryIsStale(const wqn::NoteAppState& state,
+                                 const wqn::NotePackIndex& candidate)
+{
+    return NotePackIndexIsOlder(candidate, state.pack_index) ||
+        (state.pending_pack_index_ready &&
+         NotePackIndexIsOlder(candidate, state.pending_pack_index));
+}
+
 void InstallNotePackIndex(
     wqn::NoteAppState* state,
     wqn::NotePackIndex index,
     const std::string& message)
 {
+    if (NotePackIndexIsOlder(index, state->pack_index)) return;
+    // A newer targeted aggregate supersedes an older staged full result.
+    // Keep a newer full result staged: it must not change the content backing
+    // the current browse until returning to the notebook list.
+    if (!state->pending_pack_index_ready ||
+        !NotePackIndexIsOlder(index, state->pending_pack_index)) {
+        state->pending_pack_index = {};
+        state->pending_pack_index_ready = false;
+    }
     const bool has_manifest = index.has_manifest;
     const bool pack_error = index.pack_error;
     const std::string status_message = index.status_message;
@@ -711,6 +734,7 @@ esp_err_t HandleNoteAppInput(NoteAppState* state, NoteInput input)
 void ApplyNotePackIndex(NoteAppState* state, NotePackIndex index, const std::string& message)
 {
     if (state == nullptr) return;
+    if (NotePackIndexDeliveryIsStale(*state, index)) return;
     // A refresh while browsing stages for the next return to the notebook list.
     if (state->mode != NoteAppMode::kNotebookList ||
         (state->session.persisted.active && !state->session.persisted.paused)) {
@@ -1116,8 +1140,9 @@ void ApplyNoteBodyFetchResult(
     }
     if (result == ESP_OK && index_ready) {
         // Install in place, even mid-browse: unlike the full-catalog sync
-        // (which staged as pending until the notebook list), this index only
-        // advances the notebook the user is actively waiting on.
+        // (which stages until the notebook list), the user is waiting on this
+        // operation. Install rejects older active-index replacements, retires
+        // superseded pending data, and keeps a newer full result staged.
         InstallNotePackIndex(state, std::move(index), message);
         // Honor the deferred open intent -- but only if the user's selection
         // still points at the note they asked for, and no observation commit

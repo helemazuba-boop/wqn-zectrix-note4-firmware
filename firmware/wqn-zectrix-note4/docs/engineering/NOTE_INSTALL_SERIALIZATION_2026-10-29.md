@@ -53,8 +53,9 @@ This repair covers the two current Note cloud installation callers, the only
 callers publishing/resetting the Note manifest in current source. It does not
 change disk formats, the raw storage APIs, server snapshot semantics or R-06's
 existing classification/reset policy. An external future installer must use the
-same admission boundary. Cross-lane delivery of already-built UI indexes is a
-separate follow-up to check; the admission gate ends when the installer returns,
-not when its UI mailbox is acknowledged.
+same admission boundary. The gate ends when the installer returns, not when its
+UI mailbox is acknowledged. The subsequent [N-02 repair](NOTE_INDEX_DELIVERY_2026-10-30.md)
+orders already-built indexes across lanes and pending activation without
+extending admission, and shares the failed-rebuild marker.
 
 Evidence archive: `/home/unknow/projects/doc/robustness-remediation-20261029/r01/`.

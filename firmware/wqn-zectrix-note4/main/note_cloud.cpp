@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <utility>
 
 #include "esp_log.h"
@@ -30,6 +31,20 @@ constexpr size_t kMaxSnapshotRestarts = 2;
 // Admit before fetching a remote snapshot, and keep ownership through index
 // rebuild: serializing only the final write would still publish stale rows.
 std::atomic_flag g_note_install_busy = ATOMIC_FLAG_INIT;
+
+// Calls are serialized by NotePackInstallGuard, including index construction.
+// Reserve before I/O so exhaustion cannot publish an unorderable installation.
+std::atomic<uint64_t> g_note_index_generation{0};
+// Both installers can leave the persisted catalog ahead of a failed rebuild.
+std::atomic<bool> g_note_index_stale{false};
+
+uint64_t NextNoteIndexGeneration()
+{
+    const uint64_t previous = g_note_index_generation.load(std::memory_order_relaxed);
+    if (previous == std::numeric_limits<uint64_t>::max()) return 0;
+    g_note_index_generation.store(previous + 1, std::memory_order_relaxed);
+    return previous + 1;
+}
 
 class NotePackInstallGuard {
 public:
@@ -182,13 +197,13 @@ esp_err_t FetchStableNoteManifest(
 
 esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
 {
-    // Sticky repair marker: set once pack files on disk may differ from the
+    // Shared repair marker: set once pack files on disk may differ from the
     // index the app is holding (a download landed, or a required rebuild did
     // not complete). Without it, a sync that failed AFTER downloading packs
     // left every later round in "nothing changed; rebuild skipped" while the
     // stale in-memory index kept dereferencing old offsets into the new files
     // (HIL: packs re-downloaded fine, yet every note open failed silently).
-    static bool s_index_stale = false;
+
 
     if (out == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -204,6 +219,12 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     if (!install_guard) {
         out->result = ESP_ERR_INVALID_STATE;
         out->message = "笔记正在同步，请稍后重试";
+        return out->result;
+    }
+    const uint64_t install_generation = NextNoteIndexGeneration();
+    if (install_generation == 0) {
+        out->result = ESP_ERR_INVALID_STATE;
+        out->message = "笔记同步状态异常，请重启后重试";
         return out->result;
     }
 
@@ -267,7 +288,7 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             remote_manifest.notebooks[i]);
         if (out->result == ESP_OK) {
             pack_downloaded = true;
-            s_index_stale = true;
+            g_note_index_stale = true;
         } else {
             out->message = "笔记包下载失败，已保留旧清单";
         }
@@ -280,7 +301,7 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             out->result = SaveNotePackManifest(remote_manifest);
             if (out->result == ESP_OK) {
                 local_manifest = remote_manifest;
-                s_index_stale = true;
+                g_note_index_stale = true;
             } else {
                 out->message = "笔记清单保存失败";
             }
@@ -289,15 +310,16 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
     }
 
     if (out->result == ESP_OK &&
-        (manifest_content_changed || !had_local_manifest || s_index_stale)) {
+        (manifest_content_changed || !had_local_manifest || g_note_index_stale)) {
         out->result = LoadNotePackIndex(&out->index);
         out->message = out->index.status_message;
         out->index_ready = out->result == ESP_OK;
+        if (out->index_ready) out->index.delivery_generation = install_generation;
         out->content_changed = true;
         if (out->result == ESP_OK) {
-            s_index_stale = false;
+            g_note_index_stale = false;
         } else {
-            s_index_stale = true;
+            g_note_index_stale = true;
         }
     } else if (out->result == ESP_OK) {
         out->message = "笔记无变更";
@@ -311,7 +333,7 @@ esp_err_t SyncNotePacks(const std::string& token, NotePackSyncResult* out)
             "note pack sync failed: %s stage_message=%s index_stale=%d",
             esp_err_to_name(out->result),
             out->message.empty() ? "-" : out->message.c_str(),
-            s_index_stale ? 1 : 0);
+            g_note_index_stale ? 1 : 0);
     } else {
         out->snapshot_id = remote_manifest.snapshot_id;
     }
@@ -340,6 +362,12 @@ esp_err_t SyncSingleNotebookPack(
     if (!install_guard) {
         out->result = ESP_ERR_INVALID_STATE;
         out->message = "笔记正在同步，请稍后重试";
+        return out->result;
+    }
+    const uint64_t install_generation = NextNoteIndexGeneration();
+    if (install_generation == 0) {
+        out->result = ESP_ERR_INVALID_STATE;
+        out->message = "笔记同步状态异常，请重启后重试";
         return out->result;
     }
 
@@ -393,6 +421,7 @@ esp_err_t SyncSingleNotebookPack(
                      esp_err_to_name(out->result), notebook_id.c_str());
             return out->result;
         }
+        g_note_index_stale = true;
     }
 
     // Merge ONLY the target row. A full-delta merge would advance other rows
@@ -413,11 +442,14 @@ esp_err_t SyncSingleNotebookPack(
         return out->result;
     }
 
+    g_note_index_stale = true;
     out->result = LoadNotePackIndex(&out->index);
     out->message = out->index.status_message;
     out->index_ready = out->result == ESP_OK;
+    if (out->index_ready) out->index.delivery_generation = install_generation;
     out->content_changed = true;
     if (out->result == ESP_OK) {
+        g_note_index_stale = false;
         out->snapshot_id = remote_manifest.snapshot_id;
     }
     ESP_LOGI(kTag, "single notebook pack synced: id=%.8s index_ready=%d",

@@ -110,6 +110,9 @@ struct NotePackIdentity {
 };
 
 struct NotePackIndex {
+    // RAM-only order shared by full/targeted cloud installers. Zero is the
+    // initial local load; remote manifest cursors/revisions do not order this.
+    uint64_t delivery_generation = 0;
     bool mounted = false;
     bool has_manifest = false;
     bool pack_error = false;

@@ -50,6 +50,7 @@ def main():
         '@@BOUNDS@@': function(app, 'device_ui_internal::NoteReadingGeometry NoteBodyReadingGeometry('),
         '@@INTERACTION@@': '\n'.join(function(app, name) for name in [
             'uint32_t NextTransferProgressGeneration(', 'void ArmNoteBodyFetch(', 'void RequestNoteCandidatePageIfNeeded(',
+            'bool NotePackIndexIsOlder(', 'bool NotePackIndexDeliveryIsStale(',
             'void InstallNotePackIndex(', 'void ActivatePendingNotePackIndex(',
             'void HandleNotebookListInput(', 'void HandleSessionStartingInput(',
             'void ArmOpenObservation(',
