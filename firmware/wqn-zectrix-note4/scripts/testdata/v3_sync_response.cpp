@@ -72,7 +72,7 @@ int main()
                   test.name,"failed candidate releases output vector allocations");
         }
         if (test.no_ids_allocation) {
-            Check(cpp_allocations==empty_allocations && largest_cpp_allocation==empty_largest,
+            Check(cpp_allocations<=empty_allocations && largest_cpp_allocation<=empty_largest,
                   test.name,"invalid due collection allocates no extra C++ ID/vector storage");
         }
     }

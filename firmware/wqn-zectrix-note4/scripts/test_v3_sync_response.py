@@ -99,7 +99,15 @@ def main():
     print(f'Pinned schema/UUID format: {checked} cases checked; compatibility and stricter NUL policy are explicit.',flush=True)
     code=(subprocess.check_output(['git','show',f'{args.before}:firmware/wqn-zectrix-note4/components/device_protocol/v3.cpp'],
                                   cwd=root,text=True) if args.before else (root/'components/device_protocol/v3.cpp').read_text())
-    if args.mutation:
+    guard_path='components/device_protocol/include/device_protocol/json_depth_guard.h'
+    guard=(subprocess.check_output(['git','show',f'{args.before}:firmware/wqn-zectrix-note4/{guard_path}'],cwd=root,text=True)
+           if args.before else (root/guard_path).read_text())
+    shared_nul_mutation=args.mutation=='ignore-json-nul' and 'HasUnrepresentableJsonNul(body)' not in code
+    if shared_nul_mutation:
+        old='JsonStringsRepresentable(data, length);'
+        assert guard.count(old)==1, 'shared NUL boundary drift'
+        guard=guard.replace(old,'true;')
+    if args.mutation and not shared_nul_mutation:
         changes={
             'unbounded-count':('if (count > 100)','if (false && count > 100)'),
             'skip-uuid':('!IsUuid(item->valuestring)','(!IsUuid(item->valuestring) && false)'),
@@ -133,10 +141,12 @@ def main():
     digest=hashlib.sha256((contract/'device-control-v3.schema.json').read_bytes()).hexdigest()
     with tempfile.TemporaryDirectory(prefix='wqn-v3-sync-') as directory:
         tmp=Path(directory); binary=tmp/'test'
+        (tmp/'device_protocol').mkdir()
+        (tmp/'device_protocol/json_depth_guard.h').write_text(guard)
         (tmp/'v3.cpp').write_text(code); (tmp/'test.cpp').write_text(fixture)
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer',
-                        '-I'+str(root/'scripts/testdata/sync_host'),
+                        '-I'+str(tmp),'-I'+str(root/'scripts/testdata/sync_host'),
                         '-I'+str(root/'components/device_protocol/include'),'-I'+str(cjson),
                         f'-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="{digest}"',
                         str(tmp/'v3.cpp'),str(tmp/'test.cpp'),str(cjson/'cJSON.c'),'-o',str(binary)],

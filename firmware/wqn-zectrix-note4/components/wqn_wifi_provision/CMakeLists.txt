@@ -16,4 +16,6 @@ idf_component_register(
         freertos
         json
         lwip
+    PRIV_REQUIRES
+        device_protocol
 )

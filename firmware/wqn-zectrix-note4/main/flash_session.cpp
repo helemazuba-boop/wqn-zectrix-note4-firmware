@@ -1788,9 +1788,9 @@ void ParseAndHandleEvent(const char* data, size_t len)
     }
 
     constexpr size_t kMaxJsonNestingDepth = 16;
-    if (!wqn::protocol::JsonNestingWithinLimit(
+    if (!wqn::protocol::JsonInputWithinLimits(
             data, len, kMaxJsonNestingDepth)) {
-        ESP_LOGW(kTag, "WS event JSON nesting exceeds %u, dropping (len=%u)",
+        ESP_LOGW(kTag, "WS event JSON exceeds depth %u or contains NUL, dropping (len=%u)",
                  static_cast<unsigned>(kMaxJsonNestingDepth),
                  static_cast<unsigned>(len));
         return;

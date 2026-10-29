@@ -145,7 +145,7 @@ bool DecodeSseEvent(const std::string& event_name,
   out_ev->event_id = event_id;
   out_ev->raw_json = data_json;
 
-  cJSON* root = protocol::JsonNestingWithinLimit(
+  cJSON* root = protocol::JsonInputWithinLimits(
                     data_json.data(), data_json.size())
       ? cJSON_ParseWithLength(data_json.c_str(), data_json.size())
       : nullptr;

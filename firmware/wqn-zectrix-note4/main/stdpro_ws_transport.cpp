@@ -570,10 +570,10 @@ void ProcessTextStream()
                 return;
             }
             g_control_reassembly_buf.append(buf, bytes_read);
-            if (!wqn::protocol::JsonNestingWithinLimit(
+            if (!wqn::protocol::JsonInputWithinLimits(
                     g_control_reassembly_buf.data(),
                     g_control_reassembly_buf.size())) {
-                ESP_LOGE(kTag, "session control JSON nesting too deep");
+                ESP_LOGE(kTag, "session control JSON depth/string representation invalid");
                 TeardownFailedTurn();
                 return;
             }

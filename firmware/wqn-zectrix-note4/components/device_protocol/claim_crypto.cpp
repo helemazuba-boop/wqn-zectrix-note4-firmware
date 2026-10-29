@@ -377,7 +377,7 @@ esp_err_t OpenSealedCredential(
 
         const char* plaintext_json =
             reinterpret_cast<const char*>(plaintext.data());
-        cJSON* root = wqn::protocol::JsonNestingWithinLimit(
+        cJSON* root = wqn::protocol::JsonInputWithinLimits(
                            plaintext_json, encrypted_size)
             ? cJSON_ParseWithLength(plaintext_json, encrypted_size)
             : nullptr;

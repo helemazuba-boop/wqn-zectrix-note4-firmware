@@ -196,7 +196,7 @@ esp_err_t ReadBoundedResponse(
 
 void ParseErrorBody(const std::string& body, wqn::OpenCodeResult* result)
 {
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(body.data(), body.size())
+    cJSON* root = wqn::protocol::JsonInputWithinLimits(body.data(), body.size())
         ? cJSON_ParseWithLength(body.data(), body.size())
         : nullptr;
     cJSON* error = root != nullptr
@@ -678,7 +678,7 @@ esp_err_t ParseOpenCodeSessionsBody(
         SetResultError(result, http_status, "invalid_size", "Session list is too large");
         return ESP_ERR_INVALID_SIZE;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
+    cJSON* root = protocol::JsonInputWithinLimits(body.data(), body.size())
         ? cJSON_ParseWithLength(body.data(), body.size())
         : nullptr;
     cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
@@ -800,7 +800,7 @@ esp_err_t TranscribeOpenCodeAudio(
     if (request_result != ESP_OK) {
         return request_result;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
+    cJSON* root = protocol::JsonInputWithinLimits(body.data(), body.size())
         ? cJSON_ParseWithLength(body.data(), body.size())
         : nullptr;
     cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
@@ -958,7 +958,7 @@ esp_err_t CreateOpenCodeSession(
     if (request_result != ESP_OK) {
         return request_result;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(response.data(), response.size())
+    cJSON* root = protocol::JsonInputWithinLimits(response.data(), response.size())
         ? cJSON_ParseWithLength(response.data(), response.size())
         : nullptr;
     cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
@@ -1012,7 +1012,7 @@ esp_err_t InterruptOpenCodeSession(
     if (request_result != ESP_OK) {
         return request_result;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(response_body.data(), response_body.size())
+    cJSON* root = protocol::JsonInputWithinLimits(response_body.data(), response_body.size())
         ? cJSON_ParseWithLength(response_body.data(), response_body.size())
         : nullptr;
     cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;
@@ -1179,7 +1179,7 @@ esp_err_t ParseOpenCodeAgentFrame(
                  event_name.c_str(), static_cast<unsigned>(payload.size()),
                  static_cast<unsigned>(kMaxDeltaEventBytes));
     }
-    cJSON* root = wqn::protocol::JsonNestingWithinLimit(payload.data(), payload.size())
+    cJSON* root = wqn::protocol::JsonInputWithinLimits(payload.data(), payload.size())
         ? cJSON_ParseWithLength(payload.data(), payload.size())
         : nullptr;
     if (root == nullptr) {
@@ -1345,7 +1345,7 @@ esp_err_t ParseOpenCodeHistoryBody(
         SetResultError(result, http_status, "invalid_size", "History response is too large");
         return ESP_ERR_INVALID_SIZE;
     }
-    cJSON* root = protocol::JsonNestingWithinLimit(body.data(), body.size())
+    cJSON* root = protocol::JsonInputWithinLimits(body.data(), body.size())
         ? cJSON_ParseWithLength(body.data(), body.size())
         : nullptr;
     cJSON* data = root != nullptr ? cJSON_GetObjectItemCaseSensitive(root, "data") : nullptr;

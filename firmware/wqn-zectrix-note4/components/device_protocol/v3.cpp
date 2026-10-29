@@ -15,7 +15,7 @@ class JsonDocument {
 public:
     explicit JsonDocument(cJSON* root) : root_(root) {}
     explicit JsonDocument(const std::string& body)
-        : root_(wqn::protocol::JsonNestingWithinLimit(body.data(), body.size())
+        : root_(wqn::protocol::JsonInputWithinLimits(body.data(), body.size())
                     ? cJSON_Parse(body.c_str())
                     : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
@@ -47,20 +47,6 @@ bool IsUuid(const char* value)
         }
     }
     return value[36] == '\0';
-}
-
-bool HasUnrepresentableJsonNul(const std::string& body)
-{
-    // cJSON exposes strings as NUL-terminated pointers without a decoded
-    // length. Reject truncation rather than accepting UUID + U+0000 + suffix.
-    if (body.find('\0') != std::string::npos) return true;
-    for (size_t index = 0; index < body.size(); ++index) {
-        if (body[index] == '\\') {
-            if (body.compare(index, 6, "\\u0000") == 0) return true;
-            ++index; // Skip one escaped byte; literal \\u0000 stays valid.
-        }
-    }
-    return false;
 }
 
 bool U64Field(cJSON* object, const char* key, uint64_t* output)
@@ -441,9 +427,6 @@ esp_err_t ParseSyncResponse(
     const esp_err_t result = ParseEnvelope(body, expected_request_id, &document, &payload, error);
     if (result != ESP_OK) {
         return result;
-    }
-    if (HasUnrepresentableJsonNul(body)) {
-        return ESP_ERR_INVALID_RESPONSE;
     }
     if (!U64Field(payload, "config_revision", &parsed.config_revision) ||
         !U64Field(payload, "sync_cursor", &parsed.sync_cursor)) {

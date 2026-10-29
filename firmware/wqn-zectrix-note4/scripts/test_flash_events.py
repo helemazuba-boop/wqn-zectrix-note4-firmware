@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real Flash parser/history on host ports; excludes scheduling, I2S and HIL."""
 from pathlib import Path
+import argparse
 import os
 import json
 import hashlib
@@ -10,8 +11,12 @@ import tempfile
 from test_audio_runtime import function
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--before', help='read the Flash parser from a git revision')
+args = parser.parse_args()
 SDK = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5')) / 'components/json/cJSON'
-source = (ROOT / 'main/flash_session.cpp').read_text()
+source = (subprocess.check_output(['git', 'show', f'{args.before}:firmware/wqn-zectrix-note4/main/flash_session.cpp'],cwd=ROOT,text=True)
+          if args.before else (ROOT / 'main/flash_session.cpp').read_text())
 source = source[:source.rindex('\n#else')]
 header = (ROOT / 'main/flash_session.h').read_text()
 pre = r'''
@@ -105,6 +110,18 @@ void reset(){
  event(R"({"type":"turn.started","turn_id":7})");
 }
 int main(){
+ for(const char* payload:{R"({"type":"text.delta","turn_id":7,"delta":"visible\u0000hidden"})",
+                          R"({"type":"text.delta","turn_id":7,"delta\u0000hidden":"visible"})"}){
+  reset();event(payload);CHECK(snapshot()->messages.empty());
+ }
+ reset();g_flash.status=InternalStatus::kSessionUpdating;
+ std::string bad_ready=gold_ready;
+ const auto ready_type=bad_ready.find("session.ready");CHECK(ready_type!=std::string::npos);
+ bad_ready.insert(ready_type+std::strlen("session.ready"),R"(\u0000shadow)");
+ event(bad_ready);CHECK(g_flash.status==InternalStatus::kSessionUpdating);
+ event(gold_ready);CHECK(g_flash.status==InternalStatus::kStreaming);
+ reset();event(R"({"type":"text.delta","turn_id":7,"delta":"literal\\u0000"})");
+ CHECK(snapshot()->messages.size()==2&&snapshot()->messages[1].text==R"(literal\u0000)");
  reset();
  event(R"({"type":"asr.delta","turn_id":7,"delta":"partial"})");
  CHECK(snapshot()->messages.size()==1&&snapshot()->messages[0].text=="partial");

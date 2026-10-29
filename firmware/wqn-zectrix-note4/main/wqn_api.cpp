@@ -190,7 +190,7 @@ bool IsLowercaseSha256(const std::string& value)
 class JsonDocument {
 public:
     explicit JsonDocument(const std::string& payload)
-        : root_(wqn::protocol::JsonNestingWithinLimit(
+        : root_(wqn::protocol::JsonInputWithinLimits(
                     payload.data(), payload.size())
                     ? cJSON_Parse(payload.c_str())
                     : nullptr) {}
@@ -1096,7 +1096,8 @@ esp_err_t PostAiInteractionReply(const std::string& token, const std::string& id
         *error = "回答发送失败，请重试原选项";
         return result;
     }
-    root = cJSON_Parse(response.c_str());
+    root = protocol::JsonInputWithinLimits(response.data(), response.size())
+        ? cJSON_Parse(response.c_str()) : nullptr;
     const bool ok = root != nullptr && status == 200 && GetSuccess(root);
     *error = ok ? "" : "回答未确认，请重试原选项";
     cJSON_Delete(root);

@@ -18,7 +18,7 @@ class JsonDocument {
 public:
     explicit JsonDocument(cJSON* root) : root_(root) {}
     explicit JsonDocument(const std::string& body)
-        : root_(JsonNestingWithinLimit(body.data(), body.size())
+        : root_(JsonInputWithinLimits(body.data(), body.size())
                     ? cJSON_Parse(body.c_str())
                     : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }

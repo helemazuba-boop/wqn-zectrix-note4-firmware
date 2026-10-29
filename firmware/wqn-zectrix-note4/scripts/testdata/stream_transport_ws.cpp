@@ -213,6 +213,19 @@ int main() {
     const auto control = [&](size_t size) { return prefix + std::string(size - prefix.size() - 2, 'x') + "\"}"; };
     for (size_t chunk : {size_t(1), size_t(17), size_t(512)}) {
         packet_limit = chunk;
+        for (const char* bad : {R"({"type":"session.ready\u0000shadow"})",
+                               R"({"type\u0000shadow":"session.ready"})"}) {
+            ResetControl(); Feed(bad);
+            CHECK(!g_session_ready && ready_completions==0 && destroyed==1);
+        }
+        for (const char* bad : {R"({"request_id":"req\u0000shadow"})",
+                               R"({"request_id\u0000shadow":"req"})"}) {
+            Reset(TurnState::kRemoteHandoff);
+            Feed(std::string("event: turn.released\ndata: ")+bad+"\n\n");
+            CHECK(terminals.empty() && events.empty() && g_turn_state==TurnState::kRemoteHandoff);
+            Feed(release_frame);
+            CHECK(terminals.size()==1 && terminals[0].release==Release::kReleased && g_turn_state==TurnState::kIdle);
+        }
         for (size_t size : {cap - 1, cap}) {
             ResetControl(); Feed(control(size));
             CHECK(g_session_ready.load() && ready_completions == 1 && destroyed == 0);

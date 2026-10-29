@@ -213,6 +213,14 @@ void* Allocate(size_t size)
 int main()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    for (const char* payload: {R"({"delta":"visible\u0000hidden"})",R"({"delta\u0000hidden":"visible"})"}) {
+        wqn::OpenCodeEvent event;
+        Check(wqn::ParseOpenCodeAgentFrame("agent.text.delta",payload,&event)==ESP_ERR_INVALID_RESPONSE,
+              "actual Agent typed parser rejects NUL value/key aliases");
+    }
+    wqn::OpenCodeEvent literal;
+    Check(wqn::ParseOpenCodeAgentFrame("agent.text.delta",R"({"delta":"literal\\u0000"})",&literal)==ESP_OK &&
+          literal.text==R"(literal\u0000)","Agent preserves a literal backslash-u0000 delta");
     wqn::OpenCodeResult result;
     Reset();
     const auto silent = Run(&result);
