@@ -15,13 +15,6 @@ esp_err_t InitAiSession();
 // enabled, because its tier=agent turn rides that same transport (the tap
 // feeds stdpro_ws, which drops PCM until a turn reaches kRecording).
 void SetAiAudioCaptureTapEnabled(bool enabled);
-// [agent-voice] Exported for the Agent voice pipe (agent_voice_pipe.cpp),
-// which drives its own stdpro_ws turn and therefore cannot reuse
-// PrepareRecordingSession. ArmAiVoicePreroll only arms the one-shot replay of
-// audio captured before the turn committed -- it must NOT install the STD SSE
-// trampoline (SetSseCallback is a single global slot; the agent path installs
-// its own trampoline).
-void ArmAiVoicePreroll();
 // Request-id used by the SSE idempotency headers: 16 hex chars.
 std::string GenerateRequestId();
 esp_err_t StartAiRecordingSession();

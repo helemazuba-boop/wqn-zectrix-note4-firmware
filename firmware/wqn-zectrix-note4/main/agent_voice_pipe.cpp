@@ -6,7 +6,6 @@
 #include <atomic>
 #include <string>
 
-#include "ai_session.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -199,13 +198,6 @@ esp_err_t AgentVoiceTurnStart(const std::string& token,
         ESP_LOGW(kTag, "EnsureConnected failed (%s)", esp_err_to_name(conn));
         return conn;
     }
-
-    // Arm the replay BEFORE StartTurn: the transport flips the turn to
-    // kRecording internally and the capture task outranks this worker, so the
-    // tap can deliver a live block before StartTurn even returns. Arming first
-    // is what keeps the backlog ahead of the live audio (same rule as the STD
-    // driver, see ai_session.cpp PrepareRecordingSession).
-    wqn::ArmAiVoicePreroll();
 
     uint32_t turn_gen = 0;
     const esp_err_t start = wqn::stdpro_ws::StartTurn(

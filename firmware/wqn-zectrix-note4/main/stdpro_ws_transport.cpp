@@ -172,6 +172,9 @@ std::atomic<bool> g_is_connected{false};
 std::atomic<bool> g_session_ready{false};
 std::atomic<uint32_t> g_seq{0};
 std::atomic<bool> g_prefinal_pcm_lost{false};
+// Published before kRecording by the owner, consumed only by the capture tap.
+// Early taps cannot consume it; the first admitted tap queues prefix + live.
+std::atomic<bool> g_pcm_preroll_pending{false};
 
 portMUX_TYPE g_idle_disconnect_mux = portMUX_INITIALIZER_UNLOCKED;
 wqn::stdpro_ws::IdleDisconnectGate g_idle_disconnect_gate;
@@ -891,10 +894,11 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 wqn::stdpro_ws::TurnStreamObservation::kNone;
 
             g_seq.store(0, std::memory_order_release);
+            g_prefinal_pcm_lost.store(false, std::memory_order_release);
+            g_pcm_preroll_pending.store(true, std::memory_order_release);
+            g_sse_parser.reset();
             g_turn_state.store(TurnState::kRecording,
                                std::memory_order_release);
-            g_prefinal_pcm_lost.store(false, std::memory_order_release);
-            g_sse_parser.reset();
 
             ESP_LOGI(kTag,
                      "event=ai.ws stage=start_turn_committed req=%s op=%lu turn_gen=%lu client=%p at_ms=%lld",
@@ -1697,37 +1701,66 @@ void PushPcm(const int16_t* samples, size_t count)
         return;
     }
 
-    while (count > 0) {
-        const size_t chunk_count = std::min(count, kPcmFramesPerBlock);
-
-        PcmBlock block = {};
-        block.seq = g_seq.fetch_add(1, std::memory_order_relaxed);
-        block.flags = wqn::kWflvFlagStream;
-        block.sample_count = static_cast<uint16_t>(chunk_count);
-        std::memcpy(block.samples, samples, chunk_count * sizeof(int16_t));
-
-        if (xQueueSend(g_pcm_queue, &block, 0) != pdTRUE) {
-            bool expected = false;
-            if (g_prefinal_pcm_lost.compare_exchange_strong(
-                    expected, true, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                ESP_LOGW(kTag,
-                         "PCM queue overflow: queued=%u capacity=%u; latching pre-FINAL failure",
-                         static_cast<unsigned>(uxQueueMessagesWaiting(g_pcm_queue)),
-                         static_cast<unsigned>(kPcmQueueLength));
-                if (g_transport_task != nullptr) {
-                    xTaskNotify(
-                        g_transport_task, kEvtBitResetRequired, eSetBits);
-                }
+    const int16_t* backlog = nullptr;
+    size_t backlog_count = 0;
+    if (g_pcm_preroll_pending.exchange(false, std::memory_order_acq_rel)) {
+        // Called by the sole capture producer after this live block has been
+        // appended. Keep the readiness check and replay in one entry point:
+        // a tap rejected before commit must not fall through into live PCM
+        // if the owner commits immediately afterwards.
+        const size_t captured = wqn::PeekAudioCaptureSamples(&backlog);
+        if (backlog == nullptr || captured < count) {
+            // Missing prefix evidence must not become a successful truncated
+            // turn. The existing pre-FINAL failure path permits batch recovery.
+            g_prefinal_pcm_lost.store(true, std::memory_order_release);
+            if (g_transport_task != nullptr) {
+                xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
             }
-            break;
+            return;
         }
-        if (g_transport_task != nullptr) {
-            xTaskNotify(g_transport_task, kEvtBitPcmPending, eSetBits);
-        }
+        backlog_count = captured - count;
+        ESP_LOGI(kTag, "preroll replay: samples=%u ms=%u before live tap",
+                 static_cast<unsigned>(backlog_count),
+                 static_cast<unsigned>(backlog_count / 16));
+    }
 
-        samples += chunk_count;
-        count -= chunk_count;
+    // Both spans are enqueued by the same capture task, even when the owner
+    // drains blocks between sends. No later tap can overtake the prefix.
+    for (unsigned span = 0; span < 2; ++span) {
+        const int16_t* cursor = span == 0 ? backlog : samples;
+        size_t remaining = span == 0 ? backlog_count : count;
+        while (remaining > 0) {
+            const size_t chunk_count = std::min(remaining, kPcmFramesPerBlock);
+
+            PcmBlock block = {};
+            block.seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+            block.flags = wqn::kWflvFlagStream;
+            block.sample_count = static_cast<uint16_t>(chunk_count);
+            std::memcpy(block.samples, cursor, chunk_count * sizeof(int16_t));
+
+            if (xQueueSend(g_pcm_queue, &block, 0) != pdTRUE) {
+                bool expected = false;
+                if (g_prefinal_pcm_lost.compare_exchange_strong(
+                        expected, true, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    ESP_LOGW(kTag,
+                             "PCM queue overflow: queued=%u capacity=%u; latching pre-FINAL failure",
+                             static_cast<unsigned>(uxQueueMessagesWaiting(g_pcm_queue)),
+                             static_cast<unsigned>(kPcmQueueLength));
+                    if (g_transport_task != nullptr) {
+                        xTaskNotify(
+                            g_transport_task, kEvtBitResetRequired, eSetBits);
+                    }
+                }
+                return;
+            }
+            if (g_transport_task != nullptr) {
+                xTaskNotify(g_transport_task, kEvtBitPcmPending, eSetBits);
+            }
+
+            cursor += chunk_count;
+            remaining -= chunk_count;
+        }
     }
 }
 
@@ -1739,6 +1772,17 @@ FinalHandoffResult SendFinalAndWait(const std::string& /*request_id*/,
     if (cur != TurnState::kRecording || g_pcm_queue == nullptr ||
         !g_session_ready.load(std::memory_order_acquire) ||
         g_prefinal_pcm_lost.load(std::memory_order_acquire)) {
+        return FinalHandoffResult::kDefinitelyNotSent;
+    }
+
+    if (g_pcm_preroll_pending.load(std::memory_order_acquire)) {
+        // Capture can stop between turn commit and the next tap. No producer
+        // replayed its prefix, so FINAL must not certify an empty/truncated
+        // clip. Retire this receiving connection and let the caller use its
+        // complete stopped capture through the existing safe batch path.
+        if (g_transport_task != nullptr) {
+            xTaskNotify(g_transport_task, kEvtBitResetRequired, eSetBits);
+        }
         return FinalHandoffResult::kDefinitelyNotSent;
     }
 

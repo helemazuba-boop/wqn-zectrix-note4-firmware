@@ -27,8 +27,8 @@ namespace wqn {
 // updating its own accumulation state.
 void AgentVoiceRegisterDeltaCallback(WqnAiSseCallback cb, void* ctx);
 
-// Ensure the transport is connected, arm the one-shot preroll replay and start
-// a tier=agent turn. Failures are reported so the caller can fall back to the
+// Ensure the transport is connected and start a tier=agent turn. The transport
+// commits capture replay with the turn. Failures let the caller fall back to the
 // batch endpoint; they are never fatal.
 esp_err_t AgentVoiceTurnStart(const std::string& token,
                               const std::string& request_id,

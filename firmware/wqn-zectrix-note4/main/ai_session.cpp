@@ -106,37 +106,10 @@ uint32_t g_current_turn_gen = 0;
 std::string g_prompt_request_id;
 bool g_reply_pending = false;
 std::atomic<bool> g_prompt_cancel_requested{false};
-// Set when a streaming turn becomes ready. The capture tap runs before the
-// WebSocket turn exists and PushPcm() drops everything it receives until the
-// turn reaches kRecording, so the audio captured during the TLS/turn-start
-// handshake never reaches the server. The tap replays it once, on its next
-// block, before forwarding live audio.
-std::atomic<bool> g_preroll_pending{false};
-
 void AudioCaptureTapHandler(const int16_t* samples, size_t count, void*)
 {
-    if (g_preroll_pending.exchange(false, std::memory_order_acq_rel)) {
-        // `samples` is the block that was just appended to the capture buffer,
-        // so everything before it is audio captured while the turn was still
-        // being established. Replaying it here -- rather than from the AI
-        // worker -- keeps the backlog and the live stream strictly ordered:
-        // both are enqueued from this one task, so the capture task cannot
-        // interleave a newer block ahead of the backlog.
-        //
-        // The split is exact because a capture block is kMaxMonoFrames (240)
-        // samples and a PCM queue block is kPcmFramesPerBlock (240). If either
-        // side changes, this replay has to be re-derived from a shared
-        // constant instead of `count`.
-        const int16_t* backlog = nullptr;
-        const size_t captured = wqn::PeekAudioCaptureSamples(&backlog);
-        if (backlog != nullptr && count > 0 && captured > count) {
-            const size_t backlog_samples = captured - count;
-            ESP_LOGI(kTag, "preroll replay: samples=%u ms=%u before live tap",
-                     static_cast<unsigned>(backlog_samples),
-                     static_cast<unsigned>(backlog_samples / 16));
-            wqn::stdpro_ws::PushPcm(backlog, backlog_samples);
-        }
-    }
+    // The transport owns admission and the first-block replay, so an early
+    // tap cannot consume the prefix before StartTurn actually commits.
     wqn::stdpro_ws::PushPcm(samples, count);
 }
 
@@ -1430,15 +1403,6 @@ void SetAiAudioCaptureTapEnabled(bool enabled)
     wqn::SetAudioCaptureTap(enabled ? &AudioCaptureTapHandler : nullptr, nullptr);
 }
 
-// [agent-voice] See the declarations in ai_session.h. The Agent voice pipe
-// drives its own stdpro_ws turn, so it needs the preroll arm and the request-id
-// generator without any of the STD session state that PrepareRecordingSession
-// installs.
-void ArmAiVoicePreroll()
-{
-    g_preroll_pending.store(true, std::memory_order_release);
-}
-
 std::string GenerateRequestId()
 {
     return GenerateAiRequestId();
@@ -1492,9 +1456,6 @@ esp_err_t StartAiRecordingSession()
     g_state.status_since_ms = esp_timer_get_time() / 1000;
     g_prepare_active = true;
     g_recording_requested = true;
-    // No backlog yet: anything still armed belongs to an earlier turn that
-    // never got a capture block to replay into.
-    g_preroll_pending.store(false, std::memory_order_release);
     const uint32_t prepare_generation = ++g_prepare_generation;
     g_prepare_command_generation = prepare_generation;
     g_worker_command = AiWorkerCommand::kPrepareRecording;
@@ -1978,11 +1939,6 @@ esp_err_t InitAiSession()
 }
 
 void SetAiAudioCaptureTapEnabled(bool) {}
-
-// [agent-voice] Stubs: the Agent tier is unreachable without AI features
-// (CONFIG_WQN_AGENT_ENABLE depends on WQN_AI_ENABLE), but agent_voice_pipe.cpp
-// keeps its signatures so both halves build against the same header.
-void ArmAiVoicePreroll() {}
 
 std::string GenerateRequestId()
 {

@@ -58,8 +58,13 @@ esp_err_t StartTurn(const std::string& request_id,
                     const char* reasoning_effort,
                     uint32_t* out_turn_gen = nullptr);
 
+// Capture-task only, after samples have been appended to the capture buffer.
+// The first admitted block of each committed turn queues the captured prefix
+// before live PCM. Calls before commit do not consume that replay obligation.
 void PushPcm(const int16_t* samples, size_t count);
 
+// If capture stopped before the first admitted tap, FINAL is definitely not
+// sent and the caller must retain the complete clip for safe batch fallback.
 FinalHandoffResult SendFinalAndWait(const std::string& request_id,
                                    int duration_ms,
                                    uint32_t timeout_ms);
