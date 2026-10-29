@@ -1237,6 +1237,9 @@ wqn::AiStreamingStatusView streaming_view{};
             const device_ui_internal::UiUpdate update =
                 ui_runtime.DispatchAiStreamingSnapshot(streaming_view);
             refresh_schedule = StrongerSchedule(refresh_schedule, update.refresh);
+            // Preserve waveform safety independently from schedule merging.
+            // The display path retains this across throttle/rejected submits.
+            display_tracking.force_next_submission |= update.force_full_refresh;
         }
 
 #if CONFIG_WQN_AI_ENABLE

@@ -1042,17 +1042,20 @@ UiUpdate UiRuntime::DispatchAiStreamingSnapshot(const wqn::AiStreamingStatusView
         visible_change = true;
         changed = true;
     }
-    if (state_.screen == wqn::UiScreen::kAi && view.force_full_render) {
+    const bool force_full = state_.screen == wqn::UiScreen::kAi && view.force_full_render;
+    if (force_full) {
         visible_change = true;
     }
     if (state_.screen == wqn::UiScreen::kAi) {
         changed = changed || state_.ai.status_detail != view.tool_label;
         state_.ai.status_detail = view.tool_label;
     }
-    return FinishEvent(
+    UiUpdate update = FinishEvent(
         AppEventKind::kAiStreamingSnapshot,
         visible_change ? RefreshSchedule::kAi : RefreshSchedule::kNone,
         changed);
+    update.force_full_refresh = force_full;
+    return update;
 }
 
 UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapshot)

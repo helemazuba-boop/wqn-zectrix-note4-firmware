@@ -57,6 +57,8 @@ struct UiUpdate {
     uint64_t revision = 0;
     bool state_changed = false;
     bool revision_advanced = false;
+    // Safety policy is independent from drawing cadence and pixel changes.
+    bool force_full_refresh = false;
 };
 
 // Single-task state owner. All methods must be called from DeviceUiTask; worker
