@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from types import SimpleNamespace
 
 from test_audio_runtime import function
 
@@ -18,13 +19,9 @@ def structure(source,name):
     return source[start:source.index('\n};',start)+3]
 
 
-def main():
-    root=Path(__file__).resolve().parents[1]
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--before')
-    parser.add_argument('--mutation',choices=('no-limit','no-backoff','bypass-owner','bypass-request',
-                                             'bypass-ui','reset-on-probe','stale-probe'))
-    args=parser.parse_args()
+def production_fixture(root, before=None, mutation=None):
+    """Share production extraction with the separate bounded-result proof."""
+    args=SimpleNamespace(before=before, mutation=mutation)
     def source(name):
         if args.before:
             return subprocess.check_output(['git','show',f'{args.before}:firmware/wqn-zectrix-note4/{name}'],cwd=root,text=True)
@@ -99,6 +96,17 @@ def main():
     for marker,body in pieces.items():
         if fixture.count(marker)!=1: raise SystemExit('FAIL: recovery fixture drift: '+marker)
         fixture=fixture.replace(marker,body)
+    return fixture, policy, has_recovery
+
+
+def main():
+    root=Path(__file__).resolve().parents[1]
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--before')
+    parser.add_argument('--mutation',choices=('no-limit','no-backoff','bypass-owner','bypass-request',
+                                             'bypass-ui','reset-on-probe','stale-probe'))
+    args=parser.parse_args()
+    fixture, policy, has_recovery = production_fixture(root, args.before, args.mutation)
     with tempfile.TemporaryDirectory(prefix='wqn-display-recovery-') as directory:
         tmp=Path(directory); (tmp/'display_recovery.h').write_text(policy)
         (tmp/'esp_err.h').write_text('#pragma once\nusing esp_err_t=int;\nconstexpr int ESP_OK=0,ESP_FAIL=-1,ESP_ERR_INVALID_STATE=259;\n')

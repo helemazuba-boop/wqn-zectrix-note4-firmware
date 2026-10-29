@@ -48,6 +48,7 @@ def cases():
         ('word_ack_upload', 'R-21: ACK batches, failures, yields and quiet maintenance', ()),
         ('agent_disabled', 'R-21: disabled Agent entry points refuse work', ()),
         ('display_recovery', 'R-10: cross-intent failure budget and recovery at 100/1000 Hz', ()),
+        ('display_result_capacity', 'R-04: reserved queue capacity and receive-before-ACK at 100/1000 Hz', ()),
     ):
         result.append(Case(name, model, 'runtime', (f'test_{name}.py', *args)))
     for name, model in (
@@ -62,6 +63,10 @@ def cases():
     for mutation in ('no-gap-escalation', 'forget-gap-session', 'drop-restored-attempt', 'retire-other-session'):
         result.append(Case(f'sync-{mutation}', 'R-21: escalation, restored attempts and session isolation', 'controls',
                            ('test_sync_control.py', '--mutation', mutation), r'^FAIL: GAP:', r'\d+ PASS / [1-9]\d* FAIL \(production control paths; NOT HIL\)'))
+    for mutation in ('bypass-admission', 'early-ack', 'duplicate-terminal', 'short-queue'):
+        result.append(Case(f'display-capacity-{mutation}', 'R-04: reservation/terminal/ACK proof assumptions', 'controls',
+                           ('test_display_result_capacity.py', '--mutation', mutation), r'^FAIL capacity:',
+                           r'Display result capacity: \d+ checks, [1-9]\d* failures'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

@@ -1376,11 +1376,12 @@ void EpdRefreshTask(void*)
                                  esp_err_to_name(render_result));
             }
         }
-        // A result slot was reserved when the intent was accepted. Wait a
-        // bounded time for the UI to drain the queue; if it never does (UI
-        // task wedged in storage I/O or worse), drop the result and release
-        // the ledger slot ourselves so the refresh pipeline keeps serving
-        // frames instead of deadlocking on a consumer that may never return.
+        // Admission reserves a result slot until UI receive+ACK. With equal
+        // queue/ledger capacities and one terminal per accepted intent, this
+        // publication has room even if the UI stops draining. Send failure
+        // therefore indicates a broken delivery contract/queue fault, not
+        // ordinary backpressure. The defensive cleanup below is best effort;
+        // it does not reconcile a lost terminal with the UI's separate ledger.
         if (!PublishDisplayResult(terminal_result, pdMS_TO_TICKS(10000))) {
             xSemaphoreTake(g_refresh_mutex, portMAX_DELAY);
             UntrackOutstandingRevisionLocked(local_intent.revision);
