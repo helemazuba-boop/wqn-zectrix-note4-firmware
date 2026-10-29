@@ -10,12 +10,14 @@
 #include <dirent.h>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "pack_jsonl_reader.h"
 #include "device_protocol/word_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -57,8 +59,8 @@ constexpr size_t kMaxPackObjectNameBytes =
 static_assert(
     kMaxPackObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
     "word pack filename exceeds SPIFFS object-name budget");
-// Maximum contract line, its required LF, and the terminating NUL for fgets.
-constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
+// Maximum contract line, LF/CRLF framing, and the terminating NUL for fgets.
+constexpr size_t kLineBufferSize = kMaxLineBytes + 3;
 
 // [pack-io] The default stdio buffer is 128 B (newlib __BUFSIZ__) and SPIFFS
 // reports st_blksize = 0, so every fgets refill costs one VFS read: a 381 KB
@@ -117,10 +119,9 @@ void MaybeYieldPackRebuild(int64_t& last_yield_us)
 
 class JsonDocument {
 public:
-    explicit JsonDocument(const char* payload)
-        : root_(payload != nullptr && wqn::protocol::JsonNestingWithinLimit(
-                    payload, std::strlen(payload))
-                    ? cJSON_Parse(payload)
+    explicit JsonDocument(std::string_view payload)
+        : root_(wqn::protocol::JsonInputWithinLimits(payload.data(), payload.size())
+                    ? cJSON_ParseWithLength(payload.data(), payload.size())
                     : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
@@ -194,29 +195,11 @@ void ReleaseWordPackIndexAllocations(wqn::WordPackIndex* index)
 
 esp_err_t ReadBoundedPackLine(FILE* file, std::vector<char>* buffer, std::string* line)
 {
-    if (file == nullptr || buffer == nullptr || line == nullptr ||
-        buffer->size() != kLineBufferSize) {
+    if (buffer == nullptr || buffer->size() != kLineBufferSize) {
         return ESP_ERR_INVALID_ARG;
     }
-    line->clear();
-    if (std::fgets(buffer->data(), buffer->size(), file) == nullptr) {
-        return std::feof(file) ? ESP_ERR_NOT_FOUND : ESP_FAIL;
-    }
-    const size_t length = std::strlen(buffer->data());
-    if (length == 0 || (*buffer)[length - 1] != '\n') {
-        // Every v2 line is LF-terminated. Missing LF also detects an overlong
-        // line before cJSON sees a truncated prefix.
-        return ESP_ERR_INVALID_SIZE;
-    }
-    size_t content_length = length - 1;
-    if (content_length > 0 && (*buffer)[content_length - 1] == '\r') {
-        --content_length;
-    }
-    if (content_length > kMaxLineBytes) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    line->assign(buffer->data(), content_length);
-    return ESP_OK;
+    return wqn::ReadBoundedPackTextLine(
+        file, buffer, line, kMaxLineBytes, false);
 }
 
 }  // namespace
@@ -620,7 +603,7 @@ esp_err_t ScanPackFile(
         std::fclose(file);
         return result;
     }
-    JsonDocument metadata(line.c_str());
+    JsonDocument metadata(line);
     uint64_t metadata_revision = 0;
     uint64_t metadata_schema = 0;
     uint64_t metadata_entries = 0;
@@ -724,7 +707,7 @@ esp_err_t FindPinnedPackItem(
     std::fclose(file);
     if (result != ESP_OK) return result;
 
-    JsonDocument metadata(line.c_str());
+    JsonDocument metadata(line);
     uint64_t revision = 0;
     uint64_t schema_version = 0;
     uint64_t entry_count = 0;

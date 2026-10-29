@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <utime.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 
 #include "cJSON.h"
 #include "device_protocol/json_depth_guard.h"
+#include "pack_jsonl_reader.h"
 #include "device_protocol/note_study.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -72,8 +74,8 @@ constexpr size_t kMaxNoteImageObjectNameBytes =
 static_assert(
     kMaxNoteImageObjectNameBytes <= CONFIG_SPIFFS_OBJ_NAME_LEN - 1,
     "note image cache filename exceeds SPIFFS object-name budget");
-// Maximum contract line, its optional LF, and the terminating NUL for fgets.
-constexpr size_t kLineBufferSize = kMaxLineBytes + 2;
+// Maximum contract line, optional LF/CRLF, and the terminating NUL for fgets.
+constexpr size_t kLineBufferSize = kMaxLineBytes + 3;
 
 // [pack-io] The default stdio buffer is 128 B (newlib __BUFSIZ__) and SPIFFS
 // reports st_blksize = 0, so every fgets refill costs one VFS read: a 381 KB
@@ -132,10 +134,9 @@ void MaybeYieldPackRebuild(int64_t& last_yield_us)
 
 class JsonDocument {
 public:
-    explicit JsonDocument(const char* payload)
-        : root_(payload != nullptr && wqn::protocol::JsonNestingWithinLimit(
-                    payload, std::strlen(payload))
-                    ? cJSON_Parse(payload)
+    explicit JsonDocument(std::string_view payload)
+        : root_(wqn::protocol::JsonInputWithinLimits(payload.data(), payload.size())
+                    ? cJSON_ParseWithLength(payload.data(), payload.size())
                     : nullptr) {}
     ~JsonDocument() { cJSON_Delete(root_); }
 
@@ -214,29 +215,11 @@ void ReleaseNotePackIndexAllocations(wqn::NotePackIndex* index)
 // a missing LF that is NOT at EOF means the line overflowed the bounded buffer.
 esp_err_t ReadBoundedNotePackLine(FILE* file, std::vector<char>* buffer, std::string* line)
 {
-    if (file == nullptr || buffer == nullptr || line == nullptr ||
-        buffer->size() != kLineBufferSize) {
+    if (buffer == nullptr || buffer->size() != kLineBufferSize) {
         return ESP_ERR_INVALID_ARG;
     }
-    line->clear();
-    if (std::fgets(buffer->data(), buffer->size(), file) == nullptr) {
-        return std::feof(file) ? ESP_ERR_NOT_FOUND : ESP_FAIL;
-    }
-    const size_t length = std::strlen(buffer->data());
-    const bool has_newline = length > 0 && (*buffer)[length - 1] == '\n';
-    if (!has_newline && std::feof(file) == 0) {
-        // fgets stopped because the buffer filled before any newline: overlong.
-        return ESP_ERR_INVALID_SIZE;
-    }
-    size_t content_length = has_newline ? length - 1 : length;
-    if (content_length > 0 && (*buffer)[content_length - 1] == '\r') {
-        --content_length;
-    }
-    if (content_length > kMaxLineBytes) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    line->assign(buffer->data(), content_length);
-    return ESP_OK;
+    return wqn::ReadBoundedPackTextLine(
+        file, buffer, line, kMaxLineBytes, true);
 }
 
 esp_err_t ReadWholeFile(const char* path, std::string* out)
@@ -441,7 +424,7 @@ void AddManifestNotebookStems(
 esp_err_t ParseNoteManifestPayload(const std::string& payload, wqn::WqnNotePackManifest* manifest)
 {
     *manifest = {};
-    JsonDocument document(payload.c_str());
+    JsonDocument document(payload);
     cJSON* data = document.ok()
         ? cJSON_GetObjectItemCaseSensitive(document.root(), "data")
         : nullptr;
@@ -740,7 +723,7 @@ esp_err_t ScanNotePackFile(
         std::fclose(file);
         return result;
     }
-    JsonDocument metadata(line.c_str());
+    JsonDocument metadata(line);
     uint64_t metadata_schema = 0;
     uint64_t metadata_revision = 0;
     uint64_t metadata_count = 0;

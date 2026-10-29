@@ -275,6 +275,19 @@ static void TestDomain(const std::string& base, unsigned domain)
         Reset(base, domain); Write(backup, bad); SeedPacks(domain); Prune(domain);
         CHECK(removals.empty()); CheckSurvivors(domain, true); CHECK(Read(backup) == bad);
     }
+    // An unrepresentable backup is not evidence that any offline pack is dead.
+    // Validate the original stored bytes, including a raw-NUL document suffix.
+    std::string nul_value=valid;
+    const auto id_pos=nul_value.find(id(1)); CHECK(id_pos!=std::string::npos);
+    nul_value.insert(id_pos+id(1).size(),R"(\u0000shadow)");
+    std::string nul_key=valid;
+    const auto key_pos=nul_key.find("\"data\""); CHECK(key_pos!=std::string::npos);
+    nul_key.insert(key_pos+5,R"(\u0000shadow)");
+    const auto nul_unknown=valid.substr(0,valid.size()-1)+R"(,"extra":"x\u0000y"})";
+    for(const auto& bad:{nul_value,nul_key,nul_unknown,valid+'\0'+"ignored"}) {
+        Reset(base,domain); Write(backup,bad); SeedPacks(domain); Prune(domain);
+        CHECK(removals.empty()); CheckSurvivors(domain,true); CHECK(Read(backup)==bad);
+    }
     // A valid empty backup is known, so it permits deletion rather than deferral.
     Reset(base, domain);
     doc = cJSON_Parse(valid.c_str()); CHECK(doc != nullptr);
