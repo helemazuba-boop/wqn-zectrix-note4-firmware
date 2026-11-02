@@ -948,6 +948,9 @@ std::string MessageForAiRequestFailure(const wqn::WqnAiChatResponse& response, e
     if (response.error_code == "disabled") {
         return "AI 服务未启用";
     }
+    if (response.error_code == "network_lost") {
+        return "网络已断开，请重试";
+    }
     if (!response.error_message.empty()) {
         return std::string("AI 请求失败: ") + response.error_message;
     }
@@ -1042,10 +1045,17 @@ void TranscribeInput()
         g_state.input_armed_at_ms = esp_timer_get_time() / 1000;
         g_state.status = wqn::AiSessionStatus::kAwaitingConfirmation;
         g_state.toast_visible = false;
-    } else
-        SetErrorLocked(result == ESP_ERR_INVALID_SIZE ? "录音过短或未检测到语音"
-                       : transcript.size() > 4096     ? "输入过长，请缩短后重说"
-                                                      : "转写失败，请重新输入");
+    } else {
+        const char* failure = "转写失败，请重新输入";
+        if (result == ESP_ERR_INVALID_SIZE) {
+            failure = "录音过短或未检测到语音";
+        } else if (transcript.size() > 4096) {
+            failure = "输入过长，请缩短后重说";
+        } else if (!wqn::services::IsConnectivityOnline()) {
+            failure = "网络已断开，请重试";
+        }
+        SetErrorLocked(failure);
+    }
     g_state.user_partial.clear();
     g_state.toast_visible = false;
     MarkChanged();
@@ -1611,6 +1621,17 @@ void CancelAiPrompt()
         g_state.toast_visible = false;
         g_state.follow_active = false;
         MarkChanged();
+    } else if (g_state.status == AiSessionStatus::kWaitingReply ||
+               g_state.status == AiSessionStatus::kStreaming) {
+        // [std-cancel] The downlink is a single HTTP SSE request, so the only
+        // way to end it early is the cancel flag the read loop polls every
+        // 500 ms. Setting it here (rather than tearing the client down from the
+        // UI task) keeps the worker the sole owner of the client and cleanup.
+        if (!g_prompt_cancel_requested.load(std::memory_order_acquire)) {
+            g_prompt_cancel_requested.store(true, std::memory_order_release);
+            g_state.pending_text = "正在停止...";
+            MarkChanged();
+        }
     }
     xSemaphoreGive(g_lock);
 }

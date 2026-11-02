@@ -23,6 +23,7 @@ void xTaskNotifyGive(void*) { ++notifications; }
 
 namespace wqn {
 @@MODEL@@
+bool g_online = true;
 namespace runtime {
 enum class SleepBlocker { kAiSession };
 struct SleepLease {
@@ -34,6 +35,7 @@ namespace services {
 enum class ConnectivityDemandReason { kAiInteractive };
 struct ConnectivityDemand { void Reset() {} };
 ConnectivityDemand AcquireConnectivityDemand(ConnectivityDemandReason,const char*,const char*,int) { return {}; }
+bool IsConnectivityOnline() { return g_online; }
 }
 struct AudioCaptureChunk { int duration_ms=1500; size_t sample_count=24000; const int16_t* samples=nullptr; int peak=100,rms=10; };
 AiSessionState g_state;
@@ -116,6 +118,21 @@ int main() {
     g_state.status=AiSessionStatus::kTranscribing;g_worker_command=AiWorkerCommand::kSubmitSession;
     asr_result=ESP_OK;cancelled=true;TranscribeInput();
     CHECK(g_state.pending_input.empty()&&g_state.status==AiSessionStatus::kIdle);
+
+    // [net-lost] A transcription that fails while offline names the network,
+    // not the audio: the recording itself may have been fine.
+    g_state={};g_state.status=AiSessionStatus::kTranscribing;g_worker_command=AiWorkerCommand::kSubmitSession;
+    asr_result=ESP_FAIL;g_online=false;cancelled=false;TranscribeInput();
+    CHECK(g_state.status==AiSessionStatus::kError);
+    CHECK(g_state.assistant_text=="网络已断开，请重试");
+    g_online=true;
+
+    // [std-cancel] kWaitingReply/kStreaming are cancellable in place: the flag
+    // is the only signal the SSE read loop polls, and the label must say so.
+    g_state={};g_state.status=AiSessionStatus::kStreaming;g_worker_command=AiWorkerCommand::kSubmitPrompt;
+    g_prompt_cancel_requested.store(false);CancelAiPrompt();
+    CHECK(g_prompt_cancel_requested.load());
+    CHECK(g_state.pending_text=="正在停止...");
 
     g_state.status=AiSessionStatus::kAwaitingDecision;
     AiInteraction interaction;
