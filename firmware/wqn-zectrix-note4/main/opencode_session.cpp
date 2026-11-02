@@ -32,10 +32,10 @@ constexpr TickType_t kConnectivityWait = pdMS_TO_TICKS(20000);
 constexpr size_t kMaxPromptBytes = 4096;
 constexpr uint32_t kWorkerStackBytes = 9216;
 // [voice-pipe] How long Transcribe() waits for the agent WS turn to produce an
-// ASR result after FINAL. The ASR-only pipeline is fast (streamed deltas),
-// and a stuck turn should surface as an error long before the STD driver's
-// 10-minute chat budget.
-constexpr uint32_t kAgentVoiceFinalizeTimeoutMs = 15000;
+// ASR result after FINAL. The budget covers a full 60 s capture (the device
+// ceiling), so a slow ASR does not drop the turn, while a stuck turn still
+// surfaces long before the STD driver's 10-minute chat budget.
+constexpr uint32_t kAgentVoiceFinalizeTimeoutMs = 60000;
 
 enum class WorkerCommand : uint8_t {
     kNone,

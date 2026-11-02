@@ -24,7 +24,7 @@ namespace {
 constexpr char kTag[] = "wqn_audio_capture";
 
 constexpr int kStereoChannels = 2;
-constexpr int kMaxCaptureMs = 20000;
+constexpr int kMaxCaptureMs = 60000;
 constexpr size_t kMaxCaptureSamples =
     static_cast<size_t>(wqn::kAudioCaptureSampleRate) *
     (kMaxCaptureMs / 1000);
@@ -141,7 +141,7 @@ esp_err_t EnsureCaptureBuffer()
     if (g_audio.capture_buffer != nullptr) {
         return ESP_OK;
     }
-    // [ai-memory-fix] The 20 s PCM body is one fixed 640 KiB PSRAM allocation.
+    // [ai-memory-fix] The 60 s PCM body is one fixed 1.92 MB PSRAM allocation.
     // Keeping it for the process lifetime avoids allocator churn and removes
     // the old vector growth/copy chain that briefly kept several such blocks
     // alive. Never fall back to internal SRAM: task stacks and TLS need it.
@@ -149,7 +149,7 @@ esp_err_t EnsureCaptureBuffer()
         kMaxCaptureSamples * sizeof(int16_t),
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (g_audio.capture_buffer == nullptr) {
-        // [dev-diag] 640 KiB PSRAM reservation failure is the canonical
+        // [dev-diag] 1.92 MB PSRAM reservation failure is the canonical
         // memory-pressure signal (see the allocation notes above).
         wqn::RecordError("audio_cap", "PSRAM alloc failed");
         ESP_LOGE(
