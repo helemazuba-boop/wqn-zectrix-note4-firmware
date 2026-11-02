@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "services/connectivity_service.h"
 #include "sse_chunk.h"
 #include "storage.h"
 #include "wqn_api_stream_internal.h"
@@ -248,6 +249,18 @@ bool CheckDeadline(StreamContext* ctx)
   }
   if (ctx->terminal_event_seen || ctx->fatal) {
     return !ctx->timed_out;
+  }
+  // [net-lost] A station disconnect removes the netif and its IP, so the
+  // socket behind this stream cannot be resumed even if WiFi reconnects a
+  // second later. Waiting for the turn budget would only extend the wedge;
+  // fail now and let the owner offer a retry. The terminal gate above runs
+  // first so a completed stream is never relabelled.
+  if (!wqn::services::IsConnectivityOnline()) {
+    ctx->fatal = true;
+    ctx->error_code = "network_lost";
+    ctx->error_message = "network connection lost";
+    LogHttpTrace(ctx, "network_lost", ESP_FAIL);
+    return false;
   }
   if (ctx->deadline_us - esp_timer_get_time() < 1000) {
     ctx->fatal = true;

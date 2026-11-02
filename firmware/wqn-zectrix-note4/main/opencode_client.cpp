@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "agent_run_progress.h"
+#include "services/connectivity_service.h"
 #include "sse_chunk.h"
 
 namespace wqn {
@@ -527,6 +528,16 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
             if (request.switch_delivered != nullptr) {
                 request.switch_delivered->store(true, std::memory_order_release);
             }
+            break;
+        }
+        // [net-lost] Checked after the explicit exit intents so a user cancel
+        // or switch still wins. A station disconnect is unrecoverable for this
+        // socket, and the run keeps executing upstream, so failing here costs
+        // the stream, not the task.
+        if (!wqn::services::IsConnectivityOnline()) {
+            SetResultError(request.result, request.result->http_status,
+                           "network_lost", "Network connection lost");
+            request_result = ESP_FAIL;
             break;
         }
         // Drain even when the stream is silent; replies must not wait for a heartbeat.

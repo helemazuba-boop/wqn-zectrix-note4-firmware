@@ -1850,6 +1850,17 @@ bool RunConflictsWithInFlightRun(const wqn::OpenCodeResult& result)
     return result.http_status == 409 && result.error_code == "run_in_progress";
 }
 
+// [net-lost] A transport failure must say what the device knows and what it
+// does not: the run keeps executing upstream, so the honest advice is to
+// re-enter the session rather than to re-record.
+std::string AgentStreamFailureMessage(const wqn::OpenCodeResult& result)
+{
+    if (result.error_code == "network_lost") {
+        return "网络已断开，任务可能还在云端跑，可重新进入查看";
+    }
+    return result.detail.empty() ? "连接失败，请重试" : result.detail;
+}
+
 void RunPrompt()
 {
     g_interrupt_requested.store(false, std::memory_order_release);
@@ -1988,7 +1999,7 @@ void RunPrompt()
                  g_run_session_id.c_str());
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
-        SetErrorLocked(api_result.detail.empty() ? "连接失败，请重试" : api_result.detail);
+        SetErrorLocked(AgentStreamFailureMessage(api_result));
     } else {
         g_state.stream_active = false;
         // [detail] The brief tier hides tool work from the live stream, so the
@@ -2197,7 +2208,7 @@ void ObserveSession()
         RefreshAgentRunLeaseLocked();
         MarkChangedLocked();
     } else if (result != ESP_OK && !g_run_failed) {
-        SetErrorLocked(api_result.detail.empty() ? "连接失败，请重试" : api_result.detail);
+        SetErrorLocked(AgentStreamFailureMessage(api_result));
     } else {
         g_state.stream_active = false;
         RefreshAgentRunLeaseLocked();

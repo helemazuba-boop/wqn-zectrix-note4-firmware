@@ -21,6 +21,9 @@ constexpr int ESP_ERR_NOT_SUPPORTED=262, ESP_ERR_TIMEOUT=263, ESP_ERR_INVALID_RE
 inline const char* esp_err_to_name(int) { return "host"; }
 ''',
     'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
+    # The event stream checks the connectivity service directly; the host build
+    # has no netif, so it is stubbed as permanently online.
+    'services/connectivity_service.h': '#pragma once\nnamespace wqn { namespace services {\ninline bool IsConnectivityOnline() { return true; }\n} }\n',
     'esp_crt_bundle.h': '#pragma once\ninline int esp_crt_bundle_attach(void*) { return 0; }\n',
     'esp_heap_caps.h': '''#pragma once
 #include <cstdlib>
@@ -76,7 +79,8 @@ def main():
     owner = owner.replace('@@COMMAND@@', session[start:session.index('\n};', start)+3])
     bodies = '\n'.join(function(session, signature) for signature in (
         'bool AgentRunInFlightLocked(', 'void RefreshAgentRunLeaseLocked()\n{',
-        'void SetUserVisibleActivityLocked(', 'void SetErrorLocked(',
+        'void SetUserVisibleActivityLocked(', 'std::string AgentStreamFailureMessage(',
+        'void SetErrorLocked(',
         'bool RunConflictsWithInFlightRun(', 'void DiscardOutboundReplies()\n{',
         'void RunPrompt(', 'void FinishCommand('))
     owner = owner.replace('@@OWNER@@', bodies)
@@ -107,7 +111,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wqn-agent-progress-') as directory:
         tmp = Path(directory)
         for name, content in PORTS.items():
-            (tmp/name).write_text(content)
+            port = tmp/name
+            port.parent.mkdir(parents=True, exist_ok=True)
+            port.write_text(content)
         (tmp/'opencode_client.cpp').write_text(code)
         (tmp/'agent_run_progress.h').write_text(policy)
         (tmp/'test.cpp').write_text(fixture)

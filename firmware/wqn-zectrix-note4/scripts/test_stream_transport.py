@@ -78,6 +78,9 @@ void HostLog(const char*, const char*, ...) __attribute__((format(printf, 2, 3))
 #define ESP_LOGE(tag, ...) HostLog(tag, __VA_ARGS__)
 ''',
     'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
+    # The stream checks the connectivity service directly; the host build has
+    # no netif, so it is stubbed as permanently online.
+    'services/connectivity_service.h': '#pragma once\nnamespace wqn { namespace services {\ninline bool IsConnectivityOnline() { return true; }\n} }\n',
     'esp_mac.h': '''#pragma once
 #include <cstdint>
 #include "esp_err.h"
@@ -223,7 +226,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wqn-stream-') as tmp:
         tmp = Path(tmp)
         for name, content in PORTS.items():
-            (tmp/name).write_text(content)
+            port = tmp/name
+            port.parent.mkdir(parents=True, exist_ok=True)
+            port.write_text(content)
         (tmp/'wqn_api_stream.cpp').write_text(http)
         (tmp/'sse_chunk.h').write_text(sse_h)
         (tmp/'sse_chunk.cpp').write_text(source('sse_chunk.cpp'))

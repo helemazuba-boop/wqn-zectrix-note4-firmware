@@ -1674,6 +1674,21 @@ RefreshSchedule ApplyButtonEvent(
     if (state->screen == wqn::UiScreen::kAi &&
         (state->ai.tier == wqn::AiTier::kFlash || state->ai.tier == wqn::AiTier::kStd) &&
         event.button == wqn::ButtonId::kConfirm && long_press) {
+#if CONFIG_WQN_AI_ENABLE
+        // [std-cancel] A hold while the reply is in flight is the only escape
+        // from a stalled downlink: capture is rejected while the prompt worker
+        // owns the turn, so without this the page sits on "流式" until the
+        // 10-minute budget expires. Only the first edge acts; the repeats are
+        // swallowed with the rest of the legacy long-press path.
+        if (state->ai.tier == wqn::AiTier::kStd && !event.repeat &&
+            (state->ai.status == wqn::AiSessionStatus::kWaitingReply ||
+             state->ai.status == wqn::AiSessionStatus::kStreaming)) {
+            wqn::CancelAiPrompt();
+            wqn::AiSessionState snapshot;
+            if (wqn::CopyAiSessionToUi(&snapshot))
+                state->ai = std::move(snapshot);
+        }
+#endif
         return RefreshSchedule::kAi;
     }
 
