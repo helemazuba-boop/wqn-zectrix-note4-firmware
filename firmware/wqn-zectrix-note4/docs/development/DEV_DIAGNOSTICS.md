@@ -136,7 +136,7 @@ size_t CopyRecentErrors(ErrorRecord* out, size_t cap);
 |---|---|
 | `ui/persist_worker.cpp` `PersistWorkerTask` 命令结果非 ESP_OK | 各域持久化保存失败（一处覆盖全部域） |
 | `services/sync_service.cpp` 控制面整轮结束为失败分支 | 整轮同步失败原因（快照未覆盖的缺口） |
-| `audio_capture.cpp` 初始化失败 / 640KiB PSRAM 预留失败 / 握手超时 | 录音链路故障 |
+| `audio_capture.cpp` 初始化失败 / 1.92MB PSRAM 预留失败 / 握手超时 | 录音链路故障 |
 | `services/audio_service.cpp` I2C/ES8311/I2S 创建失败 | 音频硬件故障 |
 | `audio_player.cpp` DAC 初始化失败 / I2S 写失败 | 播放链路故障 |
 | `ai_session.cpp` 录音启动失败 / AI 请求失败 / worker 卡死上报 | AI 会话故障 |

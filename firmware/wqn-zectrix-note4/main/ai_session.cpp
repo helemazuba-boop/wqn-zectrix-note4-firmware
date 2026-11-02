@@ -42,7 +42,7 @@ constexpr int kMinAudioDurationMs = 1000;
 constexpr size_t kMinAudioSamples =
     static_cast<size_t>(wqn::kAudioCaptureSampleRate) *
     static_cast<size_t>(kMinAudioDurationMs) / 1000U;
-constexpr int kMaxAudioDurationMs = 20000;
+constexpr int kMaxAudioDurationMs = 60000;
 constexpr int kMinAudioPeak = 80;
 constexpr int kMinAudioRms = 8;
 constexpr TickType_t kWifiReadyWait = pdMS_TO_TICKS(35000);

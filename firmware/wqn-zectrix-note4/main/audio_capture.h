@@ -22,7 +22,7 @@ struct AudioCaptureChunk {
     bool empty() const { return samples == nullptr || sample_count == 0; }
 };
 
-// Reserves the fixed 20-second PCM buffer in PSRAM. Called during AI service
+// Reserves the fixed 60-second PCM buffer in PSRAM. Called during AI service
 // boot so normal runtime heap churn cannot fragment away the required block.
 esp_err_t InitAudioCaptureBuffer();
 esp_err_t StartAudioCapture();

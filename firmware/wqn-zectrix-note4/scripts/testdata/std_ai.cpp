@@ -69,7 +69,7 @@ std::string GenerateAiRequestId() { return "0123456789abcdef"; }
 esp_err_t StopAudioCapture(AudioCaptureChunk*) { return ESP_OK; }
 void ReleaseAudioCapturePower() {}
 constexpr int kAudioCaptureSampleRate=16000;
-constexpr int kMaxAudioDurationMs=20000;
+constexpr int kMaxAudioDurationMs=60000;
 void DumpCapturedPcmForAnalysis(const int16_t*,size_t,int) {}
 void AgentVoiceTurnAbort() {}
 bool AgentVoiceCancelRequested() { return cancelled; }

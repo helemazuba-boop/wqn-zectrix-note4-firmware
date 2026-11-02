@@ -28,7 +28,7 @@ constexpr uint32_t kAmbiguousWaitMs = 5000;
 // Release observation on the no-result path only (see finalize). Long enough
 // for a healthy turn to release, short enough not to stall the worker.
 constexpr uint32_t kReleaseObserveMs = 3000;
-constexpr uint32_t kDefaultFinalizeTimeoutMs = 15000;
+constexpr uint32_t kDefaultFinalizeTimeoutMs = 60000;
 
 StaticSemaphore_t g_result_sem_storage = {};
 SemaphoreHandle_t g_result_sem = nullptr;
