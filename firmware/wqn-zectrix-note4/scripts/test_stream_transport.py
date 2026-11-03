@@ -20,6 +20,9 @@ void HostLog(const char*, const char*, ...) __attribute__((format(printf, 2, 3))
 #define ESP_LOGE(tag, ...) HostLog(tag, __VA_ARGS__)
 ''',
     'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
+    'services/connectivity_service.h': '''#pragma once
+namespace wqn::services { bool IsConnectivityOnline(); }
+''',
     'esp_mac.h': '''#pragma once
 #include <cstdint>
 #include "esp_err.h"
@@ -71,7 +74,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mutation', choices=('http-sticky', 'ws-sticky', 'ws-continue',
                         'reset-sticky', 'no-deadline', 'renew-budget', 'no-data-deadline',
-                        'late-terminal', 'early-status', 'fixed-host'))
+                        'late-terminal', 'early-status', 'fixed-host', 'ignore-network'))
     parser.add_argument('--before', help='Use production sources from a git revision')
     args = parser.parse_args()
 
@@ -92,6 +95,7 @@ def main():
         'no-data-deadline': ('!CheckDeadline(ctx) || ctx->fatal', 'ctx->fatal'),
         'late-terminal': ('if (ctx->terminal_event_seen) {\n          break;', 'if (false) {\n          break;'),
         'early-status': ('CaptureHttpStatus(ctx, evt->client);', '/* status ignored in buffered body */'),
+        'ignore-network': ('if (!wqn::services::IsConnectivityOnline()) {', 'if (false) {'),
     }
     if args.mutation in mutations:
         needle, replacement = mutations[args.mutation]
@@ -135,6 +139,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wqn-stream-') as tmp:
         tmp = Path(tmp)
         for name, content in PORTS.items():
+            (tmp/name).parent.mkdir(parents=True, exist_ok=True)
             (tmp/name).write_text(content)
         (tmp/'wqn_api_stream.cpp').write_text(http)
         (tmp/'sse_chunk.h').write_text(sse_h)

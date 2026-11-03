@@ -21,6 +21,7 @@ struct Scenario {
     int64_t init_us = 0, open_us = 0, write_us = 0, headers_us = 0, packet_us = 0;
     bool fail_init = false, fail_open = false, fail_write = false, fail_headers = false;
     bool data_in_headers = false, drain_in_read = false, fail_read = false;
+    bool disconnect_on_write = false, disconnect_on_read = false, disconnect_in_callback = false;
     std::vector<std::string> packets;
 } scenario;
 struct HostClient {
@@ -33,6 +34,7 @@ struct HostClient {
 static HostClient client;
 static std::string requested_url,request_body;
 static int64_t clock_us = 0;
+static bool network_online = true;
 static int cleanup_count = 0, close_count = 0, read_count = 0, write_count = 0, written = 0;
 static std::vector<int> timeouts;
 static std::map<std::string, std::string> headers;
@@ -49,6 +51,7 @@ int64_t esp_timer_get_time() { return clock_us; }
 esp_err_t esp_read_mac(uint8_t* mac, int) { std::memset(mac, 1, 6); return ESP_OK; }
 constexpr char test_token[] = "SYNTHETIC_CREDENTIAL_MUST_NOT_BE_LOGGED";
 namespace wqn { bool IsValidAccessToken(const std::string& token) { return token == test_token; } }
+namespace wqn::services { bool IsConnectivityOnline() { return network_online; } }
 static void Emit(esp_http_client_event_id_t id, const std::string& data = {}) {
     esp_http_client_event_t event{id, &client, client.cfg.user_data,
                                  const_cast<char*>(data.data()), static_cast<int>(data.size())};
@@ -74,7 +77,9 @@ esp_err_t esp_http_client_open(HostClient*, int) {
 int esp_http_client_write(HostClient*, const char* data, int len) {
     ++write_count; clock_us += scenario.write_us;
     if (scenario.fail_write) return -1;
-    const int count = std::min(len, scenario.write_max); request_body.append(data,count); written += count; return count;
+    const int count = std::min(len, scenario.write_max); request_body.append(data,count); written += count;
+    if (scenario.disconnect_on_write) network_online = false;
+    return count;
 }
 static int Packet() {
     if (client.packet == scenario.packets.size()) return 0;
@@ -94,6 +99,7 @@ int esp_http_client_get_status_code(HostClient*) { return client.status; }
 int esp_http_client_get_errno(HostClient*) { return client.socket_errno; }
 int esp_http_client_read(HostClient*, char*, int) {
     ++read_count;
+    if (scenario.disconnect_on_read) network_online = false;
     if (scenario.quiet_reads > 0) { --scenario.quiet_reads;clock_us+=200000;return -ESP_ERR_HTTP_EAGAIN; }
     if (client.closed) return -1;
     if (scenario.fail_read) {
@@ -123,6 +129,7 @@ static std::vector<int16_t> pcm(5000, 42);
 static wqn::WqnAiChatResponse response;
 static void Callback(const wqn::WqnAiSseEvent& ev, void*) {
     delivered.push_back(ev); clock_us += callback_us;
+    if (scenario.disconnect_in_callback) network_online = false;
 }
 static wqn::WqnAiStreamRequest Request() {
     wqn::WqnAiStreamRequest request;
@@ -133,6 +140,7 @@ static wqn::WqnAiStreamRequest Request() {
 }
 static void Reset() {
     scenario = Scenario{}; clock_us = 0; cleanup_count = close_count = read_count = write_count = written = 0;
+    network_online = true;
     requested_url.clear();request_body.clear();
     headers.clear(); timeouts.clear(); delivered.clear(); log_lines.clear(); callback_us = 0; errno = 0;
     response = wqn::WqnAiChatResponse{};
@@ -196,6 +204,39 @@ int main() {
     CHECK(HasLog("stage=return req=same-id phase=upload"));
     Reset(); scenario.fail_read = true; CHECK(Run() == ESP_FAIL);
     CHECK(HasLog("read_result=-1 read_errno=" + std::to_string(ECONNRESET)));
+
+    // Offline requests and mid-upload loss fail before more audio is sent.
+    Reset(); network_online = false; scenario.packets = {final_frame};
+    CHECK(Run() == ESP_FAIL && response.error_code == "network_lost");
+    CHECK(written == 0 && read_count == 0 && delivered.empty());
+    CHECK(!HasLog("stage=socket_connected ") && LogCount("stage=network_lost ") == 1);
+    Reset(); scenario.disconnect_on_write = true; scenario.packets = {final_frame};
+    CHECK(Run() == ESP_FAIL && response.error_code == "network_lost");
+    CHECK(write_count == 1 && written == 2048 && read_count == 0 && delivered.empty());
+
+    // Loss during an SDK data callback rejects the frame before delivery.
+    Reset(); scenario.disconnect_on_read = true; scenario.packets = {final_frame};
+    CHECK(Run() == ESP_FAIL && response.error_code == "network_lost");
+    CHECK(read_count == 1 && delivered.empty() && LogCount("stage=network_lost ") == 1);
+
+    // A silent EAGAIN read must also notice the loss, before the turn budget.
+    Reset(); scenario.disconnect_on_read = true; scenario.quiet_reads = 1;
+    scenario.packets = {final_frame}; auto offline_quiet = Request(); offline_quiet.timeout_ms = 2000;
+    offline_quiet.cancelled = [] { return false; };
+    CHECK(wqn::UploadAiAudioChatStream(offline_quiet, &response) == ESP_FAIL);
+    CHECK(response.error_code == "network_lost" && read_count == 1 && clock_us < 2000000);
+    CHECK(delivered.empty() && close_count == 1 && cleanup_count == 1);
+
+    // Loss after a nonterminal callback cannot leak a buffered final frame.
+    Reset(); scenario.disconnect_in_callback = true; scenario.packets = {delta_frame + final_frame};
+    CHECK(Run() == ESP_FAIL && response.error_code == "network_lost");
+    CHECK(delivered.size() == 1 && delivered.front().kind == wqn::WqnAiSseEvent::Kind::kTextDelta);
+    // Once final was delivered, losing connectivity must preserve completion.
+    Reset(); scenario.disconnect_in_callback = true; scenario.packets = {final_frame};
+    CHECK(Run() == ESP_OK && response.error_code.empty());
+    CHECK(delivered.size() == 1 && response.conversation_id == "conv");
+    CHECK(LogCount("stage=network_lost ") == 0);
+
     Reset(); scenario.init_us = 100001; Timeout(); CHECK(write_count == 0);
     Reset(); scenario.open_us = 100001; Timeout(); CHECK(write_count == 0);
     Reset(); scenario.write_max = 1000; scenario.write_us = 21000; Timeout(); CHECK(written == 5000);
@@ -290,6 +331,10 @@ int main() {
     Reset();auto cancelled_request=Request();cancelled_request.cancelled=[] {return true;};
     CHECK(wqn::UploadAiAudioChatStream(cancelled_request,&response)!=ESP_OK);
     CHECK(response.error_code=="cancelled"&&written==0);
+    Reset(); network_online = false;
+    CHECK(wqn::UploadAiAudioChatStream(cancelled_request, &response) == ESP_FAIL);
+    CHECK(response.error_code == "cancelled" && written == 0 && read_count == 0);
+    CHECK(close_count == 1 && cleanup_count == 1 && LogCount("stage=network_lost ") == 0);
     wqn::WqnAiSseEvent decision;
     const std::string question=R"({"interaction_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","kind":"question","prompt":"选择","allow_custom":true,"options":[{"value":"yes","label":"是"}]})";
     CHECK(wqn::DecodeSseEvent("interaction.request",1,question,&decision));
