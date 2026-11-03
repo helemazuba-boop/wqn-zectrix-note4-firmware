@@ -49,6 +49,7 @@ def cases():
         ('agent_disabled', 'R-21: disabled Agent entry points refuse work', ()),
         ('display_recovery', 'R-10: cross-intent failure budget and recovery at 100/1000 Hz', ()),
         ('display_result_capacity', 'R-04: reserved queue capacity and receive-before-ACK at 100/1000 Hz', ()),
+        ('ws_event_lifetime', 'R-25: client generations, pending callbacks and legal SDK stop ordering', ()),
     ):
         result.append(Case(name, model, 'runtime', (f'test_{name}.py', *args)))
     for name, model in (
@@ -67,6 +68,10 @@ def cases():
         result.append(Case(f'display-capacity-{mutation}', 'R-04: reservation/terminal/ACK proof assumptions', 'controls',
                            ('test_display_result_capacity.py', '--mutation', mutation), r'^FAIL capacity:',
                            r'Display result capacity: \d+ checks, [1-9]\d* failures'))
+    for mutation in ('keep-backlog', 'ignore-client', 'ignore-generation', 'trust-raw-bits'):
+        result.append(Case(f'ws-lifetime-{mutation}', 'R-25: retired payload, client identity, generation and wake-only semantics', 'controls',
+                           ('test_ws_event_lifetime.py', '--mutation', mutation), r'^FAIL ',
+                           r'WS event lifetime: \d+ checks, [1-9]\d* failures'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

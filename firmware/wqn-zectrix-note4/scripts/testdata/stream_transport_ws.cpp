@@ -87,6 +87,7 @@ static std::vector<Terminal> terminals;
 static std::vector<wqn::WqnAiSseEvent> events;
 static void esp_websocket_client_stop(void*) { ++stopped; }
 static void esp_websocket_client_destroy(void*) { ++destroyed; }
+void RetireWsEvents() {}  // Callback lifetime is exercised by test_ws_event_lifetime.
 static int ready_completions = 0, failed_completions = 0;
 static void PublishCompletion(uint32_t, esp_err_t error, CmdDisposition) {
     if (error == ESP_OK) ++ready_completions;

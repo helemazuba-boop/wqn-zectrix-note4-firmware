@@ -18,9 +18,9 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-49 个执行项：25 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-14 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核新增 1 个运行时入口与
-4 个负例。已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
+54 个执行项：26 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+18 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+1 个运行时入口与 4 个负例。已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
 HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原本缺失。
 
 | 故障模型 | 生产行为与检查入口 |
@@ -32,6 +32,7 @@ HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原�
 | Flash 超大帧后的后续分片 | `test_flash_frame_assembly.py` 的真实有界组装器 |
 | EPD 失败预算、AI 强制全刷与 UI | `test_display_recovery.py`、`test_ai_force_full.py`、10 个 `test_ui_*` 检查 |
 | 结果容量与 receive-before-ACK 前提 | `test_display_result_capacity.py`；[R-04 当前结论与边界](DISPLAY_RESULT_CAPACITY_20261030.md) |
+| WS 旧连接回调及待处理通知 | `test_ws_event_lifetime.py`；[R-25 生命周期与验证边界](WS_EVENT_LIFETIME_20261103.md) |
 | UUID/count 边界、独立 storage owner 与期限 | `test_v3_sync_response.py`、`test_storage_prepare_deadline.py` |
 | Word 错误、检查点与启动恢复联动 | `test_sync_control.py`、`test_sync_retry.py`、`test_word_ack_upload.py`；原有真实 Word 持久化/重放 CI |
 | 功能关闭 | `test_agent_disabled.py` 的真实关闭分支入口；不宣称这是 Agent-off SDK 构建 |
@@ -59,7 +60,8 @@ Python 异常、sanitizer 错误、信号终止、超时或变异边界漂移均
 `build-*/config/sdkconfig.json`，不从 defaults 推断最终镜像配置。显式传入
 `-DWQN_BUILD_PROFILE=ai-local` 后，CMake ALL 目标检查 ESP32-S3、PSRAM、联网、控制
 协议、AI/Agent、EPD、PM/睡眠、空闲预算与关闭自测/开发菜单等 17 项。`ai-local-agent-off`
-显式允许 Agent 关闭；未选择契约的其他开发配置照常构建。检查器只输出差异键名，
+显式允许 Agent 关闭，`ai-local-dev-menu` 明确要求开发菜单开启；三种契约都检查全部
+17 项，默认产品契约不变。未选择契约的其他开发配置照常构建。检查器只输出差异键名，
 不输出完整配置或未知值。CI 默认构建选择 ai-local，构建日志出现 warning 即失败。
 
 ## 证据边界

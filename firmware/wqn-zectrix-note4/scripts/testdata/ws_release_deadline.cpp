@@ -155,6 +155,7 @@ namespace wqn {
 size_t PeekAudioCaptureSamples(const int16_t** out) { *out=capture.data(); return capture.size(); }
 }
 
+void RetireWsEvents() {}  // Callback lifetime is exercised by test_ws_event_lifetime.
 @@OWNER@@
 
 void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)

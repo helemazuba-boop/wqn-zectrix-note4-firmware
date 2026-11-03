@@ -18,6 +18,7 @@
 #include "voice_diagnostics.h"
 #include "network_response_limits.h"
 #include "turn_release_deadline.h"
+#include "ws_event_mailbox.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -133,6 +134,7 @@ constexpr uint32_t kEvtBitResetRequired       = (1 << 5);
 constexpr uint32_t kEvtBitEmergencyAbort      = (1 << 6);
 constexpr uint32_t kEvtBitEmergencyDisconnect = (1 << 7);
 constexpr uint32_t kEvtBitPcmPending           = (1 << 8);
+constexpr uint32_t kEvtBitWsCallbackPending   = (1 << 9);
 
 // Global synchronization and queue primitives
 QueueHandle_t g_pcm_queue = nullptr;
@@ -208,6 +210,63 @@ void* g_sse_user_ctx = nullptr;
 
 // Owned strictly inside VoiceWsTransportTask
 esp_websocket_client_handle_t g_ws_client = nullptr;
+
+// Context fields are immutable from registration until stop/destroy joins the
+// component's synchronous event dispatch. Retire only the protected mailbox
+// before joining; never overwrite context while a callback can still read it.
+struct WsCallbackContext {
+    esp_websocket_client_handle_t client = nullptr;
+    uint32_t generation = 0;
+};
+WsCallbackContext g_ws_callback_context;
+portMUX_TYPE g_ws_event_mux = portMUX_INITIALIZER_UNLOCKED;
+wqn::stdpro_ws::WsEventMailbox g_ws_events;
+constexpr uint32_t kWsCallbackEventBits = kEvtBitWsConnected |
+    kEvtBitWsDisconnected | kEvtBitWsError | kEvtBitTextData;
+
+bool BeginWsEvents(esp_websocket_client_handle_t client)
+{
+    portENTER_CRITICAL(&g_ws_event_mux);
+    const uint32_t generation = g_ws_events.Begin();
+    g_ws_callback_context = {client, generation};
+    portEXIT_CRITICAL(&g_ws_event_mux);
+    return generation != 0;
+}
+
+void RetireWsEvents()
+{
+    portENTER_CRITICAL(&g_ws_event_mux);
+    g_ws_events.Retire();
+    portEXIT_CRITICAL(&g_ws_event_mux);
+}
+
+bool IsCurrentWsCallback(const WsCallbackContext* context,
+                         const esp_websocket_event_data_t* event)
+{
+    if (context == nullptr || event == nullptr || context->client == nullptr ||
+        event->client != context->client) return false;
+    portENTER_CRITICAL(&g_ws_event_mux);
+    const bool current = g_ws_events.Matches(context->generation);
+    portEXIT_CRITICAL(&g_ws_event_mux);
+    return current;
+}
+
+void PostWsEvent(const WsCallbackContext* context, uint32_t bits)
+{
+    portENTER_CRITICAL(&g_ws_event_mux);
+    const bool posted = g_ws_events.Post(context->generation, bits);
+    portEXIT_CRITICAL(&g_ws_event_mux);
+    if (posted) xTaskNotify(g_transport_task, kEvtBitWsCallbackPending, eSetBits);
+}
+
+uint32_t TakeWsEvents()
+{
+    portENTER_CRITICAL(&g_ws_event_mux);
+    const uint32_t bits = g_ws_events.Take();
+    portEXIT_CRITICAL(&g_ws_event_mux);
+    return bits;
+}
+
 uint32_t g_active_conn_op_gen = 0;
 int64_t g_conn_deadline_ms = 0;
 
@@ -342,6 +401,9 @@ void DumpResourceLedger(const char* stage);
 
 void DoDestroyWs()
 {
+    // A pending fault may have been posted after the owner's last notify read.
+    // Retire its payload before joining; the wake bit can safely arrive later.
+    RetireWsEvents();
     g_turn_release_deadline.Reset();
     g_active_turn_asr_only = false;
     bool destroyed = false;
@@ -485,7 +547,7 @@ void TeardownFailedTurn(TeardownReason reason = TeardownReason::kTransportFault)
     g_turn_state.store(TurnState::kIdle, std::memory_order_release);
 }
 
-void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
+void WebsocketEventHandler(void* handler_arg, esp_event_base_t, int32_t event_id,
                            void* event_data)
 {
     if (g_transport_task == nullptr) {
@@ -493,6 +555,8 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
     }
     const auto* event =
         static_cast<const esp_websocket_event_data_t*>(event_data);
+    const auto* context = static_cast<const WsCallbackContext*>(handler_arg);
+    if (!IsCurrentWsCallback(context, event)) return;
 
     switch (static_cast<esp_websocket_event_id_t>(event_id)) {
         case WEBSOCKET_EVENT_CONNECTED: {
@@ -504,7 +568,7 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
             if (result != ESP_OK) {
                 ESP_LOGW(kTag, "set TCP_NODELAY failed: %s", esp_err_to_name(result));
             }
-            xTaskNotify(g_transport_task, kEvtBitWsConnected, eSetBits);
+            PostWsEvent(context, kEvtBitWsConnected);
             break;
         }
 
@@ -514,13 +578,13 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
                      event == nullptr ? 0 : event->close_status_code,
                      static_cast<long long>(esp_timer_get_time() / 1000));
             LogWsSocketEvent("socket_disconnected_detail", event);
-            xTaskNotify(g_transport_task, kEvtBitWsDisconnected, eSetBits);
+            PostWsEvent(context, kEvtBitWsDisconnected);
             break;
         }
 
         case WEBSOCKET_EVENT_ERROR: {
             LogWsSocketEvent("socket_error", event);
-            xTaskNotify(g_transport_task, kEvtBitWsError, eSetBits);
+            PostWsEvent(context, kEvtBitWsError);
             break;
         }
 
@@ -535,11 +599,9 @@ void WebsocketEventHandler(void*, esp_event_base_t, int32_t event_id,
                                  "StreamBuffer overflow (sent %u of %d) — "
                                  "fatal stream loss",
                                  static_cast<unsigned>(sent), event->data_len);
-                        xTaskNotify(g_transport_task, kEvtBitResetRequired,
-                                    eSetBits);
+                        PostWsEvent(context, kEvtBitResetRequired);
                     } else {
-                        xTaskNotify(g_transport_task, kEvtBitTextData,
-                                    eSetBits);
+                        PostWsEvent(context, kEvtBitTextData);
                     }
                 }
             }
@@ -802,9 +864,21 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
                 return;
             }
 
-            esp_websocket_register_events(
+            if (!BeginWsEvents(g_ws_client)) {
+                LogWsPhase("callback_generation_exhausted", cmd.request_id, cmd.gen, ESP_ERR_INVALID_STATE);
+                DoDestroyWs();
+                PublishCompletion(cmd.gen, ESP_ERR_INVALID_STATE, CmdDisposition::kExecuted);
+                return;
+            }
+            const esp_err_t register_err = esp_websocket_register_events(
                 g_ws_client, WEBSOCKET_EVENT_ANY,
-                WebsocketEventHandler, nullptr);
+                WebsocketEventHandler, &g_ws_callback_context);
+            if (register_err != ESP_OK) {
+                LogWsPhase("event_register_failed", cmd.request_id, cmd.gen, register_err);
+                DoDestroyWs();
+                PublishCompletion(cmd.gen, register_err, CmdDisposition::kExecuted);
+                return;
+            }
 
             ESP_LOGI(kTag,
                      "event=ai.ws stage=handshake_begin req=%s op=%lu client=%p remaining_ms=%lld at_ms=%lld",
@@ -976,6 +1050,10 @@ void ExecuteCtrlCmdSingleStep(const CtrlCmd& cmd)
 
 void HandleAllNotificationBits(uint32_t bits)
 {
+    // Raw task bits carry no client identity and can outlive stop/destroy.
+    // Only the active lifetime's payload may change socket state or feed text.
+    // PCM reset and emergency/control bits retain their existing semantics.
+    bits = (bits & ~kWsCallbackEventBits) | TakeWsEvents();
     if (bits & kEvtBitWsConnected) {
         g_is_connected.store(true, std::memory_order_release);
     }
