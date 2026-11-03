@@ -28,7 +28,11 @@ AI_LOCAL = {
     'WQN_AI_AUDIO_SELFTEST_ENABLE': False,
     'WQN_DEV_MENU_ENABLE': False,
 }
-PROFILES = {'ai-local': AI_LOCAL, 'ai-local-agent-off': dict(AI_LOCAL, WQN_AGENT_ENABLE=False)}
+PROFILES = {
+    'ai-local': AI_LOCAL,
+    'ai-local-agent-off': dict(AI_LOCAL, WQN_AGENT_ENABLE=False),
+    'ai-local-dev-menu': dict(AI_LOCAL, WQN_DEV_MENU_ENABLE=True),
+}
 
 
 def main():

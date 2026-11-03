@@ -25,7 +25,7 @@ project(wqn-zectrix-note4)
 
 # Opt in to a product contract after Kconfig has resolved all overrides. Custom
 # diagnostic/feature-off builds do not silently inherit the ai-local contract.
-set(WQN_BUILD_PROFILE "" CACHE STRING "Resolved profile contract: ai-local or ai-local-agent-off")
+set(WQN_BUILD_PROFILE "" CACHE STRING "Resolved profile contract: ai-local, ai-local-agent-off or ai-local-dev-menu")
 if(NOT WQN_BUILD_PROFILE STREQUAL "")
     add_custom_target(
         wqn_profile_check ALL

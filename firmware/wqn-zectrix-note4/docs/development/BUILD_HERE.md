@@ -222,3 +222,21 @@ for device work still required.
 
 - 2026-06-14: Removed 15 stale `build-*` dirs; moved 13 `.bat` files to `scripts/`;
   archived 15 `*.log` / `*.err` to `logs/archive-2026-06-14/`. Wrote this file.
+
+## 2026-11-03 robustness validation profiles (WSL)
+
+The existing `build-wsl` configuration has the development menu enabled. Keep
+its sdkconfig and validate that image explicitly with `WQN_BUILD_PROFILE=ai-local-dev-menu`.
+The product `ai-local` contract still requires the development menu disabled.
+R-25 also uses `build-robustness-prod-20261103` with its own sdkconfig so product
+validation does not overwrite the local development/WiFi configuration. Both
+contracts check all 17 policy keys; CI continues to select `ai-local`.
+
+```sh
+idf.py -B build-wsl -DWQN_BUILD_PROFILE=ai-local-dev-menu build
+idf.py -B build-robustness-prod-20261103 \
+  -DSDKCONFIG="$PWD/build-robustness-prod-20261103/sdkconfig" \
+  -DIDF_TARGET=esp32s3 -DWQN_BUILD_PROFILE=ai-local build
+```
+
+Builds, including these two configuration variants, do not replace device HIL.
