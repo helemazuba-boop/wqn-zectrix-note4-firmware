@@ -18,9 +18,10 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-54 个执行项：26 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-18 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
-1 个运行时入口与 4 个负例。已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
+60 个执行项：29 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+21 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
+已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
 HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原本缺失。
 
 | 故障模型 | 生产行为与检查入口 |
@@ -33,6 +34,7 @@ HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原�
 | EPD 失败预算、AI 强制全刷与 UI | `test_display_recovery.py`、`test_ai_force_full.py`、10 个 `test_ui_*` 检查 |
 | 结果容量与 receive-before-ACK 前提 | `test_display_result_capacity.py`；[R-04 当前结论与边界](DISPLAY_RESULT_CAPACITY_20261030.md) |
 | WS 旧连接回调及待处理通知 | `test_ws_event_lifetime.py`；[R-25 生命周期与验证边界](WS_EVENT_LIFETIME_20261103.md) |
+| 启动恢复、显式重置与不确定写入 | `test_storage_schema.py`、`test_storage_recovery.py`；[R-18 恢复入口与边界](STORAGE_RECOVERY_20261105.md) |
 | UUID/count 边界、独立 storage owner 与期限 | `test_v3_sync_response.py`、`test_storage_prepare_deadline.py` |
 | Word 错误、检查点与启动恢复联动 | `test_sync_control.py`、`test_sync_retry.py`、`test_word_ack_upload.py`；原有真实 Word 持久化/重放 CI |
 | 功能关闭 | `test_agent_disabled.py` 的真实关闭分支入口；不宣称这是 Agent-off SDK 构建 |
@@ -68,5 +70,6 @@ Python 异常、sanitizer 错误、信号终止、超时或变异边界漂移均
 
 工作流已接入上述入口；本地运行和 SDK 构建不能充当远端 CI 执行结果。合成 HIL
 smoke 保持解析器测试身份，动态栈水位、真实 EPD/BUSY、SPIFFS/掉电、网络阻塞、
-PCM 连续性、功耗与发布验收仍按统一清单执行。R-08 无副本维修、R-18 schema 自救、
-R-04 普通背压触发链当前未证实；异常 owner/queue 故障来源仍需新证据，其他候选/政策项继续单列。
+PCM 连续性、功耗与发布验收仍按统一清单执行。R-18 已增加本地恢复入口，设备验收
+后置；R-08 无副本无损维修仍待实现。R-04 普通背压触发链当前未证实；异常
+owner/queue 故障来源仍需新证据，其他候选/政策项继续单列。

@@ -25,6 +25,7 @@
 #include "runtime/wake_context.h"
 #include "services/sync_service.h"
 #include "ui/persist_worker.h"
+#include "ui/storage_recovery_ui.h"
 #include "ui/ui_internal.h"
 #include "ui/ui_runtime.h"
 #include "ui_model.h"
@@ -1773,51 +1774,7 @@ esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
         return start_result;
     }
 
-    char error_line[80] = {};
-    std::snprintf(
-        error_line,
-        sizeof(error_line),
-        "错误：%s (0x%lx)",
-        esp_err_to_name(storage_error),
-        static_cast<unsigned long>(storage_error));
-
-    wqn::UiFrame frame;
-    frame.screen = wqn::UiScreen::kProvisioning;
-    frame.prefer_full_refresh = true;
-    frame.lines = {
-        {wqn::UiTextStyle::kTitle, "存储恢复失败"},
-        {wqn::UiTextStyle::kWarning, "业务服务已安全停止"},
-        {wqn::UiTextStyle::kBody, error_line},
-        {wqn::UiTextStyle::kWrappedBody, "请重启设备；若仍失败，请重新烧录或检查 Flash。"},
-    };
-
-    constexpr wqn::display::DisplayRevision kRecoveryRevision = 1;
-    const wqn::display::DisplaySubmission submission =
-        device_ui_internal::RequestEpdUiRefresh(
-            frame,
-            "m7-storage-recovery",
-            kRecoveryRevision,
-            device_ui_internal::RefreshSchedule::kCommit,
-            wqn::display::WaveformRequirement::kFull);
-    if (!submission.accepted) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    wqn::display::DisplayResult result;
-    if (xQueueReceive(
-            device_ui_internal::g_display_result_queue,
-            &result,
-            pdMS_TO_TICKS(45000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    device_ui_internal::AcknowledgeDisplayResult(result.revision);
-    if (result.status != wqn::display::DisplayStatus::kPresented) {
-        return result.error == ESP_OK ? ESP_FAIL : result.error;
-    }
-
-    // The EPD owner continues running its configured idle deadline even when
-    // app_main enters the inert recovery loop and no normal UI task starts.
-    return ESP_OK;
+    return device_ui_internal::RunStorageRecoveryUi(storage_error);
 #else
     ESP_LOGE(kTag, "storage recovery UI unavailable because EPD UI is disabled");
     return ESP_ERR_NOT_SUPPORTED;

@@ -144,6 +144,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   cleanup decisions.
 - `docs/engineering/SYNC_V3_REPAIR.md` — sync repair findings, host checks, and
   remaining device verification.
+- `docs/engineering/STORAGE_RECOVERY_20261105.md` — boot recovery diagnostics,
+  physically confirmed reset intent and remaining storage/device acceptance.
 - `docs/engineering/WIFI_CONNECTIVITY_REPAIR.md` — provisioning and network
   switching repair record.
 

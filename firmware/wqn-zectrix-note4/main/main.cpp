@@ -177,7 +177,7 @@ extern "C" void app_main(void)
             storage_init_result,
             wqn::runtime::kStorageSchemaGeneration);
     }
-    // A corrupt/unrecoverable sync checkpoint must enter the same inert
+    // A corrupt/unrecoverable sync checkpoint must enter the same boot-only
     // recovery mode as a failed storage schema, before UI/cloud/audio tasks
     // can accept new work. The preparation step starts no synchronization.
     const esp_err_t sync_boot_result = wqn::services::PrepareSyncServiceAtBoot();

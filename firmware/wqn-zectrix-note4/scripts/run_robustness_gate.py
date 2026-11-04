@@ -42,6 +42,7 @@ def cases():
         ('json_string_boundaries', 'N-04/N-06: external NUL and Unicode identity', ()),
         ('pack_json_boundaries', 'N-06: complete persisted pack text', ()),
         ('note_index_delivery', 'N-02: delayed results across full/targeted lanes', ()),
+        ('storage_schema', 'R-18: explicit recovery intent, stale consent and boot replay', ()),
         ('sync_journal', 'N-06: opaque checkpoints and decode allocation faults', ()),
         ('sync_control', 'R-21: raw SEQUENCE_GAP, retry checkpoint and restart escalation', ()),
         ('sync_retry', 'R-21: bounded retries and independent outbox identities', ()),
@@ -55,6 +56,7 @@ def cases():
     for name, model in (
         ('ws_release_deadline', 'R-24: missing release and stale request/generation'),
         ('storage_prepare_deadline', 'R-07: absolute deadline and detached owner lifetime'),
+        ('storage_recovery', 'R-18: recovery model, owner delivery and UI confirmation'),
     ):
         for hz in (100, 1000):
             result.append(Case(f'{name}-{hz}', model, 'runtime',
@@ -72,6 +74,10 @@ def cases():
         result.append(Case(f'ws-lifetime-{mutation}', 'R-25: retired payload, client identity, generation and wake-only semantics', 'controls',
                            ('test_ws_event_lifetime.py', '--mutation', mutation), r'^FAIL ',
                            r'WS event lifetime: \d+ checks, [1-9]\d* failures'))
+    for mutation in ('short-hold', 'unpresented-reset', 'forget-uncertain'):
+        result.append(Case(f'recovery-{mutation}', 'R-18: fresh held confirmation, presentation and uncertain writes', 'controls',
+                           ('test_storage_recovery.py', '--part', 'model', '--mutation', mutation),
+                           r'^FAIL recovery-model:', r'Storage recovery model: \d+ checks, [1-9]\d* failures'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

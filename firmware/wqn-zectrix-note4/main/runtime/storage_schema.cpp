@@ -490,4 +490,66 @@ esp_err_t InvalidateStorageSchemaForFactoryReset()
     return CommitResetIntent(reset_id);
 }
 
+esp_err_t InspectStorageRecovery(StorageRecoverySnapshot* snapshot)
+{
+    if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
+    *snapshot = {};
+    snapshot->error = ReadSchemaMarker(
+        &snapshot->observed_generation, &snapshot->generation_found,
+        &snapshot->reset_id, &snapshot->reset_id_size);
+    if (snapshot->error != ESP_OK) return snapshot->error;
+    if (snapshot->generation_found &&
+        snapshot->observed_generation > kStorageSchemaGeneration) {
+        snapshot->reset_policy = StorageRecoveryResetPolicy::kNewerFirmwareRequired;
+        return ESP_OK;
+    }
+    bool pending = false;
+    snapshot->error = ReadResetIntent(&pending, &snapshot->pending_reset_id);
+    if (snapshot->error != ESP_OK) return snapshot->error;
+    snapshot->reset_policy = pending ? StorageRecoveryResetPolicy::kAlreadyPending
+                                     : StorageRecoveryResetPolicy::kAllowed;
+    return ESP_OK;
+}
+
+StorageRecoveryResetResult AuthorizeStorageRecoveryReset(
+    const StorageRecoverySnapshot& expected)
+{
+    StorageRecoveryResetResult result;
+    if (expected.error != ESP_OK ||
+        (expected.reset_policy != StorageRecoveryResetPolicy::kAllowed &&
+         expected.reset_policy != StorageRecoveryResetPolicy::kAlreadyPending)) {
+        result.error = ESP_ERR_INVALID_STATE;
+        return result;
+    }
+    SleepLease lease = SleepLease::TryAcquire(
+        SleepBlocker::kStorage, "storage-recovery-intent", __FILE__, __LINE__);
+    if (!lease) {
+        result.error = ESP_ERR_INVALID_STATE;
+        return result;
+    }
+    StorageRecoverySnapshot current;
+    result.error = InspectStorageRecovery(&current);
+    if (result.error != ESP_OK) return result;
+    if (current.reset_policy != expected.reset_policy ||
+        current.generation_found != expected.generation_found ||
+        current.observed_generation != expected.observed_generation ||
+        current.reset_id_size != expected.reset_id_size ||
+        current.reset_id != expected.reset_id ||
+        current.pending_reset_id != expected.pending_reset_id) {
+        result.error = ESP_ERR_INVALID_STATE;
+        return result;
+    }
+    if (current.reset_policy == StorageRecoveryResetPolicy::kAlreadyPending) {
+        result.error = ESP_OK;
+        result.outcome = StorageRecoveryResetOutcome::kRecorded;
+        return result;
+    }
+    ResetId reset_id = {};
+    esp_fill_random(reset_id.data(), reset_id.size());
+    result.error = CommitResetIntent(reset_id);
+    result.outcome = result.error == ESP_OK ? StorageRecoveryResetOutcome::kRecorded
+                                          : StorageRecoveryResetOutcome::kUncertain;
+    return result;
+}
+
 }  // namespace wqn::runtime

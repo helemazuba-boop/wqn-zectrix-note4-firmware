@@ -6,9 +6,9 @@ namespace wqn {
 
 esp_err_t StartDeviceUiIfEnabled();
 
-// M7 boot-recovery surface. Starts only the display pipeline, presents a
-// terminal storage failure, and powers the panel down after it is committed.
-// No input, cloud, audio, storage, or power-coordinator task is started.
+// Boot recovery starts display, input and the maintenance storage owner only.
+// Diagnostics/retry/explicit reset run without business services. The UI loop
+// returns on initialization failure; otherwise only an explicit reboot exits.
 esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error);
 
 }  // namespace wqn

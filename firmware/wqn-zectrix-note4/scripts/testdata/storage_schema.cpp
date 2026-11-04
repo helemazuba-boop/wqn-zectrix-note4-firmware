@@ -419,8 +419,98 @@ void Run(bool immediate) {
     CHECK(env.data["legacy"]["blob"].bytes == Bytes({9, 8, 7}));
     CHECK(env.files == original_files);
 }
+void Recovery(bool immediate) {
+    CHECK(InspectStorageRecovery(nullptr) == ESP_ERR_INVALID_ARG);
+    for (int shape = 0; shape < 8; ++shape) {
+        Reset(immediate);
+        if (shape < 3) SetGeneration(shape);
+        if (shape == 3) env.data.erase("wqn_boot");
+        if (shape == 4) env.data["wqn_boot"].erase("schema_gen");
+        if (shape == 5) env.data["wqn_boot"].erase("reset_id");
+        if (shape == 6) env.data["wqn_boot"]["reset_id"].bytes.resize(17);
+        const auto data = env.data; const auto files = env.files; const auto flash = env.flash;
+        StorageRecoverySnapshot snapshot;
+        CHECK(InspectStorageRecovery(&snapshot) == ESP_OK);
+        CHECK(snapshot.reset_policy == StorageRecoveryResetPolicy::kAllowed);
+        CHECK(env.data == data && env.files == files && env.flash == flash);
+        CHECK(Calls("init") == 0 && Calls("mount") == 0 && Calls("format") == 0);
+        CHECK(Calls("open-rw:wqn_boot") == 0 && env.random_calls == 0);
+        const auto result = AuthorizeStorageRecoveryReset(snapshot);
+        CHECK(result.error == ESP_OK && result.outcome == StorageRecoveryResetOutcome::kRecorded);
+        CHECK(HasIntent() && env.files == files && env.flash == flash);
+        CHECK(Calls("format") == 0 && Calls("whole-erase") == 0);
+        CHECK(env.data["net"] == data.at("net") && env.data["audio"] == data.at("audio"));
+        Reboot(); ExpectComplete();
+    }
+    for (uint32_t generation : {4u, 0xffffffffu}) {
+        Reset(immediate); SetGeneration(generation); SetIntent();
+        const auto data = env.data; StorageRecoverySnapshot snapshot;
+        CHECK(InspectStorageRecovery(&snapshot) == ESP_OK);
+        CHECK(snapshot.reset_policy == StorageRecoveryResetPolicy::kNewerFirmwareRequired);
+        CHECK(AuthorizeStorageRecoveryReset(snapshot).outcome == StorageRecoveryResetOutcome::kRejected);
+        CHECK(env.data == data && env.random_calls == 0 && Calls("get-size:reset_pending") == 0);
+    }
+    for (const char* fault : {"open-ro:wqn_boot", "get:schema_gen", "get-size:reset_id",
+                             "get-data:reset_id", "get-size:reset_pending", "get-data:reset_pending"}) {
+        Reset(immediate); SetIntent(); Fail(fault); const auto data = env.data;
+        StorageRecoverySnapshot snapshot;
+        CHECK(InspectStorageRecovery(&snapshot) == ESP_FAIL);
+        CHECK(snapshot.reset_policy == StorageRecoveryResetPolicy::kUnavailable);
+        CHECK(AuthorizeStorageRecoveryReset(snapshot).outcome == StorageRecoveryResetOutcome::kRejected);
+        CHECK(env.data == data && Calls("set:reset_pending") == 0);
+    }
+    for (int shape = 0; shape < 3; ++shape) {
+        Reset(immediate); SetIntent(); auto& intent = env.data["wqn_boot"]["reset_pending"].bytes;
+        if (shape == 0) intent.resize(27);
+        if (shape == 1) intent[6] = 2;
+        if (shape == 2) intent[8] = 4;
+        const auto data = env.data; StorageRecoverySnapshot snapshot;
+        CHECK(InspectStorageRecovery(&snapshot) == ESP_ERR_INVALID_STATE);
+        CHECK(AuthorizeStorageRecoveryReset(snapshot).outcome == StorageRecoveryResetOutcome::kRejected);
+        CHECK(env.data == data && Calls("set:reset_pending") == 0);
+    }
+    // Consent is bound to the complete inspected marker and pending intent.
+    for (int change = 0; change < 7; ++change) {
+        Reset(immediate); if (change >= 5) SetIntent();
+        StorageRecoverySnapshot snapshot; CHECK(InspectStorageRecovery(&snapshot) == ESP_OK);
+        if (change == 0) SetGeneration(2);
+        if (change == 1) env.data["wqn_boot"].erase("schema_gen");
+        if (change == 2) env.data["wqn_boot"]["reset_id"].bytes[0] ^= 1;
+        if (change == 3) env.data["wqn_boot"]["reset_id"].bytes.resize(15);
+        if (change == 4) SetIntent();
+        if (change == 5) env.data["wqn_boot"].erase("reset_pending");
+        if (change == 6) SetIntent(0x69);
+        const auto data = env.data;
+        const auto result = AuthorizeStorageRecoveryReset(snapshot);
+        CHECK(result.error == ESP_ERR_INVALID_STATE);
+        CHECK(result.outcome == StorageRecoveryResetOutcome::kRejected);
+        CHECK(env.data == data && Calls("set:reset_pending") == 0);
+    }
+    Reset(immediate); SetIntent(); StorageRecoverySnapshot snapshot;
+    CHECK(InspectStorageRecovery(&snapshot) == ESP_OK);
+    CHECK(snapshot.reset_policy == StorageRecoveryResetPolicy::kAlreadyPending);
+    CHECK(AuthorizeStorageRecoveryReset(snapshot).outcome == StorageRecoveryResetOutcome::kRecorded);
+    CHECK(Calls("set:reset_pending") == 0 && env.random_calls == 0);
+    Reset(immediate); CHECK(InspectStorageRecovery(&snapshot) == ESP_OK); env.allow_lease = false;
+    CHECK(AuthorizeStorageRecoveryReset(snapshot).outcome == StorageRecoveryResetOutcome::kRejected);
+    CHECK(Calls("set:reset_pending") == 0);
+    for (const char* fault : {"open-rw:wqn_boot", "set:reset_pending", "commit:wqn_boot"}) {
+        for (bool after : {false, true}) {
+            if (after && std::string(fault) == "open-rw:wqn_boot") continue;
+            Reset(immediate); CHECK(InspectStorageRecovery(&snapshot) == ESP_OK);
+            const auto files = env.files; const auto flash = env.flash;
+            Fail(fault, 1, ESP_FAIL, after);
+            const auto result = AuthorizeStorageRecoveryReset(snapshot);
+            CHECK(result.error == ESP_FAIL && result.outcome == StorageRecoveryResetOutcome::kUncertain);
+            CHECK(env.files == files && env.flash == flash && Calls("format") == 0);
+            const bool pending = HasIntent(); Reboot();
+            if (pending) ExpectComplete();
+            else { CHECK(Boot().action == StorageSchemaBootAction::kReady); CHECK(env.files == files); }
+        }
+    }
+}
 int main() {
-    Run(false); Run(true);
+    Run(false); Run(true); Recovery(false); Recovery(true);
     std::printf("PASS: boot schema %u checks in %u host scenarios (staged + immediate NVS); not HIL\n",
                 checks, cases);
 }

@@ -11,11 +11,12 @@ UI = '(anonymous namespace)::DeviceUiTask(void*)'
 SUBMIT = 'device_ui_internal::RequestEpdUiRefresh(wqn::UiFrame const&)'
 RENDER = UI + '::{lambda()#1}::operator()() const'
 INITIAL = UI + '::{lambda()#2}::operator()() const'
+RECOVERY = 'device_ui_internal::RunStorageRecoveryUi(int)'
 
 
 class StackGateTest(unittest.TestCase):
     def good(self):
-        return {UI: 1600, SUBMIT: 256, RENDER: 4512, INITIAL: 4416}
+        return {UI: 1600, SUBMIT: 256, RENDER: 4512, INITIAL: 4416, RECOVERY: 512}
 
     def passes(self, frames):
         return all(passed for _label, passed, _detail in check_frames(frames))
@@ -34,6 +35,18 @@ class StackGateTest(unittest.TestCase):
     def test_missing_submit(self):
         frames = self.good()
         del frames[SUBMIT]
+        self.assertFalse(self.passes(frames))
+
+    def test_recovery_requires_compiled_frame(self):
+        frames = self.good()
+        del frames[RECOVERY]
+        self.assertFalse(self.passes(frames))
+
+    def test_recovery_budget_boundary(self):
+        frames = self.good()
+        frames[RECOVERY] = 1024
+        self.assertTrue(self.passes(frames))
+        frames[RECOVERY] = 1040
         self.assertFalse(self.passes(frames))
 
     def test_one_render_only(self):
@@ -82,7 +95,9 @@ class StackGateTest(unittest.TestCase):
                 '42012000 <' + RENDER + '>:\n'
                 '42012000:  000000 entry a1, 4512\n'
                 '42013000 <' + INITIAL + '>:\n'
-                '42013000:  000000 entry a1, 0x1140\n')
+                '42013000:  000000 entry a1, 0x1140\n'
+                '42014000 <' + RECOVERY + '>:\n'
+                '42014000:  000000 entry a1, 0x200\n')
         self.assertEqual(entry_frames(text), self.good())
         self.assertTrue(self.passes(entry_frames(text)))
 
