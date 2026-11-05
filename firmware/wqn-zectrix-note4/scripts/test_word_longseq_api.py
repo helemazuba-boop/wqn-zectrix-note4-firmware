@@ -363,7 +363,7 @@ def main():
             'constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NO_MEM=0x101,\n'
             '    ESP_ERR_INVALID_ARG=0x102, ESP_ERR_INVALID_STATE=0x103,\n'
             '    ESP_ERR_NOT_FOUND=0x105, ESP_ERR_NOT_SUPPORTED=0x106, ESP_ERR_TIMEOUT=0x107,\n'
-            '    ESP_ERR_INVALID_RESPONSE=0x108, ESP_ERR_INVALID_SIZE=0x109;\n')
+            '    ESP_ERR_INVALID_RESPONSE=0x108, ESP_ERR_INVALID_SIZE=0x104;\n')
         (tmp / 'esp_check.h').write_text(
             '#pragma once\n#include "esp_err.h"\n'
             '#define ESP_RETURN_ON_ERROR(expr, ...) do { const esp_err_t e_ = (expr); '

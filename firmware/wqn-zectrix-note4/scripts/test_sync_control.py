@@ -20,7 +20,6 @@ def main():
     args = parser.parse_args()
     sync = (root / 'main/services/sync_service.cpp').read_text()
     store = (root / 'main/storage.cpp').read_text()
-    word = (root / 'main/word_study_store.h').read_text()
     dispatch = section(sync, 'void SyncServiceTask(', '\n#endif  // CONFIG_WQN_WIFI_STA_ENABLE')
     if dispatch.index('RetryCachedControlResponseIfDue();') >= dispatch.index('AcquireConnectivityDemand('):
         raise SystemExit('FAIL: local control commit is behind connectivity admission')
@@ -57,9 +56,7 @@ def main():
         '@@RETRY_CONFIG@@': section(sync, 'constexpr uint32_t kFullSyncRetryLadderMs[] =', '// RTC retention'),
         '@@OUTBOX_RETRY_CONFIG@@': section(sync, 'constexpr uint32_t kWordOutboxRetryBaseMs =', '// Retry ladder reaches'),
         '@@GAP_CONFIG@@': section(sync, 'constexpr uint8_t kWordOutboxSequenceGapEscalation =', '\nstd::string g_bootstrap_request_id;'),
-        '@@WORD_TYPES@@': 'namespace wqn {\n' + section(word, 'enum class WordPresentationPhase :', '\ntemplate <typename T>') +
-            section(word, 'struct DurableWordObservation {', '\nstruct WordOutboxSnapshot {') +
-            section(word, 'struct WordOutboxMaintenanceGate {', '// Moves one permanently rejected observation') + '\n}',
+        '@@WORD_TYPES@@': '#include "word_local_session.h"',
         '@@WORD_PORTS@@': (root / 'scripts/testdata/sync_word_gap_ports.cpp').read_text(),
         '@@WORD_CASES@@': (root / 'scripts/testdata/sync_word_gap_cases.cpp').read_text(),
         '@@PRODUCTION@@': '\n'.join(parts),
@@ -103,13 +100,24 @@ def main():
         raise SystemExit('FAIL: g++ unavailable')
     with tempfile.TemporaryDirectory(prefix='wqn-sync-control-') as tmp:
         binary = Path(tmp) / 'test'
+        (Path(tmp) / 'esp_heap_caps.h').write_text(
+            '#pragma once\n#include <cstdlib>\n#define MALLOC_CAP_SPIRAM 1\n'
+            'inline void* heap_caps_malloc(size_t n,int){return malloc(n);}\n'
+            'inline void heap_caps_free(void* p){free(p);}\n')
+        (Path(tmp) / 'esp_check.h').write_text(
+            '#pragma once\n#include "esp_err.h"\n'
+            '#define ESP_RETURN_ON_ERROR(x,...) do { int e=(x); if(e!=ESP_OK) return e; } while(0)\n')
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=undefined', '-fno-sanitize-recover=all',
+                        '-I'+tmp,
                         '-I'+str(root/'scripts/testdata/sync_host'), '-I'+str(root/'main'),
                         '-I'+str(root/'components/device_protocol/include'), '-I'+str(cjson),
                         '-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="host-audit-only"',
                         '-DWQN_WORD_STUDY_SCHEMA_SHA256="host-audit-only"',
+                        '-DWQN_NOTE_STUDY_SCHEMA_SHA256="host-audit-only"',
+                        '-DWQN_PROBLEM_STUDY_SCHEMA_SHA256="host-audit-only"',
                         '-x', 'c++', '-', str(root/'components/device_protocol/v3.cpp'),
+                        str(root/'components/device_protocol/word_study.cpp'),
                         str(cjson/'cJSON.c'), '-o', str(binary)],
                        input=fixture, text=True, check=True, timeout=30)
         return subprocess.run([str(binary)], timeout=10).returncode

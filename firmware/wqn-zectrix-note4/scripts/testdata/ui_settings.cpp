@@ -34,6 +34,8 @@ struct TextRun { int x,y; const lv_font_t* font; std::string text; };
 std::vector<TextRun> drawn;
 int reads=0, submits=0, resets=0, powers=0, downloads=0, syncs=0, provisions=0, follows=0;
 bool persist_busy=false;
+int64_t clock_ms=1000;
+int64_t esp_timer_get_time() { return clock_ms*1000; }
 uint32_t submit_id=71;
 int allocations=0,releases=0,gray_refreshes=0,gray_result=ESP_OK,nav_result=ESP_OK;
 bool allocation_allowed=true,frame_is_gray=false;
@@ -56,14 +58,21 @@ enum class NoteObservationCommitState { kIdle,kPersisting };
 enum class ProblemVerdictCommitState { kIdle,kPersisting };
 struct WordDeckInfo { std::string deck_id,title; };
 @@MODEL@@
+@@DECK_REPAIR_TYPES@@
 struct WordState {
-    struct { WordObservationCommitState commit_state=WordObservationCommitState::kIdle; bool batch_flush_requested=false; } session;
+    struct { WordObservationCommitState commit_state=WordObservationCommitState::kIdle; bool batch_flush_requested=false,observation_effect_ready=false; } session;
     bool buffered=false;
     bool cloud_sync_failed=false;
     struct { bool has_manifest=true,pack_error=false; } pack_index;
     std::string default_deck_id,default_deck_title;
     std::vector<WordDeckInfo> deck_catalog;
+    DefaultDeckRepairState default_deck_repair;
+    bool default_deck_missing=false,scope_reset_pending_valid=false;
+    uint32_t scope_reset_save_op_id=0;
 };
+using WordAppState=WordState;
+uint32_t GetDeckScopeGeneration() { return 1; }
+@@DECK_REPAIR_MACHINE@@
 struct NoteState { struct { NoteObservationCommitState commit_state=NoteObservationCommitState::kIdle; } session; };
 struct ProblemState { ProblemVerdictCommitState commit_state=ProblemVerdictCommitState::kIdle; };
 struct HomeSummary { bool wifi_connected=true,charging=false,full=false; int battery_percent=84,wifi_rssi=-52; };
@@ -181,7 +190,7 @@ bool IsWordPackCloudBusy() { return pack_busy; }
 @@PROVISION_PAGE@@
 
 namespace device_ui_internal {
-enum class PersistKind { kSettingsAutoSync,kSettingsVolume,kSettingsImageRender,kSettingsDefaultDeck,kSettingsAiFollow };
+enum class PersistKind { kSettingsAutoSync,kSettingsVolume,kSettingsImageRender,kSettingsDefaultDeck,kSettingsAiFollow,kWordObservation };
 bool IsAnyPersistBusy() { return persist_busy; }
 bool IsPersistKindBusy(PersistKind) { return persist_busy; }
 uint32_t SubmitAutoSyncIntervalSave(uint32_t) { ++submits;return submit_id; }
@@ -221,6 +230,7 @@ public:
     UiUpdate DispatchVolumeSaveResult(int,uint32_t);
     UiUpdate DispatchImageRenderSaveResult(int,uint32_t);
     UiUpdate DispatchDefaultDeckChangeResult(int,uint32_t);
+    void PumpDefaultDeckAutoRepair(int64_t);
     UiUpdate DispatchAiFollowSaveResult(int,uint32_t);
 };
 @@TICK@@
@@ -232,7 +242,6 @@ using namespace device_ui_internal;
 using Dialog=wqn::SettingsDialog;
 using Button=wqn::ButtonId;
 using Event=wqn::ButtonEventType;
-int64_t clock_ms=1000;
 void event(wqn::UiState& state,Button button,Event type,bool repeat=false,int64_t advance=400) {
     clock_ms+=advance;
     wqn::ButtonEvent e{button,type,0,repeat,clock_ms,0};
@@ -442,6 +451,30 @@ int main(int argc,char** argv) {
     CHECK(SettingsSignature(f)!=provision_signature);
 
     UiRuntime runtime;auto& state=runtime.state_;auto& s=state.settings;
+    // Compile and exercise the real new pump/FSM/ACK alongside manual settings.
+    state.word_app.default_deck_id="gone";
+    state.word_app.default_deck_missing=true;
+    CHECK(wqn::ArmDefaultDeckRepair(&state.word_app,1));
+    state.word_app.buffered=true;
+    int repair_submits=submits;
+    runtime.PumpDefaultDeckAutoRepair(clock_ms);
+    CHECK(submits==repair_submits&&state.word_app.default_deck_repair.op_id==0);
+    state.word_app.buffered=false;
+    runtime.PumpDefaultDeckAutoRepair(clock_ms);
+    CHECK(submits==repair_submits+1&&state.word_app.default_deck_repair.op_id==submit_id);
+    runtime.DispatchDefaultDeckChangeResult(ESP_FAIL,submit_id);
+    CHECK(state.word_app.default_deck_repair.must_complete&&state.word_app.default_deck_id=="gone");
+    OpenSettingsDialog(&state,Dialog::kDefaultWordDeck);
+    repair_submits=submits;
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(submits==repair_submits&&!s.word_deck_pending_valid);
+    clock_ms+=30000;
+    ++submit_id;
+    runtime.PumpDefaultDeckAutoRepair(clock_ms);
+    CHECK(state.word_app.default_deck_repair.op_id==submit_id);
+    runtime.DispatchDefaultDeckChangeResult(ESP_OK,submit_id);
+    CHECK(!state.word_app.default_deck_repair.must_complete&&state.word_app.default_deck_id.empty());
+    state=wqn::UiState{};submit_id=71;
 #if CONFIG_WQN_DEV_MENU_ENABLE
     s.view=wqn::SettingsView::kDev;s.dev_selected=wqn::kDevRowDevInfo;
     const int dump_requests=wqn::runtime::memory_dump_requests;

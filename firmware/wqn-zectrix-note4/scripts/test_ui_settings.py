@@ -39,12 +39,16 @@ def main():
     refresh = args.refresh_source.read_text()
     storage = (root/'main/storage.cpp').read_text()
     model_cpp = (root/'main/ui_model.cpp').read_text()
+    word_header = (root/'main/word_app.h').read_text()
+    word_app = (root/'main/word_app.cpp').read_text()
     fixture = (root/'scripts/testdata/ui_settings.cpp').read_text()
     parts = {
         '@@CONNECTIVITY_TYPES@@': section((root/'main/services/connectivity_service.h').read_text(), 'enum class ConnectivityState', 'struct ConnectivityDemandTicket'),
         '@@WIFI_API@@': section((root/'main/services/connectivity_service.h').read_text(), 'enum class WifiNetworkRole', 'class ConnectivityDemand'),
         '@@CONNECTIVITY_SNAPSHOT@@': section((root/'main/services/connectivity_service.h').read_text(), 'struct ConnectivitySnapshot', 'ConnectivityDemand AcquireConnectivityDemand('),
         '@@MODEL@@': section(model, '// Settings-page row count', 'struct UiRuntimeStatus'),
+        '@@DECK_REPAIR_TYPES@@': section(word_header, 'struct DefaultDeckRepairState {', 'struct WordAppState {'),
+        '@@DECK_REPAIR_MACHINE@@': section(word_app, 'namespace {\nconstexpr int64_t kDeckRepairBaseBackoffMs', '\nvoid SetDefaultWordDeck('),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
         '@@FONT_TEXT@@': section(display, 'void DrawTextWithFont(', 'std::string TruncateUtf8TextToWidth(').replace('void DrawTextWithFont(', 'void DrawProductionTextWithFont('),

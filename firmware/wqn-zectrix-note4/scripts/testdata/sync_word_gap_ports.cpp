@@ -2,12 +2,34 @@
 // startup restoration below come from production source. This is NOT HIL.
 std::atomic<uint32_t> g_word_interaction_generation{0};
 std::string g_word_outbox_gap_terminal_session_id;
+std::string g_local_registered_session_id;
+constexpr size_t kMaxWordObservationBatchSize = 64;
 std::vector<wqn::DurableWordObservation> word_pending, word_quarantined, word_parked;
 std::map<std::string, std::string> word_errors;
 bool word_transport_failure = false, word_retryable = false;
 bool word_yield_after_quarantine = false;
 int word_calls = 0;
 namespace wqn {
+// These legacy retry/gap cases have no offline descriptor. Keep registration
+// unavailable and force the documented batch-404 single-RPC fallback. The
+// dedicated upload suite exercises real descriptor/receipt behavior.
+esp_err_t LoadLocalWordSessionDescriptor(const std::string&, LocalWordSessionDescriptor*) {
+    return ESP_ERR_NOT_FOUND;
+}
+esp_err_t RegisterLocalWordStudySessionV1(const std::string&,
+    const protocol::word_study_v1::LocalSessionRegistrationRequest&,
+    protocol::word_study_v1::LocalSessionRegistrationData*,
+    protocol::v3::Error*, int*, bool*) {
+    return ESP_ERR_NOT_FOUND;
+}
+esp_err_t SubmitWordStudyObservationBatchV1(const std::string&,
+    const protocol::word_study_v1::ObservationBatchRequest&,
+    protocol::word_study_v1::ObservationBatchData*,
+    protocol::v3::Error*, int* status, bool* transport) {
+    *status = 404;
+    *transport = false;
+    return ESP_ERR_NOT_FOUND;
+}
 esp_err_t PeekPendingWordObservationExcluding(const std::vector<std::string>& excluded,
                                              DurableWordObservation* out) {
     for (const auto& entry : word_pending) {

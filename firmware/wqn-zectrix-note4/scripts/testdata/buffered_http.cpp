@@ -15,7 +15,6 @@
 #include "network_response_limits.h"
 
 constexpr int HTTP_METHOD_GET = 0;
-constexpr int ESP_ERR_INVALID_SIZE = 0x104;
 constexpr char kTag[] = "buffered-test";
 @@TIMEOUT@@
 using wqn::network_limits::kMaxBufferedJsonBytes;
