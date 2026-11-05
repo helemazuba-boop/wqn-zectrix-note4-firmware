@@ -224,22 +224,27 @@ void WordHome(const wqn::WordAppSnapshot& word)
     WordText(kWordRight, kWordHomeSummaryY, today, 12, today_width, true);
     WordText(kWordLeft, kWordHomeNoticeY, word.hint.empty() ? word.status_line : word.hint, 12);
     DrawHorizontalLine(kWordLeft, kWordMenuTop - 2, kWordWidth);
-    const char* titles[] = {"智能复习", "随机浏览", "遗忘的单词"};
-    const char* subtitles[] = {"按到期顺序复习", "从当前词库随机抽取", "复习曾经答错的单词"};
-    const bool resume[] = {word.review_session_resumable, word.shuffle_session_resumable, word.mistakes_session_resumable};
+    const char* titles[] = {"智能复习", "顺序学习", "随机浏览", "遗忘的单词"};
+    const char* subtitles[] = {
+        "按到期顺序复习", "离线走完当前词库", "从当前词库随机抽取", "复习曾经答错的单词"};
+    const bool resume[] = {
+        word.review_session_resumable, false,
+        word.shuffle_session_resumable, word.mistakes_session_resumable};
     const std::string counts[] = {
         word.review_due_known ? std::to_string(word.review_due_count) + " 到期" : "-- 到期",
+        word.pack_ready ? "#" + std::to_string(word.sequential_cursor) + "/" +
+            std::to_string(word.sequential_total) : "未同步",
         std::to_string(word.total_count) + " 词",
         word.mistake_count >= 0 ? std::to_string(word.mistake_count) + " 词" : "-- 词",
     };
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         const int top = kWordMenuTop + i * kWordMenuPitch;
         WordFocus(top, kWordMenuPitch, static_cast<int>(word.home_selection) == i);
-        WordText(kWordLeft, top + 4, titles[i], 20, 225);
-        WordText(kWordRight, top + 10, word.pack_ready ? counts[i] : "未同步", 12, 130, true);
-        WordText(kWordLeft, top + 31,
-            !word.pack_ready ? "需同步词库" : resume[i] ? "可继续上次会话" : subtitles[i], 12);
-        if (i != 2) DrawHorizontalLine(kWordLeft, top + kWordMenuPitch, kWordWidth);
+        WordText(kWordLeft, top + 2, titles[i], 18, 210);
+        WordText(kWordRight, top + 6, word.pack_ready ? counts[i] : "未同步", 12, 130, true);
+        WordText(kWordLeft, top + 24,
+            !word.pack_ready ? "需同步词库" : resume[i] ? "可继续上次会话" : subtitles[i], 11);
+        if (i != 3) DrawHorizontalLine(kWordLeft, top + kWordMenuPitch, kWordWidth);
     }
 }
 

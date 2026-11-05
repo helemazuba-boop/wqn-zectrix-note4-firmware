@@ -66,6 +66,7 @@ void FinishOrLoadAdvancedReview(WordAppState* state) {
     if(!state->session.persisted.active) state->mode=WordAppMode::kReviewComplete;
     else ShowStudyCard(state);
 }
+void SaveSequentialCursor(WordAppState*) {}
 @@REDUCERS@@
 }
 using namespace wqn;

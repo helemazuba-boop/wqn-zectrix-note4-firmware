@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -34,6 +35,9 @@ struct PersistedWordSession {
     struct {std::vector<int> items; std::string session_id; protocol::word_study_v1::Mode mode=protocol::word_study_v1::Mode::kReview;} remote;
 };
 struct WqnWordEntry {std::string word,phonetic,meaning,example,example_translation,part_of_speech;};
+// [scope-count] Real pack index entry shape (fixed 37-byte deck_id) used by
+// the injected GetScopedCount helper -- the UI must count the SELECTED deck.
+struct WordPackIndexEntry {char deck_id[37] = {};};
 struct WordAppState {
     WordAppMode mode=WordAppMode::kHome;
     WordCardPhase card_phase=WordCardPhase::kFront;
@@ -41,22 +45,34 @@ struct WordAppState {
     bool cloud_sync_failed=false,review_session_resumable=false,shuffle_session_resumable=false,mistakes_session_resumable=false;
     uint16_t reviewed_today=20,correct_today=15;
     struct {WordObservationCommitState commit_state=WordObservationCommitState::kIdle; int batch_error=ESP_OK; bool batch_flush_requested=false,buffered=false; protocol::word_study_v1::Mode requested_mode=protocol::word_study_v1::Mode::kReview; PersistedWordSession persisted;} session;
-    struct {bool mounted=true,truncated=false;std::vector<int> entries;size_t pack_count=1,pack_bytes=100;std::string status_message;} pack_index;
+    struct {bool mounted=true,truncated=false;std::vector<WordPackIndexEntry> entries;size_t pack_count=1,pack_bytes=100;std::string status_message;} pack_index;
     struct {int cards_seen=0,reviewed=0,unknown=0,replayed=0;WordCompleteSelection complete_selection=WordCompleteSelection::kSequential;} review;
-    struct {uint32_t sequential_cursor=128;} chain;
+    struct {uint32_t sequential_cursor=128,sequential_total=3200;} chain;
     struct {size_t pending_count=0,blocked_count=0,suspended_count=0;} outbox;
     WqnWordEntry current_word;
-    std::string message,scoped_deck_title,default_deck_title;
+    std::string message,scoped_deck_title,default_deck_title,scoped_deck_id,default_deck_id;
+    // [scope-count] Memoized cache fields (mutable, refreshed by the helper).
+    uint32_t index_generation=1;
+    mutable std::string scoped_count_scope_id;
+    mutable size_t scoped_count_index_size=0;
+    mutable uint32_t scoped_count_index_generation=0;
+    mutable size_t scoped_count=0;
 };
 bool HasPackWords(const WordAppState& state){return !state.pack_index.entries.empty();}
 bool HasBufferedWordObservations(const WordAppState& state){return state.session.buffered;}
 bool IsSequentialSession(const PersistedWordSession& s){return s.remote.mode==protocol::word_study_v1::Mode::kSequential;}
+// Production WordSequenceAbsoluteCursor is injected through this host seam:
+// absolute = start_index + item ordinal at the window position (or end+1).
+int WordSequenceAbsoluteCursor(const PersistedWordSession& s,uint64_t* absolute){
+    *absolute=static_cast<uint64_t>(s.start_index)+s.position;return ESP_OK;
+}
 uint16_t ClampUint16(size_t v){return static_cast<uint16_t>(std::min<size_t>(v,UINT16_MAX));}
 std::atomic<int32_t> g_word_review_due_count{-1},g_word_mistake_count{-1};
 std::string WordAppProgressLabel(const WordAppState&);
 std::string WordAppStatusLine(const WordAppState&);
 @@COUNT_SETTERS@@
 @@COUNT_GUARD@@
+@@SCOPE_COUNT@@
 @@SNAPSHOT@@
 struct HomeSummary {bool wifi_connected=true,charging=false,full=false;int wifi_rssi=-50,battery_percent=84;};
 struct UiFrame {UiScreen screen=UiScreen::kWord;WordAppSnapshot word_app;HomeSummary home;};
@@ -109,6 +125,28 @@ int main(int argc,char** argv){
     const std::string output=argc>1?argv[1]:"";
     WordAppState state;state.pack_index.entries.resize(3200);state.default_deck_title="高中词汇";
     auto snapshot=BuildWordAppSnapshot(state);
+    // [scope-count] The UI must render the SELECTED deck's size, not a fake
+    // whole-pack total: tag a subset of entries with a deck id, select it as
+    // the default scope, and check total_count/sequential_total shrink to it.
+    {
+        WordAppState scoped;
+        scoped.pack_index.entries.resize(3200);
+        std::strcpy(scoped.pack_index.entries[0].deck_id,"deck-a");
+        std::strcpy(scoped.pack_index.entries[1].deck_id,"deck-a");
+        std::strcpy(scoped.pack_index.entries[2].deck_id,"deck-b");
+        scoped.default_deck_id="deck-a";
+        auto s=BuildWordAppSnapshot(scoped);
+        CHECK(s.total_count==2 && s.sequential_total==3200);  // pinned local whole-round total wins
+        CHECK(!s.review_due_known && s.mistake_count==-1);  // scoped hides all-decks hints
+        // A scoped override wins over the default.
+        scoped.scoped_deck_id="deck-b";
+        s=BuildWordAppSnapshot(scoped);
+        CHECK(s.total_count==1 && s.sequential_total==3200);  // local round pin remains invariant
+        // All-decks (no scope id) returns the full mounted count.
+        scoped.default_deck_id.clear();scoped.scoped_deck_id.clear();
+        s=BuildWordAppSnapshot(scoped);
+        CHECK(s.total_count==3200);
+    }
     CHECK(!snapshot.review_due_known&&snapshot.review_due_count==0&&snapshot.mistake_count==-1);
     {WordDueCountFixtureGuard guard;SetWordReviewDueCount(0);}
     CHECK(!BuildWordAppSnapshot(state).review_due_known);
@@ -131,7 +169,9 @@ int main(int argc,char** argv){
     SetWordReviewDueCount(24);SetWordMistakeCount(18);
     UiFrame frame;frame.word_app=BuildWordAppSnapshot(state);Render(frame,output,"home");
     CHECK(Seen("今日学习")&&Seen("已复习 20")&&Seen("答对 15")&&Seen("24 到期")&&Seen("18 词"));
-    for(int i=0;i<3;++i){frame.word_app.home_selection=static_cast<WordHomeSelection>(i);Render(frame,output,"focus-"+std::to_string(i));CHECK(pixels[(kWordMenuTop+i*kWordMenuPitch+10)*400+7]);}
+    CHECK(Seen("智能复习")&&Seen("顺序学习")&&Seen("随机浏览")&&Seen("遗忘的单词"));
+    CHECK(Seen("#128/3200"));
+    for(int i=0;i<4;++i){frame.word_app.home_selection=static_cast<WordHomeSelection>(i);Render(frame,output,"focus-"+std::to_string(i));CHECK(pixels[(kWordMenuTop+i*kWordMenuPitch+10)*400+7]);}
     frame.word_app.review_due_known=false;frame.word_app.mistake_count=-1;Render(frame,output,"unknown");CHECK(Seen("-- 到期")&&Seen("-- 词"));
     frame.word_app.review_due_known=true;frame.word_app.review_due_count=0;frame.word_app.mistake_count=0;Render(frame,output,"zero");CHECK(Seen("0 到期")&&Seen("0 词"));
     frame.word_app.pack_ready=false;Render(frame,output,"unsynced");CHECK(Seen("未同步")&&Seen("需同步词库"));

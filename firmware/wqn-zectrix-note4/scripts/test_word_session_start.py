@@ -33,18 +33,26 @@ def main():
     loop = args.loop.read_text(encoding='utf-8')
     inputs = args.input.read_text(encoding='utf-8')
     runtime = args.runtime.read_text(encoding='utf-8')
+    cloud_header = (root/'main/ui/ui_internal.h').read_text()
     pieces = {
+        '@@CLOUD_REQUEST@@': section(cloud_header, 'enum class WordCloudOp {', '\nstruct WordCloudResult {'),
         '@@POLICY@@': (root / 'main/word_batch_policy.h').read_text(encoding='utf-8').replace('#pragma once', ''),
         '@@ENUMS@@': section(header, 'enum class WordAppMode :', '\n// One word the user failed'),
         '@@STORE@@': section(store, 'struct StoredWordDeckId {', '\n// [ui-gates] Validates'),
         '@@OBSERVATION@@': section(store, 'struct DurableWordObservation {', '\nstruct WordOutboxSnapshot {'),
         '@@STATE@@': section(header, 'struct WordReplayEntry {', '\n// One mounted deck'),
-        '@@CHAIN@@': section(source, 'void StartSequentialWalk(', '\n// Long-press on a card:'),
+        '@@CHAIN@@': section(source, 'std::string MakeLocalStartIdentity(', '\nconstexpr char kTag') + section(source, 'void StartSequentialWalk(', '\n// Long-press on a card:'),
         '@@REQUEST@@': section(source, 'bool TakeWordSessionStartRequest(', '\nvoid CancelWordSessionStartResult('),
+        '@@CURSOR@@': section(source, 'bool TakeWordSessionCursorEffect(', '\nbool TakeWordCandidatePageRequest('),
+        '@@MUTATION@@': section(source, 'bool WordMutationBlockedByPendingWorker(', '\nbool IsIntakeSession('),
         '@@CANCEL@@': section(source, 'void CancelWordSessionStartResult(', '\nvoid ResetWordSessionForServerInvalid('),
         '@@BUFFER@@': section(source, 'bool HasBufferedWordObservations(', '\nbool BufferWordObservationEffect('),
         '@@BATCH_RESULT@@': section(source, 'bool ApplyWordObservationBatchResult(', '\nbool SameWordCardPrefetchIndex('),
         '@@FLUSH@@': section(runtime, 'void UiRuntime::RequestWordBatchFlush(', '\nbool UiRuntime::TakeWordCardPrefetchEntry('),
+        # [deck-autorepair] Inject the REAL gate (not an always-false stub), so
+        # the fixture actually exercises the new pending / must_complete guard
+        # in PumpWordSessionStart instead of faking it away.
+        '@@BLOCKING@@': section(source, 'bool DefaultDeckRepairBlocking(', '\nDefaultDeckRepairTick TickDefaultDeckRepair('),
     }
     if 'bool UiRuntime::TakeWordSessionStartRequest(' in runtime:
         pieces['@@RUNTIME@@'] = section(runtime, 'bool UiRuntime::TakeWordSessionStartRequest(', '\nbool UiRuntime::TakeWordCandidatePageRequest(')
@@ -70,6 +78,17 @@ void UiRuntime::RestoreWordSessionStartRequest() {wqn::RestoreWordSessionStartRe
     print(('PASS' if wired else 'FAIL') + ': loop pumps starts after old cloud completion and before candidate prefetch', flush=True)
     button_only_removed = 'QueueWordSessionStart(' not in inputs and 'TakeWordSessionStartRequest(' not in inputs
     print(('PASS' if button_only_removed else 'FAIL') + ': button reducer is not a second session-start dispatcher', flush=True)
+    local_branch = cloud.find('if (IsLocalSequentialOp(request))')
+    token_load = cloud.find('LoadValidTokenForTodo(&token)')
+    create_http = cloud.find('CreateWordStudySessionV1(')
+    local_before_token = 0 <= local_branch < token_load
+    print(('PASS' if local_before_token else 'FAIL') + ': local sequential start/page dispatch precedes token validation', flush=True)
+    local_helper = section(cloud, 'void ExecuteLocalWordStart(', '\nvoid ExecuteLocalWordPage(')
+    no_create = 'CreateWordStudySessionV1' not in local_helper and 'LoadValidTokenForTodo' not in local_helper
+    print(('PASS' if no_create else 'FAIL') + ': local sequential worker uses no create HTTP or token read', flush=True)
+    source_text = section(source, 'esp_err_t HandleWordAppInput(', '\nvoid ApplyWordPackIndex(') + section(source, 'bool ApplyWordSessionStartResult(', '\nstd::string WordAppSignature(')
+    no_ui_flash_write = 'SaveWordSequentialCursor(' not in source_text and 'SaveWordSessionCursor(' not in source_text and 'SavePersistedWordSession(' not in source_text and 'ClearPersistedWordSession(' not in source_text and 'LoadWordPackIndex(' not in source_text
+    print(('PASS' if no_ui_flash_write else 'FAIL') + ': reducer has no synchronous session/cursor storage writes', flush=True)
     fixture = (root / 'scripts/testdata/word_session_start.cpp').read_text(encoding='utf-8')
     for marker, body in pieces.items():
         if fixture.count(marker) != 1:
@@ -88,7 +107,7 @@ void UiRuntime::RestoreWordSessionStartRequest() {wqn::RestoreWordSessionStartRe
             '-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="host-fixture"',
             str(unit), '-o', str(binary)], check=True, timeout=30)
         result = subprocess.run([str(binary)], timeout=10).returncode
-    return 0 if result == 0 and wired and button_only_removed else 1
+    return 0 if result == 0 and wired and button_only_removed and local_before_token and no_create and no_ui_flash_write else 1
 
 
 if __name__ == '__main__':

@@ -59,6 +59,7 @@ struct PersistCommand {
     wqn::DurableWordObservation word_obs;
     std::vector<wqn::DurableWordObservation> word_batch;
     wqn::PersistedWordSession word_advanced;
+    wqn::PersistedWordSession word_cursor_session;
     wqn::WordPackIndexEntry word_card_index{};
     wqn::WqnWordEntry word_card_result;
     wqn::DurableNoteObservation note_obs;
@@ -245,6 +246,8 @@ esp_err_t ExecutePersistCommand(PersistCommand& command)
         case PersistKind::kWordSessionReset:
             // Generation-first scope reset; one foreground storage transaction.
             return wqn::ResetWordSessionScope();
+        case PersistKind::kWordSessionCursor:
+            return wqn::SaveWordSessionCursor(command.word_cursor_session);
         case PersistKind::kWordCardPrefetch:
             // The worker's stack is in PSRAM. All flash I/O must stay on the
             // storage task's internal stack; background priority yields to
@@ -288,6 +291,7 @@ void ClearCommandPayload(PersistCommand& command, bool retain_read_result = fals
     command.word_obs = {};
     command.word_batch.clear();
     command.word_advanced = {};
+    command.word_cursor_session = {};
     if (!retain_read_result) {
         command.word_card_index = {};
         command.word_card_result = {};
@@ -599,6 +603,16 @@ void EnqueueReservedWordCardPrefetch(const PersistTicket& ticket,
     EnqueueReserved(*command, ticket.slot_index, ticket.kind);
 }
 
+void EnqueueReservedWordSessionCursor(
+    const PersistTicket& ticket,
+    wqn::PersistedWordSession session)
+{
+    PersistCommand* command = ReservedCommand(ticket);
+    if (command == nullptr || ticket.kind != PersistKind::kWordSessionCursor) return;
+    command->word_cursor_session = std::move(session);
+    EnqueueReserved(*command, ticket.slot_index, ticket.kind);
+}
+
 bool TakePersistResultToApply(PersistKind kind, PersistResultReceipt* out)
 {
     if (!ValidKind(kind)) {
@@ -706,6 +720,7 @@ PersistDomain DomainForKind(PersistKind kind)
     switch (kind) {
         case PersistKind::kWordObservation:
         case PersistKind::kWordSessionReset:
+        case PersistKind::kWordSessionCursor:
             return PersistDomain::kWord;
         case PersistKind::kNoteObservation:
             return PersistDomain::kNote;

@@ -15,11 +15,30 @@
 #include "esp_timer.h"
 
 #include "storage.h"
+#include "word_local_session.h"
 
 namespace {
 
+std::string MakeLocalStartIdentity(const std::string& request_id)
+{
+    uint64_t value = 1469598103934665603ULL;
+    for (char c : request_id) {
+        value ^= static_cast<unsigned char>(c);
+        value *= 1099511628211ULL;
+    }
+    char out[37] = {};
+    std::snprintf(out, sizeof(out),
+        "%08x-%04x-%04x-%04x-%012llx",
+        static_cast<unsigned>(value & 0xFFFFFFFFU),
+        static_cast<unsigned>((value >> 32) & 0xFFFFU),
+                static_cast<unsigned>(((value >> 48) & 0x0FFFU) | 0x4000U),
+                static_cast<unsigned>(((value >> 20) & 0x3FFFU) | 0x8000U),
+        static_cast<unsigned long long>(value ^ 0x9E3779B97F4A7C15ULL) & 0xFFFFFFFFFFFFULL);
+    return out;
+}
+
 constexpr char kTag[] = "wqn_word";
-constexpr size_t kWordHomeSelectionCount = 3;
+constexpr size_t kWordHomeSelectionCount = 4;
 // Written by the sync service, read by the UI task when it builds a snapshot.
 std::atomic<int32_t> g_word_review_due_count{-1};
 // Mistakes-pool hint written by the sync service; -1 = unknown (no sync yet).
@@ -48,12 +67,56 @@ size_t SelectionIndex(wqn::WordHomeSelection selection)
     return static_cast<size_t>(selection);
 }
 
+// [scope-count] Effective study scope: the transient [词]-row override wins
+// over the NVS default; empty means the whole mounted library. This mirrors
+// TakeWordSessionStartRequest's scope resolution exactly.
+const std::string& EffectiveScopeDeckId(const wqn::WordAppState& state)
+{
+    return !state.scoped_deck_id.empty()
+        ? state.scoped_deck_id
+        : state.default_deck_id;
+}
+
+// [scope-count] One O(N) scan over the PSRAM POD index, only when the cache is
+// stale. WordPackIndexEntry::deck_id is a fixed char[37], so this is a bounded
+// strcmp with no allocation; N <= kMaxPackEntries (10000). Returned through a
+// memoized cache so BuildWordAppSnapshot / WordAppProgressLabel never rescan.
+size_t GetScopedCount(const wqn::WordAppState& state)
+{
+    const std::string& scope_id = EffectiveScopeDeckId(state);
+    const size_t index_size = state.pack_index.entries.size();
+    const uint32_t index_generation = state.index_generation;
+    if (state.scoped_count_index_generation == index_generation &&
+        state.scoped_count_index_size == index_size &&
+        state.scoped_count_scope_id == scope_id) {
+        return state.scoped_count;  // cache hit: no scan
+    }
+    size_t count = 0;
+    if (scope_id.empty()) {
+        count = index_size;
+    } else {
+        for (const wqn::WordPackIndexEntry& entry : state.pack_index.entries) {
+            if (std::strncmp(entry.deck_id, scope_id.c_str(),
+                             sizeof(entry.deck_id)) == 0) {
+                ++count;
+            }
+        }
+    }
+    state.scoped_count_scope_id = scope_id;
+    state.scoped_count_index_size = index_size;
+    state.scoped_count_index_generation = index_generation;
+    state.scoped_count = count;
+    return count;
+}
+
 wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
 {
     switch (index % kWordHomeSelectionCount) {
         case 0:
             return wqn::WordHomeSelection::kReview;
         case 1:
+            return wqn::WordHomeSelection::kSequential;
+        case 2:
             return wqn::WordHomeSelection::kShuffle;
         default:
             return wqn::WordHomeSelection::kMistakes;
@@ -65,8 +128,10 @@ wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
     switch (selection) {
         case wqn::WordHomeSelection::kReview:
             return "智能复习";
+        case wqn::WordHomeSelection::kSequential:
+            return "顺序学习";
         case wqn::WordHomeSelection::kShuffle:
-            return "随机";
+            return "随机浏览";
         case wqn::WordHomeSelection::kMistakes:
             return "遗忘的单词";
     }
@@ -89,6 +154,18 @@ wqn::WordCardPhase CardPhaseFromSession(
 bool IsReviewSession(const wqn::PersistedWordSession& session)
 {
     return session.remote.mode == wqn::protocol::word_study_v1::Mode::kReview;
+}
+
+bool WordMutationBlockedByPendingWorker(const wqn::WordAppState& state)
+{
+    return state.session.cursor_intent_armed ||
+        state.session.session_load_armed ||
+        state.session.session_clear_armed ||
+        state.session.session_worker_operation_id != 0 ||
+        state.session.commit_state ==
+            wqn::WordObservationCommitState::kPersisting ||
+        wqn::DefaultDeckRepairBlocking(state) ||
+        state.scope_reset_pending_valid;
 }
 
 bool IsIntakeSession(const wqn::PersistedWordSession& session)
@@ -583,6 +660,12 @@ void InstallWordPackIndex(
     const std::string status_message = index.status_message;
     state->pack_index = std::move(index);
     state->card_prefetch = {};
+    // [scope-count] Any re-install (boot load, pack sync, resumed-session pin)
+    // invalidates the scoped count, including a same-sized content change.
+    ++state->index_generation;
+    if (state->index_generation == 0) {
+        state->index_generation = 1;  // 0 is the "never computed" sentinel
+    }
     // Every install lands the library index unless the caller re-pins it
     // immediately (the resumed-session path below does).
     state->pack_index_pinned = false;
@@ -616,15 +699,15 @@ void SaveSequentialCursor(wqn::WordAppState* state)
     if (state == nullptr || !IsSequentialSession(state->session.persisted)) {
         return;
     }
-    const uint64_t index = static_cast<uint64_t>(state->session.persisted.start_index) +
-        state->session.persisted.position;
-    const uint32_t cursor =
-        index > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(index);
-    const esp_err_t result = wqn::SaveWordSequentialCursor(cursor);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "save sequential cursor failed: %s", esp_err_to_name(result));
+    uint64_t absolute = 0;
+    if (wqn::WordSequenceAbsoluteCursor(
+            state->session.persisted, &absolute) != ESP_OK) {
         return;
     }
+    const uint32_t cursor = absolute > UINT32_MAX
+        ? UINT32_MAX : static_cast<uint32_t>(absolute);
+    // RAM only: the durable authority is the replayed slot/journal and the
+    // immutable local descriptor. Legacy NVS has no pack/scope identity.
     state->chain.sequential_cursor = cursor;
 }
 
@@ -733,27 +816,24 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
     if (completed_sequential) {
         // The walk reached the end of the library: wrap the cursor so the next
         // 顺序过词库 starts over instead of asking for an empty slice.
-        state->chain.sequential_cursor = 0;
-        const esp_err_t wrap_result = wqn::SaveWordSequentialCursor(0);
-        if (wrap_result != ESP_OK) {
-            ESP_LOGW(
-                kTag,
-                "reset sequential cursor failed: %s",
-                esp_err_to_name(wrap_result));
+        // Only the descriptor's whole-scope total decides a real round end.
+        // A 500-item segment completion must continue, not wrap to zero.
+        if (state->chain.sequential_total > 0 &&
+            state->chain.sequential_cursor < state->chain.sequential_total) {
+            state->chain.segment_finished = true;
+        } else {
+            state->chain.sequential_cursor = 0;
+            state->chain.segment_finished = false;
+            state->chain.next_segment_armed = false;
+            state->message = "本轮完成，下次从第一词开始";
         }
     }
     if (state->pending_pack_index_ready) {
         ActivatePendingWordPackIndex(state);
-    } else if (state->pack_index_pinned) {
-        // Only a resumed session's pinned snapshot needs replacing. Pack files
-        // are immutable, so re-reading SPIFFS and re-hashing every pack on a
-        // plain completion would freeze the caller for seconds and change
-        // nothing (the boot contract fixtures hit this path hundreds of times).
-        wqn::WordPackIndex current;
-        if (wqn::LoadWordPackIndex(&current) == ESP_OK) {
-            InstallWordPackIndex(state, std::move(current), "");
-        }
     }
+    // A pinned index is retained in memory for the whole round. The reducer
+    // never performs a full library/index read here; worker results carry the
+    // next immutable descriptor/index payload when activation is allowed.
     if (completed_review) {
         state->mode = wqn::WordAppMode::kReviewComplete;
         state->review.complete_selection = wqn::WordCompleteSelection::kSequential;
@@ -764,7 +844,11 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
         return;
     }
     state->mode = wqn::WordAppMode::kHome;
-    state->message = "本轮浏览完成";
+    if (completed_sequential && state->message.empty()) {
+        state->message = "本段完成，准备下一段";
+    } else if (!completed_sequential) {
+        state->message = "本轮浏览完成";
+    }
 }
 
 // Long-press on a card: keep the cursor, remember it as resumable, go home.
@@ -776,14 +860,15 @@ void PauseWordSession(wqn::WordAppState* state)
         state->message = "正在保存暂存，请稍后暂停";
         return;
     }
-    state->session.persisted.paused = true;
-    SetStudySessionResumable(state, state->session.persisted.remote.mode, true);
     SaveSequentialCursor(state);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(
-        wqn::SaveWordSessionCursor(state->session.persisted));
-    state->mode = wqn::WordAppMode::kHome;
-    state->message = "本轮已暂停";
-    ActivatePendingWordPackIndex(state);
+    auto& intent = state->session;
+    intent.cursor_intent_armed = true;
+    intent.cursor_intent_paused = true;
+    intent.cursor_intent_home = true;
+    intent.cursor_intent_operation_id = 0;
+    intent.cursor_intent_session = intent.persisted;
+    intent.cursor_intent_session.paused = true;
+    state->message = "正在保存暂停进度";
 }
 
 // Resume a paused session of `mode`, pinning the session's own pack snapshot
@@ -794,72 +879,43 @@ bool TryResumePausedSession(
     wqn::protocol::word_study_v1::Mode mode)
 {
     if (state == nullptr) return false;
-    wqn::PersistedWordSession stored_session;
-    if (wqn::LoadPersistedWordSession(mode, &stored_session) == ESP_OK &&
-        stored_session.active && stored_session.paused &&
-        (stored_session.position < stored_session.remote.items.size() ||
-         (stored_session.position == stored_session.remote.items.size() &&
-          stored_session.remote.has_more))) {
-        state->session.persisted = std::move(stored_session);
-        if (!wqn::WordPackIndexMatchesSession(
-                state->pack_index, state->session.persisted)) {
-            wqn::WordPackIndex pinned_index;
-            const esp_err_t pinned_result = wqn::LoadWordPackIndexForSession(
-                state->session.persisted, &pinned_index);
-            if (pinned_result != ESP_OK || pinned_index.pack_error) {
-                state->message = "会话词包不可用";
-                return true;
-            }
-            InstallWordPackIndex(state, std::move(pinned_index), "已载入会话词包");
-            state->pack_index_pinned = true;
-        } else {
-            ESP_LOGI(kTag, "reuse in-memory word pack index for pinned session");
-        }
-    }
-    if (!state->session.persisted.active ||
-        !state->session.persisted.paused ||
-        state->session.persisted.remote.mode != mode ||
-        !(state->session.persisted.position <
-              state->session.persisted.remote.items.size() ||
-          (state->session.persisted.position ==
-               state->session.persisted.remote.items.size() &&
-           state->session.persisted.remote.has_more))) {
-        return false;
-    }
-    state->session.persisted.paused = false;
-    SetStudySessionResumable(state, mode, false);
-    if (mode == wqn::protocol::word_study_v1::Mode::kReview) {
-        // A resumed review session starts a fresh local pool: every word the
-        // user missed is already due=now on the server.
-        SeedReviewRuntime(&state->review, state->session.persisted.remote.session_id);
-    }
-    const esp_err_t cursor_result =
-        wqn::SaveWordSessionCursor(state->session.persisted);
-    if (cursor_result != ESP_OK) {
-        ESP_LOGW(kTag, "resume word session failed: %s", esp_err_to_name(cursor_result));
-        state->message = "会话未保存，请重试";
-        return true;
-    }
-    if (state->session.persisted.position ==
-        state->session.persisted.remote.items.size()) {
-        state->mode = wqn::WordAppMode::kSessionStarting;
-        state->session.page_requested = true;
-        state->message = "正在加载后续单词";
-        return true;
-    }
-    if (LoadCurrentReviewWord(state) != ESP_OK) {
-        state->message = "会话词包不可用";
-        return true;
-    }
-    ShowStudyCard(state);
-    state->message = "已继续上次会话";
-    RequestCandidatePageIfNeeded(state);
+    const bool known_resumable =
+        (mode == wqn::protocol::word_study_v1::Mode::kReview &&
+         state->review_session_resumable) ||
+        (mode == wqn::protocol::word_study_v1::Mode::kShuffle &&
+         state->shuffle_session_resumable) ||
+        (mode == wqn::protocol::word_study_v1::Mode::kMistakes &&
+         state->mistakes_session_resumable) ||
+        (mode == wqn::protocol::word_study_v1::Mode::kSequential &&
+         !state->chain.pinned_session_id.empty());
+    if (!known_resumable) return false;
+    auto& intent = state->session;
+    intent.session_load_armed = true;
+    intent.start_requested = true;
+    intent.requested_mode = mode;
+    intent.create_request_id.clear();
+    intent.session_load_mode = mode;
+    intent.session_worker_operation_id = 0;
+    state->mode = wqn::WordAppMode::kSessionStarting;
+    state->message = "正在恢复上次会话";
     return true;
 }
 
 }  // namespace
 
 namespace wqn {
+
+void ActivateLoadedPendingWordPackIndex(WordAppState* state)
+{
+    ActivatePendingWordPackIndex(state);
+}
+
+void InstallPreparedWordPackIndex(WordAppState* state, WordPackIndex index)
+{
+    if (state == nullptr) return;
+    InstallWordPackIndex(state, std::move(index), "");
+    state->pack_index_pinned = true;
+}
 
 void SetWordReviewDueCount(int count)
 {
@@ -886,13 +942,9 @@ esp_err_t InitWordApp(WordAppState* state)
     state->card_phase = WordCardPhase::kFront;
     state->home_selection = WordHomeSelection::kReview;
     state->message = "词库同步中";
-    // The sequential walk resumes from this cursor (and the completion page
-    // shows it as 续 #N).
-    uint32_t sequential_cursor = 0;
-    if (wqn::LoadWordSequentialCursor(&sequential_cursor) != ESP_OK) {
-        sequential_cursor = 0;
-    }
-    state->chain.sequential_cursor = sequential_cursor;
+    // Legacy numeric-only cursor is deliberately NOT installed here: it has no
+    // pack/scope identity and must never be applied to a newer pack.
+    state->chain.sequential_cursor = 0;
 
     const esp_err_t storage_result = InitWordPackStorage();
     if (storage_result != ESP_OK) {
@@ -920,10 +972,46 @@ esp_err_t InitWordApp(WordAppState* state)
     }
     std::vector<WordDeckInfo> catalog;
     if (BuildWordDeckCatalog(&catalog) == ESP_OK) {
-        InstallWordDeckCatalog(state, std::move(catalog));
+        // [deck-autorepair] Boot's local/possibly-empty catalog is NOT
+        // authoritative: it must never arm an NVS-clearing repair.
+        InstallWordDeckCatalog(state, std::move(catalog), /*authoritative=*/false);
+    }
+
+    // Boot may perform synchronous storage reads. Prefer a replayed local
+    // descriptor for the walk cursor: numeric NVS has no pack/scope identity.
+    {
+        PersistedWordSession sequential_slot;
+        if (LoadPersistedWordSession(
+                protocol::word_study_v1::Mode::kSequential,
+                &sequential_slot) == ESP_OK) {
+            LocalWordSessionDescriptor descriptor;
+            const bool have_descriptor =
+                !sequential_slot.remote.session_id.empty() &&
+                LoadLocalWordSessionDescriptor(
+                    sequential_slot.remote.session_id, &descriptor) == ESP_OK &&
+                descriptor.total_count > 0 &&
+                descriptor.session.deck_scope_generation ==
+                    sequential_slot.deck_scope_generation &&
+                descriptor.session.start_index == sequential_slot.start_index;
+            if (have_descriptor) {
+                uint64_t absolute = 0;
+                if (WordSequenceAbsoluteCursor(sequential_slot, &absolute) == ESP_OK &&
+                    absolute <= descriptor.total_count) {
+                    state->chain.sequential_cursor =
+                        static_cast<uint32_t>(absolute);
+                    state->chain.sequential_total = descriptor.total_count;
+                    state->chain.pinned_session_id =
+                        sequential_slot.remote.session_id;
+                    state->chain.pinned_scope_generation =
+                        sequential_slot.deck_scope_generation;
+                    state->chain.active = true;
+                }
+            }
+        }
     }
 
     bool found_paused_session = false;
+    bool restored_active_session = false;
     bool found_corrupt_session = false;
     for (const auto mode : kPersistedSessionModes) {
         PersistedWordSession persisted;
@@ -935,10 +1023,12 @@ esp_err_t InitWordApp(WordAppState* state)
         if (session_result == ESP_OK && resumable) {
             if (persisted.remote.mode ==
                 protocol::word_study_v1::Mode::kSequential) {
-                // No home card of its own: the walk is resumed from the review
-                // completion page, and its cursor is already loaded.
-                state->chain.sequential_cursor =
-                    persisted.start_index + persisted.position;
+                uint64_t absolute = 0;
+                if (WordSequenceAbsoluteCursor(persisted, &absolute) == ESP_OK &&
+                    absolute <= UINT32_MAX) {
+                    state->chain.sequential_cursor =
+                        static_cast<uint32_t>(absolute);
+                }
             } else {
                 SetStudySessionResumable(state, persisted.remote.mode, true);
             }
@@ -946,7 +1036,7 @@ esp_err_t InitWordApp(WordAppState* state)
         if (session_result == ESP_OK && resumable) {
             // At most one session should be unpaused. Prefer it so a reset
             // restores the exact card and presentation phase.
-            if (!persisted.paused) {
+            if (!persisted.paused && !restored_active_session) {
                 state->session.persisted = std::move(persisted);
                 if (state->session.persisted.position ==
                     state->session.persisted.remote.items.size()) {
@@ -960,9 +1050,10 @@ esp_err_t InitWordApp(WordAppState* state)
                     state->mode = WordAppMode::kHome;
                     state->message = "上次会话可继续";
                 }
-                break;
+                restored_active_session = true;
+                continue;
             }
-            if (!found_paused_session) {
+            if (!found_paused_session && !restored_active_session) {
                 state->session.persisted = std::move(persisted);
                 found_paused_session = true;
             }
@@ -1008,6 +1099,39 @@ esp_err_t InitWordApp(WordAppState* state)
     return ESP_OK;
 }
 
+// [deck-autorepair] Pure gate, extracted verbatim by
+// scripts/test_word_autorepair_input_gate.py. While an automatic repair is
+// pending/in flight, the worker's success ACK runs ResetWordSessionsInMemory,
+// which discards the RAM observation buffer. Only inputs that would START a
+// new session (home Confirm) or CREATE a new RAM observation (a card answer)
+// must be refused; an existing buffer's flush/retry is handled earlier in
+// HandleWordAppInput and is deliberately NOT gated here. Keeping this a pure
+// predicate of (state, input) makes the whole gate host-testable.
+bool WordAppInputBlockedByDeckRepair(
+    const wqn::WordAppState& state, wqn::WordInput input)
+{
+    if (!wqn::DefaultDeckRepairBlocking(state)) {
+        return false;
+    }
+    // A home Confirm arms a brand-new cloud session (kSessionStarting).
+    if (state.mode == wqn::WordAppMode::kHome &&
+        input == wqn::WordInput::kConfirm) {
+        return true;
+    }
+    // A card Confirm/Up/Down calls PrepareObservation: a fresh RAM
+    // observation/commit effect that the ACK reset would silently drop.
+    if (state.mode == wqn::WordAppMode::kWordCard &&
+        (input == wqn::WordInput::kConfirm ||
+         input == wqn::WordInput::kUp ||
+         input == wqn::WordInput::kDown)) {
+        return true;
+    }
+    // Navigation (home Up/Down, completion Up/Down), long-confirm pause and
+    // the kSessionStarting retry do not create observations or sessions, so
+    // they stay usable while the repair is in flight.
+    return false;
+}
+
 esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
 {
     if (state == nullptr) {
@@ -1018,6 +1142,8 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
     }
     ActivatePendingWordPackIndex(state);
 
+    // Existing RAM-buffer retry / flush paths come FIRST: an automatic repair
+    // must never swallow buffered observations the user already produced.
     if (state->session.batch_error != ESP_OK && HasBufferedWordObservations(*state)) {
         if (input == WordInput::kConfirm || input == WordInput::kLongConfirm) {
             state->session.batch_retry_after_ms = 0;
@@ -1030,6 +1156,38 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
         (input == WordInput::kLongConfirm || state->mode != WordAppMode::kWordCard)) {
         state->session.batch_flush_requested = true;
         state->message = "正在保存暂存，请稍后重试";
+        return ESP_OK;
+    }
+
+    if (state->mode == WordAppMode::kSessionStarting && input == WordInput::kLongConfirm) {
+        if (state->session.start_requested && !state->session.start_result_expected) {
+            CancelWordSessionStartResult(state);
+            state->session.session_load_armed = false;
+            state->mode = WordAppMode::kHome;
+            state->message = "已取消准备";
+        } else if (state->session.start_result_expected) {
+            state->session.cancel_start_requested = true;
+            state->message = "正在取消并保存暂停";
+        } else if (state->session.persisted.active) {
+            PauseWordSession(state);
+        }
+        return ESP_OK;
+    }
+
+    // [deck-autorepair] No NEW word action may cross a pending/in-flight auto
+    // repair: the success ACK's in-memory reset would discard a RAM observation
+    // produced between submit and ACK. The existing-buffer flush/retry paths
+    // above remain reachable (and are never gated). The pump additionally
+    // defers the submit until any buffered observations are durably flushed,
+    // so at ACK time there is no buffer left to swallow.
+    if (state->session.cursor_awaiting_retry_confirm &&
+        (input == WordInput::kConfirm || input == WordInput::kLongConfirm)) {
+        state->session.cursor_awaiting_retry_confirm = false;
+        state->session.cursor_retry_after_ms = 0;
+    }
+    if (WordAppInputBlockedByDeckRepair(*state, input) ||
+        WordMutationBlockedByPendingWorker(*state)) {
+        state->message = "正在保存学习进度，请稍后";
         return ESP_OK;
     }
 
@@ -1061,11 +1219,14 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 return ESP_OK;
             }
             const auto requested_mode =
-                state->home_selection == WordHomeSelection::kShuffle
-                    ? protocol::word_study_v1::Mode::kShuffle
-                    : (state->home_selection == WordHomeSelection::kMistakes
-                           ? protocol::word_study_v1::Mode::kMistakes
-                           : protocol::word_study_v1::Mode::kReview);
+                state->home_selection == WordHomeSelection::kSequential
+                    ? protocol::word_study_v1::Mode::kSequential
+                    : (state->home_selection == WordHomeSelection::kShuffle
+                           ? protocol::word_study_v1::Mode::kShuffle
+                           : (state->home_selection ==
+                                  WordHomeSelection::kMistakes
+                                  ? protocol::word_study_v1::Mode::kMistakes
+                                  : protocol::word_study_v1::Mode::kReview));
             if (TryResumePausedSession(state, requested_mode)) {
                 return ESP_OK;
             }
@@ -1073,11 +1234,17 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 state->session.create_request_id.clear();
             }
             state->session.requested_mode = requested_mode;
-            state->session.requested_start_index = 0;
+            state->session.requested_start_index =
+                requested_mode == protocol::word_study_v1::Mode::kSequential
+                    ? state->chain.sequential_cursor : 0;
             state->session.requested_new_word_limit = 0;
             state->session.start_requested = true;
+            state->chain.active =
+                requested_mode == protocol::word_study_v1::Mode::kSequential;
             state->mode = WordAppMode::kSessionStarting;
-            state->message = "正在准备本轮单词";
+            state->message = requested_mode ==
+                    protocol::word_study_v1::Mode::kSequential
+                ? "正在准备本地顺序学习" : "正在准备本轮单词";
             return ESP_OK;
         }
 
@@ -1096,11 +1263,9 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 CancelWordSessionStartResult(state);
                 if (state->session.persisted.active) {
                     state->session.persisted.paused = true;
-                    SetStudySessionResumable(
-                        state, state->session.persisted.remote.mode, true);
+                    // Do not install a paused state before its cursor overlay
+                    // is durable. Keep the original active session for retry.
                     SaveSequentialCursor(state);
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        SaveWordSessionCursor(state->session.persisted));
                 }
                 state->chain.active = false;
                 state->chain.exclude_ids.clear();
@@ -1200,9 +1365,13 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             // server's intake accounting), then the library walk from the
             // durable cursor. A paused walk/intake session resumes instead.
             state->chain.active = true;
-            if (state->chain.sequential_cursor >= state->pack_index.entries.size()) {
+            // [scope-count] Wrap against the selected deck's size so a stale
+            // whole-pack cursor cannot skip words when the scope narrowed.
+            if (state->chain.sequential_total > 0 &&
+                state->chain.sequential_cursor >= state->chain.sequential_total) {
                 state->chain.sequential_cursor = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::SaveWordSequentialCursor(0));
+                state->chain.segment_finished = false;
+                state->chain.next_segment_armed = false;
             }
             if (TryResumePausedSession(
                     state, protocol::word_study_v1::Mode::kIntake)) {
@@ -1249,29 +1418,223 @@ esp_err_t BuildWordDeckCatalog(std::vector<WordDeckInfo>* catalog)
     return ESP_OK;
 }
 
-void InstallWordDeckCatalog(WordAppState* state, std::vector<WordDeckInfo> catalog)
+void InstallWordDeckCatalog(
+    WordAppState* state, std::vector<WordDeckInfo> catalog, bool authoritative)
 {
     if (state == nullptr) {
         return;
     }
     state->deck_catalog = std::move(catalog);
     state->default_deck_title.clear();
-    if (state->default_deck_id.empty()) {
+    // [deck-autorepair] Only a fresh, confirmed FULL manifest success may
+    // authorise a repair. Boot/unloaded catalogs (authoritative=false) must
+    // NEVER clear NVS -- an empty local catalog is not evidence of a deletion.
+    if (!authoritative) {
+        state->default_deck_missing = false;
+        // Still resolve the title from a local non-empty catalog for display.
+        for (const WordDeckInfo& deck : state->deck_catalog) {
+            if (!state->default_deck_id.empty() &&
+                deck.deck_id == state->default_deck_id) {
+                state->default_deck_title = deck.title;
+                break;
+            }
+        }
         return;
+    }
+    // Authoritative: an EMPTY catalog means every deck (including the
+    // configured default) was deleted -- that is authoritative evidence too,
+    // so the "missing deck" signal is set below for the all-decks repair.
+    state->default_deck_missing = false;
+    if (state->default_deck_id.empty()) {
+        return;  // all-decks is already selected: nothing to repair
     }
     for (const WordDeckInfo& deck : state->deck_catalog) {
         if (deck.deck_id == state->default_deck_id) {
             state->default_deck_title = deck.title;
-            return;
+            return;  // default still present: no repair
         }
     }
-    if (!state->deck_catalog.empty()) {
-        // The default deck disappeared from the cloud: fall back to all decks
-        // in memory (NVS keeps the id; re-picking in settings overwrites it).
-        ESP_LOGW(kTag, "default word deck missing from catalog; falling back to all decks");
-        state->default_deck_id.clear();
-    }
+    // Do NOT clear default_deck_id here: that would make memory disagree with
+    // NVS and hide the need for a durable repair. Only flag it; the caller
+    // arms the independent auto intent and the worker's durable ACK installs
+    // the cleared default via SetDefaultWordDeck.
+    ESP_LOGW(kTag, "default word deck missing from authoritative catalog; awaiting durable repair");
+    state->default_deck_missing = true;
 }
+
+// [deck-autorepair] The rest of this block is the self-contained state machine
+// extracted verbatim by scripts/test_word_scope_autorepair.py. It operates only
+// on WordAppState's default_deck_repair POD + explicit gates, never on UI or
+// worker internals, so the whole intent lifecycle is host-testable.
+namespace {
+constexpr int64_t kDeckRepairBaseBackoffMs = 1000;
+constexpr int64_t kDeckRepairMaxBackoffMs = 30000;
+
+int64_t DeckRepairBackoffMs(uint32_t attempts)
+{
+    int64_t backoff = kDeckRepairBaseBackoffMs;
+    for (uint32_t i = 0; i < attempts && backoff < kDeckRepairMaxBackoffMs; ++i) {
+        backoff = std::min<int64_t>(backoff * 2, kDeckRepairMaxBackoffMs);
+    }
+    return backoff;
+}
+
+bool DeckRepairSignalValid(const WordAppState& state)
+{
+    return state.default_deck_missing && !state.default_deck_id.empty();
+}
+}  // namespace
+
+bool ArmDefaultDeckRepair(WordAppState* state, uint32_t scope_generation)
+{
+    if (state == nullptr) {
+        return false;
+    }
+    DefaultDeckRepairState& repair = state->default_deck_repair;
+    // [deck-autorepair] An ACCEPTED operation (in flight, or a failed one that
+    // still owes its recoverable marker tail) is never cancelled: a failed
+    // ChangeDefaultWordDeckForeground may already have durably changed the
+    // default key / session clears / scope generation before failing, so the
+    // tail MUST be retried to a success ACK. Only a fresh, UNSUBMITTED intent
+    // may be re-armed or dropped. Judge the obligation BEFORE the signal.
+    if (repair.op_id != 0 || repair.must_complete) {
+        return false;  // keep attribution / recovery until the success ACK
+    }
+    // Unsubmitted intent only: a fresh authoritative catalog found the default
+    // (or all-decks is set), so cancel the stale intent -- never repair a
+    // now-valid configuration (e.g. the deck was re-added remotely, or a
+    // manual ACK already resolved it). A transient/bad (non-authoritative)
+    // catalog load also leaves the signal invalid here, but can never drop an
+    // accepted operation (handled above).
+    if (!DeckRepairSignalValid(*state)) {
+        repair = DefaultDeckRepairState{};
+        return false;
+    }
+    if (repair.pending && repair.scope_generation == scope_generation) {
+        return false;  // idempotent re-arm for the same epoch
+    }
+    // Re-arm: a NEW epoch supersedes a stale pending intent. A manual switch
+    // bumps the scope generation on its durable ACK; a temp-scope reset is
+    // handled by the pump gates (scope_reset_pending), never by overwriting a
+    // manual choice here.
+    repair = DefaultDeckRepairState{};
+    repair.pending = true;
+    repair.scope_generation = scope_generation;
+    return true;
+}
+
+void CancelDefaultDeckRepair(WordAppState* state)
+{
+    if (state == nullptr) {
+        return;
+    }
+    DefaultDeckRepairState& repair = state->default_deck_repair;
+    // [deck-autorepair] Manual priority cancels ONLY an UNSUBMITTED intent.
+    // Once a worker operation is accepted (op_id) or a failed transaction
+    // still owes its marker tail (must_complete), the recovery obligation
+    // MUST NOT be erased: a failure is not proof of no NVS mutation.
+    if (repair.op_id != 0 || repair.must_complete) {
+        return;
+    }
+    repair = DefaultDeckRepairState{};
+}
+
+bool DefaultDeckRepairBlocking(const WordAppState& state)
+{
+    // [deck-autorepair] must_complete keeps the card / new-session / temp-scope
+    // / manual gates CLOSED between a failed ACK and the next retry: the scope
+    // is still owned by a possibly half-applied durable transaction.
+    return state.default_deck_repair.pending ||
+           state.default_deck_repair.op_id != 0 ||
+           state.default_deck_repair.must_complete;
+}
+
+DefaultDeckRepairTick TickDefaultDeckRepair(
+    WordAppState* state, const DefaultDeckRepairGates& gates)
+{
+    if (state == nullptr) {
+        return DefaultDeckRepairTick::kIdle;
+    }
+    DefaultDeckRepairState& repair = state->default_deck_repair;
+    if (!repair.pending && repair.op_id == 0 && !repair.must_complete) {
+        return DefaultDeckRepairTick::kIdle;
+    }
+    if (repair.op_id != 0) {
+        return DefaultDeckRepairTick::kDefer;  // in flight; wait for the ACK
+    }
+    // [deck-autorepair] An accepted-once recovery obligation is IMMUNE to the
+    // signal/epoch cancellation below: a failed transaction may have left a
+    // live recoverable marker, so it must be retried to a success ACK even if
+    // the deck reappeared, the signal resolved, or the scope epoch moved.
+    // Only an UNSUBMITTED intent may be cancelled by a now-valid config.
+    if (!repair.must_complete &&
+        (!DeckRepairSignalValid(*state) ||
+         repair.scope_generation != gates.current_scope_generation)) {
+        repair = DefaultDeckRepairState{};
+        return DefaultDeckRepairTick::kIdle;
+    }
+    // Every guard PRESERVES the intent and defers -- it never drops it. A
+    // manual/scope-reset in flight wins; observation buffers / kPersisting
+    // share the deck-scope transaction (§4.2); backoff bounds retries.
+    if (gates.manual_switch_pending || gates.scope_reset_pending ||
+        gates.observations_pending || gates.persisting ||
+        gates.now_ms < repair.retry_after_ms) {
+        return DefaultDeckRepairTick::kDefer;
+    }
+    return DefaultDeckRepairTick::kSubmit;
+}
+
+void OnDefaultDeckRepairSubmitted(
+    WordAppState* state, uint32_t op_id, int64_t now_ms)
+{
+    if (state == nullptr) {
+        return;
+    }
+    DefaultDeckRepairState& repair = state->default_deck_repair;
+    if (op_id != 0) {
+        repair.op_id = op_id;         // in flight; pending stays until the ACK
+        repair.must_complete = true;  // accepted once: recovery tail is owed
+        return;
+    }
+    // Reserve/busy failure: keep the intent, back off, retry on a later tick.
+    repair.retry_after_ms = now_ms + DeckRepairBackoffMs(repair.attempts);
+    ++repair.attempts;
+}
+
+bool OnDefaultDeckRepairAck(
+    WordAppState* state, uint32_t operation_id, esp_err_t result, int64_t now_ms)
+{
+    if (state == nullptr) {
+        return false;
+    }
+    DefaultDeckRepairState& repair = state->default_deck_repair;
+    if (repair.op_id == 0 || repair.op_id != operation_id) {
+        return false;  // not ours (a manual result, or a stale duplicate)
+    }
+    repair.op_id = 0;  // clear this operation's attribution first
+    if (result == ESP_OK) {
+        // Durable all-decks repair committed. Clear the whole obligation; the
+        // caller installs SetDefaultWordDeck("","") on this ACK. This is the
+        // terminal install even if a newer catalog showed the deck reappeared:
+        // the worker already cleared NVS, so memory MUST follow NVS.
+        repair = DefaultDeckRepairState{};
+        return true;
+    }
+    // [deck-autorepair] A FAILED accepted transaction may be half-applied
+    // (default key / session clears / scope generation durable, cursor/marker
+    // tail outstanding). A valid catalog or a non-authoritative local load is
+    // NOT proof of no mutation, so NEVER cancel the recovery obligation here.
+    // Keep must_complete, force pending and back off; the pump retries with a
+    // fresh operation_id until a success ACK (boot marker recovery is the
+    // power-loss backstop). Stale/duplicate ACKs are rejected by the op_id
+    // guard above.
+    repair.must_complete = true;
+    repair.pending = true;
+    repair.retry_after_ms = now_ms + DeckRepairBackoffMs(repair.attempts);
+    ++repair.attempts;
+    return true;
+}
+// [deck-autorepair] end of extracted state machine
 
 void SetDefaultWordDeck(
     WordAppState* state, const std::string& deck_id, const std::string& title)
@@ -1281,6 +1644,10 @@ void SetDefaultWordDeck(
     }
     state->default_deck_id = deck_id;
     state->default_deck_title = deck_id.empty() ? std::string() : title;
+    // [deck-autorepair] This is the durable-ACK install point. A switch (user
+    // or auto-repair to all-decks) resolves the missing-deck signal; the next
+    // authoritative catalog install re-evaluates it from scratch.
+    state->default_deck_missing = false;
 }
 
 void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
@@ -1302,11 +1669,12 @@ void ResetWordSessionsForScopeChange(WordAppState* state, bool clear_persisted)
         // was four independent background transactions plus a raw NVS write, so
         // it could stop between clears and leave a half-wiped scope behind.
         ESP_ERROR_CHECK_WITHOUT_ABORT(wqn::ResetWordSessionScope());
-    } else {
-        // The durable half already ran inside the default-deck transaction; the
-        // walk cursor is the only piece that one does not reset.
-        ESP_ERROR_CHECK_WITHOUT_ABORT(SaveWordSequentialCursor(0));
     }
+    // [deck-scope] The default-deck (clear_persisted=false) durable half now
+    // clears the walk cursor inside its own recoverable marker transaction
+    // (ApplyDeckScopeChangeLocked), so there is NO storage write on this UI ACK
+    // path. The remaining sequential-cursor UI writes (pause/resume/wrap) are
+    // known and deferred to the local-session work, not claimed fixed here.
     ResetWordSessionsInMemory(state);
     state->message = "词库范围已切换";
 }
@@ -1353,6 +1721,16 @@ bool TakeWordSessionStartRequest(
     WordAppState* state,
     protocol::word_study_v1::CreateSessionRequest* request)
 {
+    if (state != nullptr && state->chain.segment_finished &&
+        state->chain.active && !HasBufferedWordObservations(*state) &&
+        state->session.commit_state != WordObservationCommitState::kPersisting &&
+        !state->session.cursor_intent_armed) {
+        state->chain.segment_finished = false;
+        state->chain.next_segment_armed = true;
+        state->session.local_session_id.clear();
+        state->session.create_request_id.clear();
+        StartSequentialWalk(state, true);
+    }
     if (state == nullptr || request == nullptr || !state->session.start_requested) {
         return false;
     }
@@ -1373,6 +1751,14 @@ bool TakeWordSessionStartRequest(
     }
     request->optional_count = 500;
     request->seed.clear();
+    if (request->mode == protocol::word_study_v1::Mode::kSequential) {
+        if (state->session.local_session_id.empty()) {
+            state->session.local_session_id =
+                MakeLocalStartIdentity(request->metadata.request_id);
+            state->session.local_seed = "local-sequential-v1";
+        }
+        request->seed = state->session.local_session_id;
+    }
     request->start_index = -1;
     request->new_word_limit = 0;
     if (request->mode == protocol::word_study_v1::Mode::kSequential) {
@@ -1395,8 +1781,11 @@ bool ApplyWordSessionStartResult(
 {
     if (state == nullptr || !state->session.start_result_expected) return false;
     state->session.start_result_expected = false;
+    state->session.session_load_armed = false;
+    state->session.cancel_start_requested = false;
     const auto requested_mode = state->session.requested_mode;
     if (result != ESP_OK) {
+        if (result == ESP_ERR_NOT_FOUND) SetStudySessionResumable(state, requested_mode, false);
         state->mode = WordAppMode::kHome;
         state->message = result == ESP_ERR_INVALID_STATE
             ? "请先完成配对"
@@ -1449,18 +1838,17 @@ bool ApplyWordSessionStartResult(
         return true;
     }
     state->session.persisted = std::move(persisted);
-    if (IsSequentialSession(state->session.persisted)) {
-        // The server response does not carry the walk's continuation point;
-        // stamp the value the request was built with.
-        state->session.persisted.start_index =
-            state->session.requested_start_index;
-    }
+    // Durable worker start_index is authoritative. It is the immutable segment
+    // base; adding the requested absolute cursor again would double-count it.
     SetStudySessionResumable(
         state, state->session.persisted.remote.mode, false);
     state->session.commit_state = WordObservationCommitState::kIdle;
     state->session.page_in_flight = false;
     state->session.page_requested = false;
     state->session.create_request_id.clear();
+    state->session.local_session_id.clear();
+    state->session.local_seed.clear();
+    state->session.session_load_armed = false;
     if (IsReviewSession(state->session.persisted)) {
         SeedReviewRuntime(&state->review, state->session.persisted.remote.session_id);
     }
@@ -1493,7 +1881,6 @@ bool ApplyWordSessionStartResult(
         state->session.persisted.active = false;
         SetStudySessionResumable(
             state, state->session.persisted.remote.mode, false);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(SavePersistedWordSession(state->session.persisted));
         state->mode = WordAppMode::kHome;
         state->message = "会话词包尚未就绪";
         state->chain.active = false;
@@ -1523,6 +1910,10 @@ void CancelWordSessionStartResult(WordAppState* state)
     if (state == nullptr) return;
     state->session.start_requested = false;
     state->session.start_result_expected = false;
+    state->session.cancel_start_requested = false;
+    state->session.session_load_armed = false;
+    state->chain.segment_finished = false;
+    state->chain.next_segment_armed = false;
     state->session.create_request_id.clear();
 }
 
@@ -1534,9 +1925,14 @@ void ResetWordSessionForServerInvalid(WordAppState* state)
     // durable record and every derived flag; the next entry creates a fresh
     // session. The local pack index is untouched, so the word library stays
     // usable.
-    const protocol::word_study_v1::Mode mode = state->session.persisted.remote.mode;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ClearPersistedWordSession(mode));
+    // Durable clear belongs to the next worker-backed reset; the reducer only
+    // drops its derived state and asks for a fresh session.
+    const auto invalid_mode = state->session.persisted.remote.mode;
+    const auto invalid_id = state->session.persisted.remote.session_id;
     state->session = WordSessionState{};
+    state->session.session_clear_armed = !invalid_id.empty();
+    state->session.session_clear_mode = invalid_mode;
+    state->session.session_clear_id = invalid_id;
     state->review = WordReviewRuntime{};
     state->chain.active = false;
     state->chain.exclude_ids.clear();
@@ -1548,6 +1944,63 @@ void ResetWordSessionForServerInvalid(WordAppState* state)
     state->current_word = WqnWordEntry{};
     state->mode = WordAppMode::kHome;
     state->message = "上次会话已失效，请重新开始";
+}
+
+bool TakeWordSessionCursorEffect(
+    WordAppState* state,
+    uint32_t operation_id,
+    PersistedWordSession* session)
+{
+    if (state == nullptr || session == nullptr || operation_id == 0 ||
+        !state->session.cursor_intent_armed ||
+        HasBufferedWordObservations(*state) ||
+        state->session.cursor_intent_operation_id != 0) {
+        return false;
+    }
+    *session = state->session.cursor_intent_session;
+    state->session.cursor_intent_operation_id = operation_id;
+    return true;
+}
+
+bool ApplyWordSessionCursorResult(
+    WordAppState* state,
+    uint32_t operation_id,
+    esp_err_t result)
+{
+    if (state == nullptr || !state->session.cursor_intent_armed ||
+        state->session.cursor_intent_operation_id != operation_id) {
+        return false;
+    }
+    if (state->session.cursor_intent_session.remote.session_id !=
+            state->session.persisted.remote.session_id ||
+        state->session.cursor_intent_session.deck_scope_generation !=
+            state->session.persisted.deck_scope_generation) {
+        state->session.cursor_intent_armed = false;
+        state->session.cursor_intent_operation_id = 0;
+        return false;
+    }
+    if (result != ESP_OK) {
+        state->session.cursor_awaiting_retry_confirm = true;
+        // Keep the exact intent/session and let the pump retry with a fresh
+        // reservation; the active screen was never optimistically changed.
+        state->session.cursor_intent_operation_id = 0;
+        state->message = "会话进度未保存，请重试";
+        return true;
+    }
+    const auto& intent = state->session.cursor_intent_session;
+    state->session.persisted.paused = intent.paused;
+    SetStudySessionResumable(state, intent.remote.mode, intent.paused);
+    if (state->session.cursor_intent_paused) {
+        state->mode = WordAppMode::kHome;
+        state->message = "本轮已暂停";
+        ActivatePendingWordPackIndex(state);
+    } else {
+        state->message = "已继续上次会话";
+    }
+    state->session.cursor_intent_armed = false;
+    state->session.cursor_intent_operation_id = 0;
+    state->session.cursor_intent_session = {};
+    return true;
 }
 
 bool TakeWordCandidatePageRequest(
@@ -1682,8 +2135,6 @@ void ApplyWordCandidatePageResult(
         // The last page brought nothing left to show: let the normal finish
         // path decide (review completion page, replay drain, or home).
         FinishOrLoadAdvancedReview(state);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            SavePersistedWordSession(state->session.persisted));
         RequestCandidatePageIfNeeded(state);
         return;
     }
@@ -1766,6 +2217,7 @@ void ApplyWordObservationState(WordAppState* state, esp_err_t result, bool durab
                 .items[state->session.persisted.position].ordinal;
     }
     state->session.persisted = std::move(state->session.pending_advanced_session);
+    SaveSequentialCursor(state);
     state->session.pending_advanced_session = {};
     state->session.pending_observation = {};
     state->session.commit_state = durable ? WordObservationCommitState::kCloudPending
@@ -2014,7 +2466,10 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.mistakes_session_resumable = state.mistakes_session_resumable;
     snapshot.reviewed_today = state.reviewed_today;
     snapshot.correct_today = state.correct_today;
-    snapshot.total_count = ClampUint16(state.pack_index.entries.size());
+    // [scope-count] Describe the selected deck, not the whole mounted pack.
+    const size_t scoped_count = GetScopedCount(state);
+    const bool scoped_active = !EffectiveScopeDeckId(state).empty();
+    snapshot.total_count = ClampUint16(scoped_count);
     const bool study_cursor_visible =
         state.mode == WordAppMode::kWordCard ||
         state.mode == WordAppMode::kSessionStarting;
@@ -2033,15 +2488,23 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.review_complete_replayed = state.review.replayed;
     const int32_t due_hint =
         g_word_review_due_count.load(std::memory_order_acquire);
-    snapshot.review_due_known = due_hint >= 0;
+    // [scope-count] review_due_count / mistake_count are global (all-decks)
+    // sync hints. They have no per-deck meaning, so under a single-deck scope
+    // present them as unknown/hidden instead of masquerading as scoped counts.
+    // All-decks keeps the existing sync-derived values. No v3 sync change.
+    snapshot.review_due_known = !scoped_active && due_hint >= 0;
     snapshot.review_due_count =
         ClampUint16(static_cast<size_t>(due_hint > 0 ? due_hint : 0));
     const int32_t mistake_hint =
         g_word_mistake_count.load(std::memory_order_acquire);
-    snapshot.mistake_count = static_cast<int16_t>(
-        mistake_hint > INT16_MAX ? INT16_MAX : mistake_hint);
+    snapshot.mistake_count = scoped_active
+        ? -1
+        : static_cast<int16_t>(
+              mistake_hint > INT16_MAX ? INT16_MAX : mistake_hint);
     snapshot.sequential_cursor = state.chain.sequential_cursor;
-    snapshot.sequential_total = ClampUint16(state.pack_index.entries.size());
+    snapshot.sequential_total = state.chain.sequential_total > 0
+        ? state.chain.sequential_total
+        : static_cast<uint32_t>(scoped_count);
     snapshot.pack_count = state.pack_index.pack_count;
     snapshot.pack_bytes = state.pack_index.pack_bytes;
     snapshot.progress_line = WordAppProgressLabel(state);
@@ -2088,14 +2551,18 @@ std::string WordAppProgressLabel(const WordAppState& state)
         static_cast<size_t>(state.session.persisted.position) + 1,
         state.session.persisted.remote.items.size());
     if (IsSequentialSession(state.session.persisted)) {
-        // The walk counts through the whole library, not the local window.
-        const size_t library_index =
-            static_cast<size_t>(state.session.persisted.start_index) +
-            visible_position;
-        const std::string total = state.pack_index.entries.empty()
+        uint64_t absolute = 0;
+        if (WordSequenceAbsoluteCursor(
+                state.session.persisted, &absolute) != ESP_OK) {
+            return "";
+        }
+        const uint64_t display_index = absolute == 0 ? 1 : absolute;
+        const uint64_t scoped_total = state.chain.sequential_total > 0
+            ? state.chain.sequential_total : GetScopedCount(state);
+        const std::string total = scoped_total == 0
             ? std::string("--")
-            : std::to_string(state.pack_index.entries.size());
-        return "#" + std::to_string(library_index) + "/" + total;
+            : std::to_string(scoped_total);
+        return "#" + std::to_string(display_index) + "/" + total;
     }
     return std::to_string(visible_position) + "/" +
            std::to_string(state.session.persisted.remote.items.size());

@@ -321,20 +321,36 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
             return RefreshSchedule::kConfig;
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            const bool word_observations_busy =
+                wqn::HasBufferedWordObservations(state->word_app) ||
+                state->word_app.session.commit_state ==
+                    wqn::WordObservationCommitState::kPersisting;
+            // [deck-autorepair] An auto repair IN FLIGHT (op_id) or one that
+            // still owes a failed accepted transaction's marker tail
+            // (must_complete) owns the scope: a manual Confirm must not reserve
+            // the slot or race the recovery, so defer (user retries). A merely
+            // *pending* UNSUBMITTED auto intent is NOT a blocker: the user's
+            // explicit switch always wins and cancels it below (gap 2/3).
+            const bool auto_repair_in_flight =
+                state->word_app.default_deck_repair.op_id != 0 ||
+                state->word_app.default_deck_repair.must_complete;
             if (settings.word_deck_selected < settings.word_deck_options.size() &&
-                (wqn::HasBufferedWordObservations(state->word_app) ||
-                 state->word_app.session.commit_state == wqn::WordObservationCommitState::kPersisting)) {
+                (word_observations_busy || auto_repair_in_flight)) {
                 state->word_app.session.batch_flush_requested = true;
                 // A word answer is still pending (kPersisting spans Prepare ->
                 // worker Apply, so it also covers the Prepare->reserve gap where
-                // persist-busy is briefly false but the effect is still armed):
-                // the deck switch clears both session files inside its worker
-                // transaction and must not race the in-flight commit's session
-                // save. Defer; user retries.
+                // persist-busy is briefly false but the effect is still armed),
+                // or an auto repair holds the worker slot: the deck switch
+                // clears both session files inside its worker transaction and
+                // must not race an in-flight commit/repair. Defer; user retries.
                 settings.notice = "正在保存，请稍后切换";
             } else if (settings.word_deck_selected < settings.word_deck_options.size()) {
                 const wqn::WordDeckInfo& option =
                     settings.word_deck_options[settings.word_deck_selected];
+                // [deck-autorepair] Manual ALWAYS priority: drop any armed (not
+                // yet submitted) auto intent before committing the user's
+                // choice. Its durable ACK would otherwise race this switch.
+                wqn::CancelDefaultDeckRepair(&state->word_app);
                 // [deck-scope] Async switch via the worker's recoverable marker
                 // protocol (c5). Arm the choice first (a rejected submit or a
                 // failed transaction keeps it for a re-Confirm); NOTHING is

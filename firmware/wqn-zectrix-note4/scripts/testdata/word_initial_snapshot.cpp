@@ -20,6 +20,15 @@ namespace wqn {
 template<typename T> using WordStorePsramAllocator=std::allocator<T>;
 enum class WordPresentationPhase : uint8_t { kFront=0,kBack=1 };
 struct WordPackIndex {};
+// [deck-autorepair] Minimal real struct matching main/word_app.h so the
+// WordCloudResult extraction (std::vector<wqn::WordDeckInfo> catalog) compiles.
+// This is the actual payload the bulk runner builds, not a stub of the
+// behaviour under test (snapshot coalescing).
+struct WordDeckInfo {
+    std::string deck_id;
+    std::string title;
+    size_t entry_count = 0;
+};
 @@STRUCTS@@
 }
 using S=wqn::PersistedWordSession;

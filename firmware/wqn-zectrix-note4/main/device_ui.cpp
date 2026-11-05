@@ -886,6 +886,9 @@ void TrackHeldCloudResult(device_ui_internal::CloudDomain domain, bool gated)
                 wqn::HasBufferedWordObservations(state.word_app) ||
                 state.word_app.session.commit_state ==
                 wqn::WordObservationCommitState::kPersisting ||
+                state.word_app.session.cursor_intent_armed ||
+                device_ui_internal::IsPersistDomainBusy(
+                    device_ui_internal::PersistDomain::kWord) ||
                 // [deck-scope] A default-deck switch in flight wipes and
                 // re-scopes the word sessions; hold Word cloud results until
                 // its ACK so a stale session/page result cannot apply against
@@ -1076,6 +1079,23 @@ void TrackHeldCloudResult(device_ui_internal::CloudDomain domain, bool gated)
                 device_ui_internal::AckPersistResult(
                     device_ui_internal::PersistKind::kWordObservation,
                     word_persist.generation, word_persist.operation_id);
+            }
+        }
+
+        // [persist-worker] Drain the typed Word pause/resume cursor ACK.
+        {
+            device_ui_internal::PersistResultReceipt cursor_receipt;
+            if (device_ui_internal::TakePersistResultToApply(
+                    device_ui_internal::PersistKind::kWordSessionCursor,
+                    &cursor_receipt)) {
+                const device_ui_internal::UiUpdate cursor_update =
+                    ui_runtime.DispatchWordSessionCursorResult(
+                        cursor_receipt.result, cursor_receipt.operation_id);
+                refresh_schedule = StrongerSchedule(
+                    refresh_schedule, cursor_update.refresh);
+                device_ui_internal::AckPersistResult(
+                    device_ui_internal::PersistKind::kWordSessionCursor,
+                    cursor_receipt.generation, cursor_receipt.operation_id);
             }
         }
 
@@ -1425,6 +1445,8 @@ wqn::AiStreamingStatusView streaming_view{};
         // lease is acquired before acceptance; durable work stays off UI.
         refresh_schedule = StrongerSchedule(refresh_schedule,
             device_ui_internal::PumpWordObservationCommit(&ui_runtime));
+        refresh_schedule = StrongerSchedule(refresh_schedule,
+            device_ui_internal::PumpWordSessionCursor(&ui_runtime));
         ApplyDisplayRecoveryGate(&ui_runtime, &display_tracking, &refresh_schedule);
         if (refresh_schedule != RefreshSchedule::kNone &&
             state.screen == wqn::UiScreen::kNote &&
@@ -1592,6 +1614,11 @@ wqn::AiStreamingStatusView streaming_view{};
         if (problem_bulk_completed) {
             FinishProblemCloudRequest(device_ui_internal::CloudDomain::kProblemBulk);
         }
+        // [deck-autorepair] Drive the independent auto-repair intent AFTER the
+        // persist-result dispatch (an ACK clears attribution first) and BEFORE
+        // the session/page pumps, so a pending repair blocks a cross-scope
+        // session start and the worker submit sees the current gate state.
+        ui_runtime.PumpDefaultDeckAutoRepair(now_ms);
         // Result reducers can arm the next intake/sequential stage. Dispatch
         // only after the previous cloud result has released its busy/lease.
         device_ui_internal::PumpWordSessionStart(&ui_runtime);

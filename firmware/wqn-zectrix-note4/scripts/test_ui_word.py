@@ -33,6 +33,9 @@ def main():
         '@@ENUMS@@': section(header, 'enum class WordInput {', '// One word the user'),
         '@@SNAPSHOT_TYPE@@': section(header, 'struct WordAppSnapshot {', '// [word-due-hint]'),
         '@@SNAPSHOT@@': section(app, 'WordAppSnapshot BuildWordAppSnapshot(', 'std::string WordAppSignature('),
+        # [scope-count] Inject the REAL memoized scope-aware count helpers so
+        # the UI renders the selected deck's size, not a fake whole-pack total.
+        '@@SCOPE_COUNT@@': section(app, '// [scope-count] Effective study scope:', '\nwqn::WordHomeSelection HomeSelectionFromIndex'),
         '@@COUNT_SETTERS@@': section(app, 'void SetWordReviewDueCount(', 'esp_err_t InitWordApp('),
         '@@COUNT_GUARD@@': section(app, 'class WordDueCountFixtureGuard {', '// WordAppState is intentionally large'),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),

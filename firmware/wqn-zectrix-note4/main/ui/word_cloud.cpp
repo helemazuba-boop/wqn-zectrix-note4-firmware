@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <random>
 #include <utility>
 
 #include "esp_log.h"
@@ -17,6 +18,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "services/sync_service.h"
 #include "storage.h"
+#include "word_local_session.h"
 #include "word_pack.h"
 #include "wqn_api.h"
 
@@ -86,6 +88,41 @@ RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
     return refresh;
 }
 
+RefreshSchedule PumpWordSessionCursor(UiRuntime* runtime)
+{
+    if (runtime == nullptr) return RefreshSchedule::kNone;
+    auto& word = runtime->state().word_app;
+    if (!word.session.cursor_intent_armed ||
+        word.session.cursor_intent_operation_id != 0 ||
+        word.session.cursor_awaiting_retry_confirm || IsWordCloudBusy() ||
+        wqn::HasBufferedWordObservations(word) ||
+        word.session.batch_in_flight != 0 ||
+        word.session.commit_state ==
+            wqn::WordObservationCommitState::kPersisting ||
+        wqn::DefaultDeckRepairBlocking(word) ||
+        word.scope_reset_pending_valid ||
+        IsPersistDomainBusy(PersistDomain::kWord) ||
+        IsPersistKindBusy(PersistKind::kSettingsDefaultDeck)) {
+        if (word.session.cursor_intent_armed &&
+            wqn::HasBufferedWordObservations(word)) {
+            runtime->RequestWordBatchFlush();
+        }
+        return RefreshSchedule::kNone;
+    }
+    PersistTicket ticket =
+        TryReservePersist(PersistKind::kWordSessionCursor);
+    if (!ticket.valid()) return RefreshSchedule::kNone;
+    wqn::PersistedWordSession session;
+    if (!runtime->TakeWordSessionCursorEffect(
+            ticket.operation_id, &session)) {
+        CancelPersistReservation(ticket);
+        return RefreshSchedule::kNone;
+    }
+    EnqueueReservedWordSessionCursor(
+        ticket, std::move(session));
+    return RefreshSchedule::kNone;
+}
+
 bool IsWordCloudBusy()
 {
     return g_word_cloud_busy.load(std::memory_order_acquire);
@@ -142,14 +179,34 @@ bool QueueWordReviewRefresh()
     return true;
 }
 
+std::string MakeStableLocalUuid(const std::string& request_id)
+{
+    uint64_t value = 1469598103934665603ULL;
+    for (char c : request_id) {
+        value ^= static_cast<unsigned char>(c);
+        value *= 1099511628211ULL;
+    }
+    char out[37] = {};
+    std::snprintf(out, sizeof(out),
+        "%08x-%04x-%04x-%04x-%012llx",
+        static_cast<unsigned>(value & 0xFFFFFFFFU),
+        static_cast<unsigned>((value >> 32) & 0xFFFFU),
+                static_cast<unsigned>(((value >> 48) & 0x0FFFU) | 0x4000U),
+                static_cast<unsigned>(((value >> 20) & 0x3FFFU) | 0x8000U),
+        static_cast<unsigned long long>(value ^ 0x9E3779B97F4A7C15ULL) & 0xFFFFFFFFFFFFULL);
+    return out;
+}
+
 bool QueueWordSessionStart(
-    const wqn::protocol::word_study_v1::CreateSessionRequest& session)
+    const wqn::protocol::word_study_v1::CreateSessionRequest& session,
+    bool resume_existing)
 {
     if (session.metadata.request_id.empty()) {
         return false;
     }
     WordCloudRequest request;
     request.op = WordCloudOp::kStartSession;
+    request.resume_existing = resume_existing;
     // [deck-scope] Epoch at queue time: a deck switch completing while this
     // request is in flight must invalidate both the runner-side session save
     // and the apply of the result.
@@ -160,6 +217,14 @@ bool QueueWordSessionStart(
         "%s",
         session.metadata.request_id.c_str());
     request.study_mode = static_cast<uint8_t>(session.mode);
+    const std::string local_id = !session.seed.empty() &&
+            wqn::IsValidLocalSessionUuid(session.seed)
+        ? session.seed
+        : MakeStableLocalUuid(session.metadata.request_id);
+    std::snprintf(request.session_id, sizeof(request.session_id), "%s",
+        local_id.c_str());
+    std::snprintf(request.seed, sizeof(request.seed), "%s",
+        session.seed.empty() ? "local-sequential-v1" : session.seed.c_str());
     // Carry the -1 "unset" sentinel untouched; collapsing it to 0 here
     // made every non-sequential start send a literal start_index.
     request.start_index = session.start_index;
@@ -251,15 +316,37 @@ bool QueueWordCandidatePage(
         "%s",
         page.cursor.c_str());
     request.limit = static_cast<uint16_t>(page.limit);
+    request.study_mode = static_cast<uint8_t>(snapshot.remote.mode);
     request.page_extension_handle = ParkPageExtension(snapshot);
     return QueueWordCloudRequest(request);
 }
 
 void PumpWordSessionStart(UiRuntime* runtime)
 {
-    if (runtime == nullptr || runtime->state().screen != wqn::UiScreen::kWord ||
-        runtime->state().word_app.mode != wqn::WordAppMode::kSessionStarting ||
-        !runtime->state().word_app.session.start_requested || IsWordCloudBusy()) return;
+    if (runtime == nullptr || IsWordCloudBusy()) return;
+    auto& pending = runtime->state().word_app;
+    if (pending.session.session_clear_armed) {
+        if (wqn::HasBufferedWordObservations(pending) ||
+            IsPersistDomainBusy(PersistDomain::kWord) ||
+            wqn::DefaultDeckRepairBlocking(pending)) return;
+        WordCloudRequest clear;
+        clear.op = WordCloudOp::kClearSession;
+        clear.scope_generation = wqn::GetDeckScopeGeneration();
+        clear.study_mode = static_cast<uint8_t>(pending.session.session_clear_mode);
+        std::snprintf(clear.session_id, sizeof(clear.session_id), "%s",
+                      pending.session.session_clear_id.c_str());
+        QueueWordCloudRequest(clear);
+        return;
+    }
+    if (runtime->state().screen != wqn::UiScreen::kWord ||
+        (!pending.session.start_requested && !pending.chain.segment_finished)) return;
+    if (!pending.chain.segment_finished &&
+        pending.mode != wqn::WordAppMode::kSessionStarting) return;
+    if (pending.session.cursor_intent_armed || IsPersistDomainBusy(PersistDomain::kWord)) return;
+    // [deck-autorepair] Defer a new session while a repair is pending/in
+    // flight: the scope is about to change, so a session started now would
+    // cross into the reset scope (generation defense, gap 3).
+    if (wqn::DefaultDeckRepairBlocking(runtime->state().word_app)) return;
     const auto& word = runtime->state().word_app;
     if (wqn::HasBufferedWordObservations(word) || word.session.observation_effect_ready ||
         word.session.commit_state == wqn::WordObservationCommitState::kPersisting ||
@@ -272,7 +359,7 @@ void PumpWordSessionStart(UiRuntime* runtime)
     wqn::protocol::word_study_v1::CreateSessionRequest request;
     request.metadata = wqn::services::MakeDeviceRequestMetadata();
     if (!runtime->TakeWordSessionStartRequest(&request)) return;
-    if (!QueueWordSessionStart(request)) {
+    if (!QueueWordSessionStart(request, word.session.session_load_armed)) {
         runtime->RestoreWordSessionStartRequest();
         return;
     }
@@ -309,6 +396,9 @@ void PumpWordCardPrefetch(UiRuntime* runtime)
 void PumpWordCandidatePrefetch(UiRuntime* runtime)
 {
     if (runtime == nullptr || IsWordCloudBusy()) return;
+    // [deck-autorepair] Defer a candidate page while a repair is pending/in
+    // flight (scope about to change, gap 3).
+    if (wqn::DefaultDeckRepairBlocking(runtime->state().word_app)) return;
     if (wqn::HasBufferedWordObservations(runtime->state().word_app) ||
         runtime->state().word_app.session.observation_effect_ready) {
         // A page extension writes a full snapshot. Never publish RAM-ahead
@@ -454,25 +544,48 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             if (!result.pack_index_ready) {
                 // The remote cursor contained no content changes. Keep the
                 // current session/index and do not manufacture a visible
-                // word-result revision or a full EPD refresh.
+                // word-result revision or a full EPD refresh. The runner STILL
+                // delivered an authoritative catalog for an unchanged (or
+                // authoritative-empty) manifest; install it in memory so a
+                // deleted default deck is detected here too, not only on a
+                // content-changing sync (gap 1). No BuildWordDeckCatalog here.
                 state->word_app.cloud_sync_failed = false;
                 state->word_app.cloud_loaded_once = true;
                 state->word_app.cloud_sync_requested = false;
+                if (result.catalog_authoritative) {
+                    wqn::InstallWordDeckCatalog(
+                        &state->word_app, std::move(result.catalog),
+                        /*authoritative=*/true);
+                    wqn::ArmDefaultDeckRepair(
+                        &state->word_app, wqn::GetDeckScopeGeneration());
+                    RebuildNoteWordDeckRows(state);
+                    state->settings.default_word_deck_id =
+                        state->word_app.default_deck_id;
+                    state->settings.default_word_deck_title =
+                        state->word_app.default_deck_title;
+                }
                 return false;
             }
             wqn::ApplyWordPackIndex(
                 &state->word_app,
                 std::move(result.pack_index),
                 result.message);
-            // Content changed: refresh the deck catalog (manifest titles +
-            // counts) and the note screen's [词] rows that mirror it.
-            std::vector<wqn::WordDeckInfo> catalog;
-            if (wqn::BuildWordDeckCatalog(&catalog) == ESP_OK) {
-                wqn::InstallWordDeckCatalog(&state->word_app, std::move(catalog));
+            // [deck-autorepair] Install the RUNNER-built catalog in memory.
+            // NEVER call BuildWordDeckCatalog here: that would read SPIFFS on
+            // the UI task (gap 4). Arm the INDEPENDENT auto-repair intent; the
+            // actual worker submit happens in the per-tick pump with full gates
+            // + bounded backoff, attributed back by operation_id (gap 2).
+            if (result.catalog_authoritative) {
+                wqn::InstallWordDeckCatalog(
+                    &state->word_app, std::move(result.catalog),
+                    /*authoritative=*/true);
+                wqn::ArmDefaultDeckRepair(
+                    &state->word_app, wqn::GetDeckScopeGeneration());
             }
             RebuildNoteWordDeckRows(state);
-            // Keep the settings row value in step (a cloud-deleted default
-            // falls back to 全部词库 inside InstallWordDeckCatalog).
+            // Keep the settings row value in step. InstallWordDeckCatalog does
+            // not clear the in-memory default: a deleted deck is repaired
+            // durably by the worker, and memory changes only on its ACK.
             state->settings.default_word_deck_id = state->word_app.default_deck_id;
             state->settings.default_word_deck_title =
                 state->word_app.default_deck_title;
@@ -486,12 +599,25 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
         return true;
     }
 
+    if (result.op == WordCloudOp::kClearSession) {
+        auto& session = state->word_app.session;
+        if (session.session_clear_armed && session.session_clear_id == result.control_session_id) {
+            session.session_clear_armed = false;
+            session.session_clear_id.clear();
+            state->word_app.message = result.result == ESP_OK
+                ? "旧会话已关闭，可重新开始" : "旧会话关闭失败，请同步后重试";
+        }
+        return state->screen == wqn::UiScreen::kWord;
+    }
     if (result.op == WordCloudOp::kStartSession) {
         // [deck-scope] A default-deck switch committed while this request was
         // in flight: the runner-side save was already rejected by the store;
         // drop the result too so a stale session never installs over the
-        // fresh scope. The user re-enters the word page to start a new round.
-        if (result.scope_generation != wqn::GetDeckScopeGeneration()) {
+        // fresh scope. [deck-autorepair] Also drop while a repair is pending/
+        // in flight: the scope is about to change even if the generation has
+        // not been bumped yet, so installing now would cross scopes (gap 3).
+        if (result.scope_generation != wqn::GetDeckScopeGeneration() ||
+            wqn::DefaultDeckRepairBlocking(state->word_app)) {
             ESP_LOGW(kTag, "word session start dropped: scope epoch %lu != %lu",
                      static_cast<unsigned long>(result.scope_generation),
                      static_cast<unsigned long>(wqn::GetDeckScopeGeneration()));
@@ -500,11 +626,40 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             state->word_app.message = "词库已切换，请重新进入";
             return state->screen == wqn::UiScreen::kWord;
         }
+        if ((state->screen != wqn::UiScreen::kWord ||
+             state->word_app.session.cancel_start_requested) &&
+            result.result == ESP_OK && result.persisted_session.active) {
+            auto& session = state->word_app.session;
+            session.persisted = result.persisted_session;
+            session.session_load_armed = false;
+            session.cancel_start_requested = false;
+            session.cursor_intent_armed = true;
+            session.cursor_intent_paused = true;
+            session.cursor_intent_session = result.persisted_session;
+            session.cursor_intent_session.paused = true;
+            session.cursor_intent_operation_id = 0;
+            wqn::CancelWordSessionStartResult(&state->word_app);
+            state->word_app.message = "正在保存暂停";
+            return state->screen == wqn::UiScreen::kWord;
+        }
         if (state->screen != wqn::UiScreen::kWord) {
             wqn::CancelWordSessionStartResult(&state->word_app);
             state->word_app.mode = wqn::WordAppMode::kHome;
             state->word_app.message = "已取消本轮准备";
             return false;
+        }
+        if (result.local_sequence && result.local_round_complete) {
+            wqn::CancelWordSessionStartResult(&state->word_app);
+            state->word_app.mode = wqn::WordAppMode::kHome;
+            state->word_app.chain.sequential_cursor = 0;
+            state->word_app.chain.segment_finished = false;
+            state->word_app.chain.next_segment_armed = false;
+            state->word_app.message = "本轮完成，下次从第一词开始";
+            return state->screen == wqn::UiScreen::kWord;
+        }
+        if (result.result == ESP_OK && result.pack_index_ready) {
+            wqn::InstallPreparedWordPackIndex(
+                &state->word_app, std::move(result.pack_index));
         }
         const bool applied = wqn::ApplyWordSessionStartResult(
             &state->word_app,
@@ -513,14 +668,42 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             result.session_persist_result,
             std::move(result.persisted_session));
         if (!applied) return false;
+        if (result.result != ESP_OK) {
+            state->word_app.message = result.auth_required ? "请重新配对"
+                : (!result.message.empty() ? result.message : "本轮准备失败，可重试");
+        } else if (!result.message.empty() && result.pack_index_ready &&
+                   result.message == "词库已更新，已从第一词开始") {
+            state->word_app.message = result.message;
+        }
+        if (result.local_sequence && result.result == ESP_OK) {
+            auto& chain = state->word_app.chain;
+            chain.active = true;
+            chain.sequential_total = result.local_sequence_total;
+            chain.pinned_session_id =
+                state->word_app.session.persisted.remote.session_id;
+            chain.pinned_deck_id = result.local_scope_deck_id;
+            chain.pinned_scope_generation = result.scope_generation;
+            (void)result.local_segment_start;
+            chain.segment_finished = false;
+            chain.next_segment_armed = false;
+            uint64_t absolute = 0;
+            if (wqn::WordSequenceAbsoluteCursor(
+                    state->word_app.session.persisted,
+                    &absolute) == ESP_OK && absolute <= UINT32_MAX) {
+                chain.sequential_cursor =
+                    static_cast<uint32_t>(absolute);
+            }
+        }
         BuildHomeSummary(state);
         return true;
     }
     if (result.op == WordCloudOp::kFetchSessionPage) {
         // [deck-scope] Same stale-epoch drop as kStartSession: route it through
         // the existing failure path so page_in_flight resets without touching
-        // the (already reset) session.
-        if (result.scope_generation != wqn::GetDeckScopeGeneration()) {
+        // the (already reset) session. [deck-autorepair] Also drop while a
+        // repair is pending/in flight (scope about to change, gap 3).
+        if (result.scope_generation != wqn::GetDeckScopeGeneration() ||
+            wqn::DefaultDeckRepairBlocking(state->word_app)) {
             ESP_LOGW(kTag, "word candidate page dropped: scope epoch %lu != %lu",
                      static_cast<unsigned long>(result.scope_generation),
                      static_cast<unsigned long>(wqn::GetDeckScopeGeneration()));
@@ -550,6 +733,165 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
     return false;
 }
 
+namespace {
+
+bool IsLocalSequentialOp(const WordCloudRequest& request)
+{
+    return request.study_mode ==
+               static_cast<uint8_t>(
+                   wqn::protocol::word_study_v1::Mode::kSequential) &&
+           (request.op == WordCloudOp::kStartSession ||
+            request.op == WordCloudOp::kFetchSessionPage);
+}
+
+void ExecuteLocalWordStart(const WordCloudRequest& request, WordCloudResult* result)
+{
+    result->op = WordCloudOp::kStartSession;
+    result->local_sequence = true;
+    const std::string scope = request.deck_id;
+    result->local_scope_deck_id = scope;
+    wqn::PersistedWordSession old;
+    const auto mode = wqn::protocol::word_study_v1::Mode::kSequential;
+    const esp_err_t loaded = wqn::LoadPersistedWordSession(mode, &old);
+    if (loaded != ESP_OK && loaded != ESP_ERR_NOT_FOUND) { result->result = loaded; return; }
+    wqn::LocalWordSessionDescriptor prior;
+    bool have_prior = false;
+    if (loaded == ESP_OK) {
+        const esp_err_t found = wqn::LoadLocalWordSessionDescriptor(old.remote.session_id, &prior);
+        if (found != ESP_OK && found != ESP_ERR_NOT_FOUND) { result->result = found; return; }
+        have_prior = found == ESP_OK;
+    }
+    uint64_t absolute = 0;
+    if (have_prior && (prior.session.deck_scope_generation != request.scope_generation ||
+        wqn::WordSequenceAbsoluteCursor(old, &absolute) != ESP_OK || absolute > prior.total_count)) {
+        result->result = ESP_ERR_INVALID_STATE;
+        return;
+    }
+    // A completed round is retained for recovery. A new home entry at zero
+    // starts a new round; mid-round completion continues from its durable end.
+    const bool new_round = have_prior && !old.active && absolute == prior.total_count &&
+        request.start_index == 0;
+    bool resume = have_prior && old.active;
+    bool pinned = have_prior && !new_round;
+    uint32_t start = pinned ? static_cast<uint32_t>(absolute) : 0;
+    wqn::WordPackIndex index;
+    esp_err_t indexed = pinned ? wqn::LoadWordPackIndexForSession(prior.session, &index)
+                              : wqn::LoadWordPackIndex(&index);
+    bool restarted = false;
+    if (pinned && indexed != ESP_OK) {
+        wqn::WordPackIndex current;
+        const esp_err_t fresh = wqn::LoadWordPackIndex(&current);
+        if (fresh == ESP_OK && !wqn::LocalSequenceSnapshotMatches(current, prior)) {
+            index = std::move(current);
+            indexed = ESP_OK;
+            pinned = false;
+            resume = false;
+            start = 0;
+            restarted = true;
+        }
+    }
+    if (indexed != ESP_OK || !index.mounted || !index.has_manifest ||
+        index.pack_error || index.truncated || index.entries.empty()) {
+        result->result = indexed == ESP_OK ? ESP_ERR_INVALID_STATE : indexed;
+        result->message = "词库未缓存或校验失败，请同步";
+        return;
+    }
+    if (pinned && !wqn::LocalSequenceSnapshotMatches(index, prior)) {
+        result->result = ESP_ERR_INVALID_RESPONSE;
+        return;
+    }
+    if (resume) {
+        old.paused = false;
+        result->result = wqn::SaveWordSessionCursor(old);
+        if (result->result != ESP_OK) return;
+        result->persisted_session = std::move(old);
+        result->local_sequence_total = prior.total_count;
+        result->local_segment_start = prior.session.start_index;
+    } else {
+        wqn::LocalWordSessionDescriptor descriptor;
+        result->result = wqn::PrepareLocalWordSequence(index, scope, start,
+            request.session_id, request.seed[0] ? request.seed : "local-sequential-v1",
+            request.scope_generation, &descriptor);
+        if (result->result == ESP_ERR_NOT_FOUND) {
+            result->result = ESP_OK;
+            result->local_round_complete = true;
+            return;
+        }
+        if (result->result != ESP_OK) return;
+        result->session_persist_result = wqn::SaveLocalWordSessionDescriptor(descriptor);
+        if (result->session_persist_result != ESP_OK) { result->result = result->session_persist_result; return; }
+        result->session_compact_result = wqn::BuildLocalWordInitialSession(descriptor, 32, &result->persisted_session);
+        if (result->session_compact_result != ESP_OK) { result->result = result->session_compact_result; return; }
+        result->session_persist_result = wqn::SavePersistedWordSession(result->persisted_session);
+        if (result->session_persist_result != ESP_OK) { result->result = result->session_persist_result; return; }
+        result->local_sequence_total = descriptor.total_count;
+        result->local_segment_start = descriptor.session.start_index;
+    }
+    result->result = ESP_OK;
+    result->pack_index = std::move(index);
+    result->pack_index_ready = true;
+    result->message = restarted ? "词库已更新，已从第一词开始" : "本地顺序学习已就绪";
+}
+
+void ExecuteLocalWordPage(const WordCloudRequest& request, WordCloudResult* result)
+{
+    if (result == nullptr) return;
+    result->op = WordCloudOp::kFetchSessionPage;
+    result->local_sequence = true;
+    wqn::PersistedWordSession parked;
+    const bool have_parked =
+        TakePageExtension(request.page_extension_handle, &parked);
+    wqn::LocalWordSessionDescriptor descriptor;
+    result->result = wqn::LoadLocalWordSessionDescriptor(
+        request.session_id, &descriptor);
+    if (result->result != ESP_OK || !have_parked ||
+        descriptor.session.deck_scope_generation != request.scope_generation ||
+        descriptor.session.remote.session_id !=
+            parked.remote.session_id) {
+        if (result->result == ESP_OK) result->result = ESP_ERR_INVALID_STATE;
+        result->message = "本地顺序会话已失效";
+        return;
+    }
+    result->local_sequence_total = descriptor.total_count;
+    result->result = wqn::GetLocalWordCandidatePage(
+        descriptor, request.cursor,
+        request.limit == 0 ? 64 : request.limit,
+        &result->candidate_page);
+    if (result->result == ESP_ERR_NOT_FOUND) {
+        // Segment exhausted: the worker result arms the next descriptor only
+        // after the UI's final batch ACK has cleared the buffer.
+        result->result = ESP_OK;
+        result->candidate_page = {};
+        result->candidate_page.cursor = request.cursor;
+        result->candidate_page.has_more = false;
+        result->message = "本段已学完";
+        result->persisted_session = parked;
+        result->session_compact_result = ESP_OK;
+        result->session_persist_result = ESP_OK;
+        return;
+    }
+    if (result->result != ESP_OK) return;
+    result->persisted_session = parked;
+    result->session_compact_result =
+        wqn::ExtendPersistedWordSessionWithPage(
+            parked, result->candidate_page, &result->persisted_session);
+    if (result->session_compact_result != ESP_OK) {
+        result->result = result->session_compact_result;
+        return;
+    }
+    if (result->persisted_session.active) {
+        result->session_persist_result =
+            wqn::SavePersistedWordSession(result->persisted_session);
+        if (result->session_persist_result != ESP_OK) {
+            result->result = result->session_persist_result;
+            return;
+        }
+    }
+    result->result = ESP_OK;
+}
+
+}  // namespace
+
 void ExecuteWordCloudRequest(const WordCloudRequest& request)
 {
     const CloudDomain result_domain = request.op == WordCloudOp::kPackSync
@@ -575,6 +917,42 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
     result.op = request.op;
     result.scope_generation = request.scope_generation;
     result.message.clear();
+
+    result.control_session_id = request.session_id;
+    if (request.op == WordCloudOp::kClearSession) {
+        result.result = wqn::ClearPersistedWordSessionIfMatches(
+            static_cast<wqn::protocol::word_study_v1::Mode>(request.study_mode),
+            request.session_id, request.scope_generation);
+        SendWordCloudResult(result_domain);
+        return;
+    }
+    if (request.op == WordCloudOp::kStartSession && request.resume_existing &&
+        request.study_mode != static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kSequential)) {
+        result.result = wqn::LoadPersistedWordSession(
+            static_cast<wqn::protocol::word_study_v1::Mode>(request.study_mode), &result.persisted_session);
+        if (result.result == ESP_OK && result.persisted_session.active) {
+            result.result = wqn::LoadWordPackIndexForSession(result.persisted_session, &result.pack_index);
+            if (result.result == ESP_OK) {
+                result.persisted_session.paused = false;
+                result.result = wqn::SaveWordSessionCursor(result.persisted_session);
+                result.pack_index_ready = result.result == ESP_OK;
+            }
+        } else if (result.result == ESP_OK) result.result = ESP_ERR_NOT_FOUND;
+        SendWordCloudResult(result_domain);
+        return;
+    }
+
+    // Local sequential walks must never require a valid token or an online
+    // create/intake round first. Dispatch before ANY token validation.
+    if (IsLocalSequentialOp(request)) {
+        if (request.op == WordCloudOp::kStartSession) {
+            ExecuteLocalWordStart(request, &result);
+        } else {
+            ExecuteLocalWordPage(request, &result);
+        }
+        SendWordCloudResult(result_domain);
+        return;
+    }
 
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {
@@ -790,6 +1168,18 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         wqn::services::CompleteContentRefresh(
             content_ticket, result.result, nullptr,
             result.result == ESP_OK ? nullptr : result.message.c_str());
+        // [deck-autorepair] Build the mounted deck catalog HERE on the bulk
+        // runner lane, where SPIFFS reads are allowed -- the UI apply step must
+        // never read SPIFFS. This runs for EVERY confirmed full manifest
+        // success: changed content, unchanged manifest, and an authoritative
+        // empty catalog (all decks deleted). Only a full success (result==OK)
+        // yields an authoritative payload; a partial/failed walk leaves it
+        // false so the UI never arms an NVS-clearing repair from bad data.
+        if (result.result == ESP_OK) {
+            if (wqn::BuildWordDeckCatalog(&result.catalog) == ESP_OK) {
+                result.catalog_authoritative = true;
+            }
+        }
     }
     SendWordCloudResult(result_domain);
 }

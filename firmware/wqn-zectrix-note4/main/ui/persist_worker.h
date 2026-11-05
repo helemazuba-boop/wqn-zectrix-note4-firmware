@@ -59,6 +59,10 @@ enum class PersistKind : uint8_t {
     // default deck. One foreground transaction: commit the new scope
     // generation, then the four session clears and the walk cursor.
     kWordSessionReset,
+    // [persist-worker] Pause/resume cursor overlay for an existing session.
+    // Same kWord domain as observation commits so a newer durable cursor can
+    // never be overwritten by a stale pause snapshot.
+    kWordSessionCursor,
     // Read-only, immutable pack speculation. Reuses the worker and ACK mailbox;
     // no word mutation domain and no additional task/storage owner.
     kWordCardPrefetch,
@@ -128,6 +132,11 @@ void EnqueueReservedWordObservations(
     wqn::PersistedWordSession advanced_session);
 void EnqueueReservedWordCardPrefetch(const PersistTicket& ticket,
     const wqn::WordPackIndexEntry& index);
+// [persist-worker] Typed pause/resume overlay. Takes the exact session as of
+// the reservation, then installs paused/resumable/home only after its ACK.
+void EnqueueReservedWordSessionCursor(
+    const PersistTicket& ticket,
+    wqn::PersistedWordSession session);
 void EnqueueReservedNoteObservation(
     const PersistTicket& ticket,
     wqn::DurableNoteObservation observation,

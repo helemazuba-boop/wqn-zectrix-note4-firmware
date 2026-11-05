@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 #include "device_protocol/word_study.h"
-constexpr int ESP_OK=0,ESP_FAIL=1,ESP_ERR_INVALID_STATE=2;
+constexpr int ESP_OK=0,ESP_FAIL=1,ESP_ERR_INVALID_STATE=2,ESP_ERR_NOT_FOUND=3;
 constexpr const char* kTag="fixture";
 void Log(const char*,const char*,...) {}
 const char* esp_err_to_name(int result) {return result==ESP_OK?"ESP_OK":"ESP_FAIL";}
@@ -24,6 +24,15 @@ constexpr int kWordNewWordDailyLimit=20;
 @@STATE@@
 struct WqnWordEntry {std::string word;};
 struct WordPackIndex {};
+// [deck-autorepair] Real POD fields used by the injected DefaultDeckRepairBlocking.
+struct DefaultDeckRepairState {
+    bool pending = false;
+    uint32_t op_id = 0;
+    int64_t retry_after_ms = 0;
+    uint32_t attempts = 0;
+    uint32_t scope_generation = 0;
+    bool must_complete = false;
+};
 struct WordAppState {
     WordAppMode mode=WordAppMode::kSessionStarting;
     WordSessionState session;
@@ -32,9 +41,12 @@ struct WordAppState {
     WordOutboxState outbox;
     WordPackIndex pack_index;
     WqnWordEntry current_word;
+    DefaultDeckRepairState default_deck_repair;
+    bool scope_reset_pending_valid=false;
     bool pending_pack_index_ready=false,pack_index_pinned=false;
     std::string message,scoped_deck_id,default_deck_id;
 };
+@@BLOCKING@@
 bool HasBufferedWordObservations(const WordAppState&);
 int card_reads=0,saves=0;
 bool IsReviewSession(const PersistedWordSession& s){return s.remote.mode==protocol::word_study_v1::Mode::kReview;}
@@ -58,6 +70,8 @@ esp_err_t SavePersistedWordSession(const PersistedWordSession&){++saves;return E
 @@CHAIN@@
 @@REQUEST@@
 @@CANCEL@@
+@@CURSOR@@
+@@MUTATION@@
 @@BUFFER@@
 @@BATCH_RESULT@@
 enum class UiScreen {kWord,kOther};
@@ -71,14 +85,19 @@ protocol::v3::RequestMetadata MakeDeviceRequestMetadata(){
 }
 }
 }
+namespace wqn { uint32_t GetDeckScopeGeneration() { return 7; } }
 namespace device_ui_internal {
+@@CLOUD_REQUEST@@
+enum class PersistDomain {kWord};
+bool IsPersistDomainBusy(PersistDomain) { return false; }
+bool QueueWordCloudRequest(const WordCloudRequest&) { return true; }
 enum class PersistKind {kWordObservation};
 bool cloud_busy=false,persist_busy=false,queue_allowed=true;
 int attempts=0;
 std::vector<wqn::protocol::word_study_v1::CreateSessionRequest> queued;
 bool IsWordCloudBusy(){return cloud_busy;}
 bool IsPersistKindBusy(PersistKind){return persist_busy;}
-bool QueueWordSessionStart(const wqn::protocol::word_study_v1::CreateSessionRequest& request){
+bool QueueWordSessionStart(const wqn::protocol::word_study_v1::CreateSessionRequest& request, bool = false){
     ++attempts;
     if(!queue_allowed)return false;
     queued.push_back(request);cloud_busy=true;return true;
@@ -184,6 +203,36 @@ int main(){
             gate==0?"Prepared effect defers start":gate==1?"kPersisting gates the Prepare-to-reserve gap":"worker ownership defers start");
     }
 
+    // [deck-autorepair] NEW gate: the REAL DefaultDeckRepairBlocking defers a
+    // new session while a repair is pending / in flight / owes a failed
+    // accepted transaction's marker tail (must_complete). Not an always-false
+    // stub: exercise each field and the cleared (proceeds) case.
+    {
+        runtime=Initial();word=&runtime.state_.word_app;Pending(&runtime);
+        word->default_deck_repair.pending=true;
+        PumpWordSessionStart(&runtime);
+        Check(attempts==0 && word->session.start_requested &&
+            !word->session.start_result_expected,
+            "pending auto repair defers a new session (real gate)");
+        // Clear pending, but an accepted in-flight op still blocks.
+        word->default_deck_repair.pending=false;
+        word->default_deck_repair.op_id=55;
+        PumpWordSessionStart(&runtime);
+        Check(attempts==0 && word->session.start_requested,
+            "in-flight auto repair op defers a new session (real gate)");
+        // A failed accepted transaction's recovery obligation also blocks.
+        word->default_deck_repair.op_id=0;
+        word->default_deck_repair.must_complete=true;
+        PumpWordSessionStart(&runtime);
+        Check(attempts==0 && word->session.start_requested,
+            "must_complete recovery tail defers a new session (real gate)");
+        // Only once the obligation is fully cleared does the start proceed.
+        word->default_deck_repair.must_complete=false;
+        PumpWordSessionStart(&runtime);
+        Check(attempts==1 && queued.size()==1 && !word->session.start_requested,
+            "cleared auto repair lets the pending session start (real gate)");
+    }
+
     runtime=Initial();word=&runtime.state_.word_app;Pending(&runtime);
     runtime.state_.screen=UiScreen::kOther;PumpWordSessionStart(&runtime);
     Check(attempts==0 && word->session.start_requested,"a hidden word page cannot start a new session");
@@ -219,6 +268,47 @@ int main(){
     Check(ApplyWordSessionStartResult(word,ESP_OK,ESP_OK,ESP_OK,active) &&
         word->mode==WordAppMode::kWordCard && card_reads==1 && saves==0,
         "nonempty already-durable session still installs its first card without a UI snapshot write");
+    // Cursor ACK owns the visible transition; stale or failed ACK cannot
+    // change the card, SID, generation or exact pending pause intent.
+    runtime=Initial();word=&runtime.state_.word_app;
+    word->mode=WordAppMode::kWordCard;
+    word->session.persisted.active=true;
+    word->session.persisted.remote.session_id="pause-session";
+    word->session.persisted.deck_scope_generation=7;
+    word->session.persisted.phase=WordPresentationPhase::kBack;
+    auto arm_pause=[&](){
+        auto& s=word->session;
+        s.cursor_intent_armed=true;s.cursor_intent_paused=true;
+        s.cursor_intent_operation_id=0;s.cursor_intent_session=s.persisted;
+        s.cursor_intent_session.paused=true;
+    };
+    arm_pause();
+    Check(WordMutationBlockedByPendingWorker(*word),"pending cursor intent gates new word mutations");
+    PersistedWordSession intent;
+    Check(TakeWordSessionCursorEffect(word,10,&intent) && intent.paused &&
+        intent.phase==WordPresentationPhase::kBack,"pause worker receives the exact back-phase snapshot");
+    Check(!TakeWordSessionCursorEffect(word,11,&intent),"one cursor intent has only one worker owner");
+    Check(!ApplyWordSessionCursorResult(word,9,ESP_OK) && !word->session.persisted.paused &&
+        word->mode==WordAppMode::kWordCard,"stale operation ACK cannot publish pause");
+    Check(ApplyWordSessionCursorResult(word,10,ESP_FAIL) &&
+        word->session.cursor_intent_armed && word->session.cursor_awaiting_retry_confirm &&
+        !word->session.persisted.paused && word->mode==WordAppMode::kWordCard,
+        "failed pause preserves intent and requires retry confirmation");
+    word->session.cursor_awaiting_retry_confirm=false;
+    Check(TakeWordSessionCursorEffect(word,11,&intent) &&
+        ApplyWordSessionCursorResult(word,11,ESP_OK) && word->session.persisted.paused &&
+        !word->session.cursor_intent_armed && word->mode==WordAppMode::kHome,
+        "successful retry ACK publishes durable pause and returns home");
+    Check(!ApplyWordSessionCursorResult(word,11,ESP_OK),"duplicate cursor ACK is ignored");
+    for(int mismatch=0;mismatch<2;++mismatch){
+        arm_pause();TakeWordSessionCursorEffect(word,20,&intent);
+        if(mismatch==0)word->session.persisted.remote.session_id="replacement-session";
+        else ++word->session.persisted.deck_scope_generation;
+        Check(!ApplyWordSessionCursorResult(word,20,ESP_OK) && !word->session.cursor_intent_armed,
+            mismatch==0?"replaced SID rejects cursor ACK":"changed scope generation rejects cursor ACK");
+    }
+    arm_pause();word->session.buffered_observations.resize(1);
+    Check(!TakeWordSessionCursorEffect(word,30,&intent),"RAM observations must flush before cursor worker ownership");
     std::printf("%d PASS / %d FAIL (production start/chain/batch/pump, host cloud/card/I/O seams; NOT HIL)\n",passes,failures);
     return failures?1:0;
 }

@@ -159,6 +159,9 @@ public:
     UiUpdate DispatchWordObservationPersistResult(esp_err_t result, uint32_t operation_id);
     UiUpdate DispatchWordObservationBuffered(const std::string& request_id,
         const std::string& occurred_at, int64_t now_ms);
+    bool TakeWordSessionCursorEffect(uint32_t operation_id,
+        wqn::PersistedWordSession* session);
+    UiUpdate DispatchWordSessionCursorResult(esp_err_t result, uint32_t operation_id);
     bool TakeWordObservationBatch(uint32_t operation_id, int64_t now_ms,
         std::vector<wqn::DurableWordObservation>* observations,
         wqn::PersistedWordSession* advanced_session);
@@ -198,6 +201,12 @@ public:
     // inside the worker's marker transaction) and rebuilds the [词] rows;
     // failure keeps the displayed deck and the armed pending pair for retry.
     UiUpdate DispatchDefaultDeckChangeResult(esp_err_t result, uint32_t operation_id);
+    // [deck-autorepair] Per-tick pump for the independent auto-repair intent:
+    // supplies gates, decides with bounded backoff, and calls
+    // SubmitDefaultDeckChange only on kSubmit. Must run after the persist
+    // result dispatch (an ACK clears attribution first) and before the word
+    // session/prefetch pumps. Owns the state mutation as a typed entry point.
+    void PumpDefaultDeckAutoRepair(int64_t now_ms);
     // [word-scope-reset] Applies the durable ACK of a word-page scope switch.
     UiUpdate DispatchWordSessionResetResult(esp_err_t result, uint32_t operation_id);
     // [ai-follow] Durable follow-toggle result (c4 shape). Success installs the

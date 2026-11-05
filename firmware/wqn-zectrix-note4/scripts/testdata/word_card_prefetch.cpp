@@ -72,7 +72,7 @@ struct PersistCommand {
     std::atomic<uint32_t> state{kSlotFree};
     PersistKind kind=PersistKind::kWordObservation;
     uint32_t operation_id=0;
-    int word_obs=0, word_advanced=0, note_obs=0, note_advanced=0, problem_obs=0, settings_int=0;
+    int word_obs=0, word_advanced=0, word_cursor_session=0, note_obs=0, note_advanced=0, problem_obs=0, settings_int=0;
     std::vector<int> word_batch;
     wqn::WordPackIndexEntry word_card_index{};
     wqn::WqnWordEntry word_card_result;

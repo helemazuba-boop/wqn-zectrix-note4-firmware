@@ -555,10 +555,20 @@ void HandleUiInput(UiState* state, UiInput input)
                     //     would clear the session out from under the commit.
                     // (b) The durable ACK switches screens, which navigates away
                     //     from the note screen's answering context.
+                    // (c) [deck-autorepair] An auto repair IN FLIGHT (op_id) or
+                    //     one still owing a failed accepted transaction's marker
+                    //     tail (must_complete) owns the scope/deck worker
+                    //     transaction; this temporary scope submit must not race
+                    //     it -- same in-flight gate as the manual settings Confirm.
+                    //     A merely pending (unsubmitted) auto intent is not a
+                    //     blocker: the pump defers its own submit while this scope
+                    //     reset is pending.
                     // Consume the request and say nothing else, so a retry is the
                     // only thing left to do. Mirrors the top-nav guards above.
                     if (state->word_app.session.commit_state ==
                             wqn::WordObservationCommitState::kPersisting ||
+                        state->word_app.default_deck_repair.op_id != 0 ||
+                        state->word_app.default_deck_repair.must_complete ||
                         (state->problem_app.active &&
                          state->problem_app.commit_state ==
                              wqn::ProblemVerdictCommitState::kPersisting)) {

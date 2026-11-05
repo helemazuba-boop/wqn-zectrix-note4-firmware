@@ -451,6 +451,26 @@ UiUpdate UiRuntime::DispatchWordObservationBuffered(const std::string& request_i
         state_.screen == wqn::UiScreen::kWord ? RefreshSchedule::kSelection : RefreshSchedule::kNone, true);
 }
 
+bool UiRuntime::TakeWordSessionCursorEffect(
+    uint32_t operation_id, wqn::PersistedWordSession* session)
+{
+    return wqn::TakeWordSessionCursorEffect(
+        &state_.word_app, operation_id, session);
+}
+
+UiUpdate UiRuntime::DispatchWordSessionCursorResult(
+    esp_err_t result, uint32_t operation_id)
+{
+    const bool applied = wqn::ApplyWordSessionCursorResult(
+        &state_.word_app, operation_id, result);
+    if (!applied) return {};
+    BuildHomeSummary(&state_);
+    return FinishEvent(AppEventKind::kWordObservationPersist,
+        state_.screen == wqn::UiScreen::kWord
+            ? RefreshSchedule::kSelection : RefreshSchedule::kNone,
+        true);
+}
+
 bool UiRuntime::TakeWordObservationBatch(uint32_t operation_id, int64_t now_ms,
     std::vector<wqn::DurableWordObservation>* observations,
     wqn::PersistedWordSession* advanced_session)
@@ -735,6 +755,38 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
     esp_err_t result, uint32_t operation_id)
 {
     wqn::SettingsAppState& settings = state_.settings;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    // [deck-autorepair] An auto-repair operation is attributed by its OWN
+    // op_id in word_app, NEVER in the manual settings pending pair. Handle it
+    // separately so an automatic result can never overwrite a user switch.
+    if (wqn::OnDefaultDeckRepairAck(
+            &state_.word_app, operation_id, result, now_ms)) {
+        if (result == ESP_OK) {
+            // Durable all-decks repair committed. Install the cleared default
+            // in memory, reset the in-memory session (the worker already did
+            // the durable clears) and refresh note [词] rows. The manual
+            // settings pending pair is NOT touched: this is not a user switch.
+            wqn::SetDefaultWordDeck(
+                &state_.word_app, std::string(), std::string());
+            settings.default_word_deck_id = state_.word_app.default_deck_id;
+            settings.default_word_deck_title =
+                state_.word_app.default_deck_title;
+            wqn::ResetWordSessionsForScopeChange(&state_.word_app, false);
+            RebuildNoteWordDeckRows(&state_);
+            ESP_LOGI(kTag, "default deck autorepair committed: all decks");
+        } else {
+            // [deck-autorepair] A failed accepted transaction may be half-
+            // applied (live recoverable marker). OnDefaultDeckRepairAck keeps
+            // the must_complete obligation + backs off; the pump retries with a
+            // fresh op_id until a success ACK. A reappearing/valid catalog does
+            // NOT cancel this recovery tail. Keep the repair quiet (no notice).
+            ESP_LOGW(kTag, "default deck autorepair failed; will retry tail: %s",
+                     esp_err_to_name(result));
+        }
+        const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
+            ? RefreshSchedule::kConfig : RefreshSchedule::kNone;
+        return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+    }
     if (settings.word_deck_save_op_id == 0 ||
         settings.word_deck_save_op_id != operation_id) {
         ESP_LOGW(kTag, "stale deck change result: op=%lu expected=%lu",
@@ -777,6 +829,48 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
         ? RefreshSchedule::kConfig
         : RefreshSchedule::kNone;
     return FinishEvent(AppEventKind::kSettingsPersist, refresh, true);
+}
+
+void UiRuntime::PumpDefaultDeckAutoRepair(int64_t now_ms)
+{
+    wqn::WordAppState& word = state_.word_app;
+    const wqn::SettingsAppState& settings = state_.settings;
+    // [deck-autorepair] Full gate set (gap 2/3): observation buffers and the
+    // unified kPersisting state, a manual switch (pending or in flight) and a
+    // [词]-row scope reset all take priority. The captured scope_generation
+    // lets TickDefaultDeckRepair cancel an intent superseded by a committed
+    // manual/scope switch. Manual always wins; gates only DEFER, never drop.
+    const wqn::DefaultDeckRepairGates gates = {
+        /*.observations_pending=*/
+            wqn::HasBufferedWordObservations(word) ||
+            word.session.observation_effect_ready,
+        /*.persisting=*/
+            word.session.commit_state ==
+                wqn::WordObservationCommitState::kPersisting ||
+            IsPersistKindBusy(PersistKind::kWordObservation),
+        /*.manual_switch_pending=*/
+            settings.word_deck_pending_valid ||
+            settings.word_deck_save_op_id != 0,
+        /*.scope_reset_pending=*/
+            word.scope_reset_pending_valid ||
+            word.scope_reset_save_op_id != 0,
+        /*.current_scope_generation=*/ wqn::GetDeckScopeGeneration(),
+        /*.now_ms=*/ now_ms,
+    };
+    const wqn::DefaultDeckRepairTick tick =
+        wqn::TickDefaultDeckRepair(&word, gates);
+    if (tick != wqn::DefaultDeckRepairTick::kSubmit) {
+        return;  // kIdle (cancelled) or kDefer (gate/backoff/in-flight)
+    }
+    const uint32_t op_id = SubmitDefaultDeckChange(std::string());
+    wqn::OnDefaultDeckRepairSubmitted(&word, op_id, now_ms);
+    if (op_id != 0) {
+        ESP_LOGI(kTag, "default deck autorepair submitted: op=%lu",
+                 static_cast<unsigned long>(op_id));
+    } else {
+        // Reserve/busy failure: intent stays armed with bounded backoff.
+        ESP_LOGW(kTag, "default deck autorepair deferred: worker busy");
+    }
 }
 
 UiUpdate UiRuntime::DispatchAiFollowSaveResult(esp_err_t result, uint32_t operation_id)

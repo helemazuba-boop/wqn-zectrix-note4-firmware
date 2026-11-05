@@ -179,13 +179,21 @@ enum class WordCloudOp {
     kPackSync,
     kStartSession,
     kFetchSessionPage,
+    kClearSession,
 };
 
 struct WordCloudRequest {
+    bool resume_existing = false;
     WordCloudOp op = WordCloudOp::kPackSync;
     char request_id[65] = {};
     char session_id[37] = {};
     char cursor[65] = {};
+    // Stable local segment UUID at start; immutable pinned seed (1..64 chars).
+    char seed[65] = {};
+    // Absolute end cursor recovered from the replayed slot/journal. Used to
+    // select a mid-segment resume and arm an exact next-segment start.
+    uint32_t local_absolute_cursor = 0;
+    bool local_resume_expected = false;
     uint16_t limit = 0;
     uint8_t study_mode = 0;
     // [word-modes-v2] kStartSession only: the sequential walk's continuation
@@ -218,6 +226,7 @@ struct WordCloudRequest {
 };
 
 struct WordCloudResult {
+    std::string control_session_id;
     WordCloudOp op = WordCloudOp::kPackSync;
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
@@ -233,8 +242,25 @@ struct WordCloudResult {
     wqn::PersistedWordSession persisted_session;
     esp_err_t session_compact_result = ESP_OK;
     esp_err_t session_persist_result = ESP_OK;
+    // Local sequential descriptor identity for the UI's whole-round cursor.
+    // total_count is the selected scope total, not one <=500 segment.
+    bool local_sequence = false;
+    uint32_t local_sequence_total = 0;
+    std::string local_scope_deck_id;
+    bool local_round_complete = false;
+    // Exact segment base and pinned snapshot identity for coherent UI install.
+    uint32_t local_segment_start = 0;
     // [deck-scope] Echo of the request's scope epoch (see WordCloudRequest).
     uint32_t scope_generation = 0;
+    // [deck-autorepair] kPackSync: the mounted deck catalog built on the
+    // RUNNER (bulk lane) after a CONFIRMED full manifest success. The UI apply
+    // step only installs this payload in memory and must NEVER read SPIFFS.
+    // catalog_authoritative is true ONLY for a full successful manifest walk,
+    // for BOTH changed and unchanged manifests -- an unchanged or authoritative
+    // empty catalog (all decks deleted) is still evidence about which decks
+    // exist, so boot/partial loads stay false and never clear NVS.
+    std::vector<wqn::WordDeckInfo> catalog;
+    bool catalog_authoritative = false;
 };
 
 struct TodoCloudResultReady {
@@ -505,6 +531,9 @@ RefreshSchedule PumpNoteObservationCommit(UiRuntime* runtime);
 // Take-failure path (cursor desync) mutates state to kFailed after this
 // iteration's display commit, so it must request its own repaint.
 RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime);
+// [persist-worker] Typed pause/resume cursor overlay. Buffer flush must
+// finish first; the Word domain gate excludes concurrent observation commits.
+RefreshSchedule PumpWordSessionCursor(UiRuntime* runtime);
 
 bool QueueProblemPackSync();
 bool QueueProblemImageFetch(
