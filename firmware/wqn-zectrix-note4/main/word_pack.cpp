@@ -19,6 +19,7 @@
 #include "device_protocol/json_depth_guard.h"
 #include "pack_jsonl_reader.h"
 #include "device_protocol/word_study.h"
+#include "word_local_session.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -381,6 +382,19 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
     std::vector<std::string> retained_stems;
     std::vector<std::string> pinned_hash_prefixes;
     AddManifestPackStems(current, &retained_stems);
+    // A local descriptor pins an exact pack snapshot until its observations
+    // have been collected. If the pin set cannot be proven, skip pruning.
+    wqn::LocalDescriptorRetention local_retention;
+    if (wqn::CollectRetainedLocalSnapshots(&local_retention) != ESP_OK) {
+        ESP_LOGW(kTag, "local snapshot pins unavailable; skip word pack prune");
+        return;
+    }
+    for (const std::string& sha : local_retention.pinned_sha256) {
+        if (sha.size() >= kPackHashStemChars) {
+            pinned_hash_prefixes.push_back(
+                sha.substr(0, kPackHashStemChars));
+        }
+    }
 
     for (const auto mode : kPersistedSessionModes) {
         wqn::PersistedWordSession pinned_session;

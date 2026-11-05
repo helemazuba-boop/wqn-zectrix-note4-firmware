@@ -48,6 +48,7 @@ struct PersistedWordSession {
         uint64_t next_sequence = 0;
         std::vector<Item> items;
         std::string cursor;
+        bool has_more = false;
     } remote;
     uint32_t position = 0;
     WordPresentationPhase phase = WordPresentationPhase::kFront;

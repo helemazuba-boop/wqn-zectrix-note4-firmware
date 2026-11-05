@@ -151,7 +151,21 @@ struct WordOutboxSnapshot {
 // A separate physical-byte bound reserves their terminal-marker slots. New
 // submissions can return INVALID_SIZE under unreclaimed space pressure; no
 // accepted observation is silently evicted to make room.
-inline constexpr size_t kWordObservationOutboxCapacity = 1000;
+//
+// 8192 (was 1000): a 3507-word local round can produce 7014 durable ~200 B
+// observations (reveal + judgment), in addition to terminal markers. Physical
+// budget (derived below in the .cpp, NOT a guarantee of free space):
+//   kOutboxMaxRecords = 2*8192 + 64 = 16448 records
+//   kOutboxMaxBytes   = 16448 * 200 = 3,289,600 B (~3.14 MiB) per journal
+// A compaction briefly holds primary + backup + temp (up to ~3x that), and the
+// 8 MiB SPIFFS partition also holds a full ~4 MiB pack and other journals.  The
+// partition is NOT guaranteed to fit all of that: under genuine ENOSPC / flush
+// / fsync / close / rename pressure the write fails with ESP_FAIL / ENOSPC and
+// the caller must RETRY, preserving every accepted fact (pending + suspended,
+// plus the descriptor and original journal).  Nothing is evicted or deleted to
+// make room, and a storage error is never reinterpreted as a deletable proof.
+// The v1 200 B record layout and CRC are unchanged, so old journals still read.
+inline constexpr size_t kWordObservationOutboxCapacity = 8192;
 
 // Every resumable word mode (sequential, review, shuffle, mistakes) has its own
 // durable slot. This is part of the product contract: changing entry mode must
@@ -165,6 +179,8 @@ esp_err_t SavePersistedWordSession(const PersistedWordSession& session);
 // value is overlaid on load after outbox reconciliation.
 esp_err_t SaveWordSessionCursor(const PersistedWordSession& session);
 esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode);
+esp_err_t ClearPersistedWordSessionIfMatches(protocol::word_study_v1::Mode mode,
+    const std::string& session_id, uint32_t generation);
 
 // A normal new observation durably includes the advanced position/phase/sequence
 // in its outbox record; it does not rewrite the complete candidate snapshot or

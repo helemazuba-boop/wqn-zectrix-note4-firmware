@@ -1,10 +1,12 @@
 #include "word_study_store.h"
+#include "word_local_session.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <new>
 #include <string>
 #include <sys/stat.h>
@@ -655,7 +657,8 @@ bool ReadSessionCursorPaused(
     return true;
 }
 
-esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
+esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session,
+    bool check_scope = true)
 {
     if (session == nullptr) return ESP_ERR_INVALID_ARG;
     FILE* file = std::fopen(path, "rb");
@@ -683,7 +686,7 @@ esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session)
     // snapshot stamped under an older scope generation must not resume after
     // a deck switch (e.g. a switch replayed by boot recovery while this file
     // survived a torn clear). NOT_FOUND matches the "unused mode" contract.
-    if (session->deck_scope_generation != wqn::GetDeckScopeGeneration()) {
+    if (check_scope && session->deck_scope_generation != wqn::GetDeckScopeGeneration()) {
         ESP_LOGW(kTag,
                  "word session rejected: scope generation %u != committed %u",
                  static_cast<unsigned>(session->deck_scope_generation),
@@ -824,6 +827,32 @@ esp_err_t BuildSuspendRecord(
     record->crc = RecordCrc(*record);
     return ESP_OK;
 }
+
+#ifdef WORD_LOCAL_DESCRIPTOR_HOST_SEAM
+// Host-test seam: the descriptor I/O fixture links this translation unit and
+// must mint REAL v1 200B outbox facts (observation + paired suspend) rather
+// than hand-rolled bytes. These wrappers expose the production builders only
+// for that host build; firmware builds are byte-for-byte unaffected.
+extern "C" esp_err_t WqnHostBuildObservationRecord(
+    const wqn::DurableWordObservation* observation, void* record)
+{
+    return BuildObservationRecord(
+        *observation, OutboxRecordKind::kObservation,
+        static_cast<OutboxRecord*>(record));
+}
+extern "C" esp_err_t WqnHostBuildSuspendRecord(
+    const char* request_id, wqn::OutboxSuspendReason reason, void* record)
+{
+    return BuildSuspendRecord(std::string(request_id), reason,
+                              static_cast<OutboxRecord*>(record));
+}
+extern "C" size_t WqnHostOutboxRecordSize() { return sizeof(OutboxRecord); }
+extern "C" void WqnHostResetWordOutboxCache()
+{
+    g_outbox_cache = {};
+    g_outbox_cache_loaded = false;
+}
+#endif
 
 esp_err_t ScanOutboxFile(const char* path, OutboxScan* scan)
 {
@@ -997,9 +1026,15 @@ esp_err_t EnsureOutboxCache(OutboxScan** scan)
     return ESP_OK;
 }
 
-// Preserve the existing 1000 live-observation capacity. A parked observation
-// needs two records; retain the EXISTING 64-record maintenance slack, independent
-// of maintenance frequency. Reserve one terminal slot for EVERY pending event.
+// Live capacity is now 8192 (header). A parked observation needs two records;
+// retain the EXISTING 64-record maintenance slack, independent of maintenance
+// frequency. Reserve one terminal slot for EVERY pending event. Derived:
+//   kOutboxMaxRecords = 2*8192 + 64   = 16448 records
+//   kOutboxMaxBytes   = 16448 * 200   = 3,289,600 B (~3.14 MiB) per journal
+// Compaction can briefly hold primary+backup+temp (~3x) and a full ~4 MiB pack
+// also lives on the 8 MiB partition, so this byte bound is an admission cap,
+// NOT a free-space guarantee. Real ENOSPC/flush/fsync/close/rename failures
+// propagate (ESP_FAIL) and are retryable; no fact is evicted or deleted.
 constexpr size_t kOutboxMaxRecords =
     2 * wqn::kWordObservationOutboxCapacity + 64;
 constexpr size_t kOutboxMaxBytes = kOutboxMaxRecords * sizeof(OutboxRecord);
@@ -1343,6 +1378,15 @@ void ReconcileSession(
         }
         session->phase = static_cast<wqn::WordPresentationPhase>(observation.next_phase);
         session->remote.next_sequence = observation.sequence + 1;
+        // The final journal fact advances the cursor without rewriting the
+        // session file. Restore segment completion as well as its position,
+        // otherwise a reset at 500 resumes an active but exhausted window.
+        if (session->remote.mode == wqn::protocol::word_study_v1::Mode::kSequential &&
+            session->position == session->remote.items.size() &&
+            !session->remote.has_more) {
+            session->active = false;
+            session->paused = false;
+        }
         *changed = true;
     }
 }
@@ -2193,6 +2237,592 @@ esp_err_t SnapshotTransaction(void* context)
     return ESP_OK;
 }
 
+// ===========================================================================
+// Local (offline) long-sequence descriptor storage.
+//
+// Independent per-segment file family, deliberately NOT the per-mode session
+// slots: the PersistedWordSession v4 disk format is unchanged, and a descriptor
+// keeps ALL <=500 candidates of its segment forever (until safe GC), even after
+// the current published session snapshot advances.  Old-scope descriptors must
+// remain loadable/registerable for pending upload facts, so LOAD does NOT apply
+// the current deck-scope generation filter; only NEW SAVE rejects a stale gen.
+// ===========================================================================
+constexpr uint32_t kLocalDescriptorMagic = UINT32_C(0x534c4457);  // WDLS
+constexpr uint16_t kLocalDescriptorVersion = 1;
+constexpr size_t kLocalDescriptorTokenChars = 24;  // first 24 hex of UUID
+constexpr size_t kLocalDescriptorMaxFiles = 32;
+constexpr size_t kLocalDescriptorMaxFileBytes = 96U * 1024U;
+// 32 descriptors * 96 KiB ceiling. The real 8 MiB partition also holds a pack
+// and journals; this is an admission cap, not a free-space guarantee.
+constexpr size_t kLocalDescriptorMaxTotalBytes =
+    kLocalDescriptorMaxFiles * kLocalDescriptorMaxFileBytes;
+
+esp_err_t PruneLocalDescriptorsImpl(const std::string& active_session_id);
+
+// The descriptor header is serialized MANUALLY as fixed little-endian scalars
+// into a byte vector (no #pragma pack, so the file's single existing
+// #pragma pack(push,1) / SessionHeader boundary stays unique for the existing
+// host-test section() extractors). Layout (all little-endian, no padding):
+//   [0..3]   magic (u32)      [4..5]  version (u16)   [6..7]  reserved (u16)
+//   [8..11]  session_size u32 [12..15] session_crc u32 [16..19] total_count u32
+//   [20..56] session_uuid[37] (36 hex+hyphen + NUL)
+//   [57..60] header_crc u32   (CRC32 over bytes [0..56])
+constexpr size_t kLocalDescriptorHeaderBytes = 61;
+constexpr size_t kLocalDescriptorCrcOffset = 57;
+static_assert(kLocalDescriptorCrcOffset + 4 == kLocalDescriptorHeaderBytes,
+              "descriptor header layout");
+
+void AppendLe(std::vector<uint8_t>* out, uint64_t value, size_t width)
+{
+    for (size_t i = 0; i < width; ++i) {
+        out->push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+    }
+}
+
+uint64_t ReadLe(const uint8_t* bytes, size_t width)
+{
+    uint64_t value = 0;
+    for (size_t i = 0; i < width; ++i) {
+        value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+    }
+    return value;
+}
+
+std::vector<uint8_t> EncodeLocalDescriptorHeaderBytes(
+    uint32_t session_size, uint32_t session_crc, uint32_t total_count,
+    const std::string& session_uuid)
+{
+    std::vector<uint8_t> out;
+    out.reserve(kLocalDescriptorHeaderBytes);
+    AppendLe(&out, kLocalDescriptorMagic, 4);
+    AppendLe(&out, kLocalDescriptorVersion, 2);
+    AppendLe(&out, 0, 2);  // reserved
+    AppendLe(&out, session_size, 4);
+    AppendLe(&out, session_crc, 4);
+    AppendLe(&out, total_count, 4);
+    for (size_t i = 0; i < 37; ++i) {
+        out.push_back(i < session_uuid.size()
+            ? static_cast<uint8_t>(session_uuid[i]) : 0);
+    }
+    const uint32_t crc = Crc32(out.data(), out.size());
+    AppendLe(&out, crc, 4);
+    return out;
+}
+
+// Basename is "/storage/wl" + 24 hex + 3-char ext = 29 (<=31 SPIFFS
+// SPIFFS_OBJ_NAME_LEN-1). The short token is derived from the UUID; the FULL
+// UUID lives in the header/payload and is compared on load/save.
+bool DeriveLocalDescriptorPaths(
+    const std::string& session_id,
+    char primary[40],
+    char temporary[40],
+    char backup[40])
+{
+    if (!wqn::IsValidLocalSessionUuid(session_id)) return false;
+    char token[kLocalDescriptorTokenChars + 1] = {};
+    size_t out = 0;
+    for (char ch : session_id) {
+        if (ch == '-') continue;
+        if (out >= kLocalDescriptorTokenChars) break;
+        token[out++] = ch;
+    }
+    if (out != kLocalDescriptorTokenChars) return false;
+    for (size_t i = 0; i < out; ++i) {
+        if (!((token[i] >= '0' && token[i] <= '9') ||
+              (token[i] >= 'a' && token[i] <= 'f') ||
+              (token[i] >= 'A' && token[i] <= 'F'))) {
+            return false;
+        }
+    }
+    std::snprintf(primary, 40, "/storage/wl%s.v1", token);
+    std::snprintf(temporary, 40, "/storage/wl%s.tmp", token);
+    std::snprintf(backup, 40, "/storage/wl%s.bak", token);
+    // Strict bound: every basename (path minus "/storage/") <= 31 chars.
+    return std::strlen(primary) <= 9 + 31 &&
+        std::strlen(temporary) <= 9 + 31 &&
+        std::strlen(backup) <= 9 + 31;
+}
+
+// Full descriptor validation shared by save and load.  Independent of I/O so a
+// corrupt/oversized/duplicate descriptor can never be published or recovered.
+bool LocalDescriptorSemanticsValid(
+    const wqn::LocalWordSessionDescriptor& descriptor)
+{
+    const auto& s = descriptor.session;
+    const auto& r = s.remote;
+    using namespace wqn::protocol::word_study_v1;
+    const auto uuid = [](const char* v) {
+        return v[36] == '\0' && std::memchr(v, '\0', 36) == nullptr &&
+            wqn::IsValidLocalSessionUuid(std::string(v, 36));
+    };
+    if (!s.active || s.paused || s.position != 0 ||
+        s.phase != wqn::WordPresentationPhase::kFront ||
+        r.mode != Mode::kSequential || r.purpose != Purpose::kStudy ||
+        r.ordering != Ordering::kSequential || !r.include_mastered ||
+        r.next_sequence != 0 || r.progress_revision != 0 || r.has_more ||
+        !r.cursor.empty() || r.optional_count < 1 || r.optional_count > 500 ||
+        r.seed.empty() || r.seed.size() > 64 ||
+        !std::all_of(r.seed.begin(), r.seed.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_';
+        }) || !wqn::IsValidLocalSessionUuid(r.session_id) ||
+        descriptor.total_count > 10000 || descriptor.total_count <= s.start_index ||
+        r.items.empty() || r.items.size() > kMaxSessionItems ||
+        r.items.size() > descriptor.total_count - s.start_index ||
+        r.deck_ids.empty() || r.deck_ids.size() > kMaxDecks ||
+        r.deck_ids.size() != r.snapshot.size()) return false;
+    for (size_t i = 0; i < r.deck_ids.size(); ++i) {
+        const auto& snap = r.snapshot[i];
+        if (!uuid(r.deck_ids[i].value) || !uuid(snap.deck_id) ||
+            std::strcmp(r.deck_ids[i].value, snap.deck_id) != 0 ||
+            snap.sha256[64] != '\0' || snap.pack_revision == 0 ||
+            snap.pack_revision > wqn::protocol::v3::kMaxSafeJsonInteger ||
+            snap.content_revision > wqn::protocol::v3::kMaxSafeJsonInteger) return false;
+        for (size_t c = 0; c < 64; ++c) {
+            const char ch = snap.sha256[c];
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+        }
+        for (size_t j = 0; j < i; ++j)
+            if (std::strcmp(r.deck_ids[i].value, r.deck_ids[j].value) == 0) return false;
+    }
+    for (size_t i = 0; i < r.items.size(); ++i) {
+        const auto& item = r.items[i];
+        if (item.ordinal != i || !uuid(item.item_id) || !uuid(item.deck_id) ||
+            std::none_of(r.deck_ids.begin(), r.deck_ids.end(), [&](const auto& d) {
+                return std::strcmp(d.value, item.deck_id) == 0;
+            })) return false;
+        for (size_t j = 0; j < i; ++j)
+            if (std::strcmp(item.item_id, r.items[j].item_id) == 0) return false;
+    }
+    return true;
+}
+
+// Encode descriptor = manual header bytes + EncodeSession(payload).
+// Reuses the EXISTING EncodeSession / Crc32; no new session disk format.
+esp_err_t EncodeLocalDescriptor(
+    const wqn::LocalWordSessionDescriptor& descriptor,
+    std::vector<uint8_t>* bytes)
+{
+    if (bytes == nullptr) return ESP_ERR_INVALID_ARG;
+    std::vector<uint8_t> payload;
+    if (!EncodeSession(descriptor.session, &payload)) return ESP_ERR_INVALID_ARG;
+    const std::vector<uint8_t> header = EncodeLocalDescriptorHeaderBytes(
+        static_cast<uint32_t>(payload.size()),
+        Crc32(payload.data(), payload.size()),
+        descriptor.total_count,
+        descriptor.session.remote.session_id);
+    bytes->clear();
+    bytes->reserve(header.size() + payload.size());
+    bytes->insert(bytes->end(), header.begin(), header.end());
+    bytes->insert(bytes->end(), payload.begin(), payload.end());
+    if (bytes->size() > kLocalDescriptorMaxFileBytes) return ESP_ERR_INVALID_SIZE;
+    return ESP_OK;
+}
+
+// Decode helper: parse a manual header out of a byte buffer.
+struct LocalDescriptorFields {
+    uint32_t session_size = 0;
+    uint32_t session_crc = 0;
+    uint32_t total_count = 0;
+    std::string session_uuid;
+};
+
+esp_err_t ParseLocalDescriptorHeader(
+    const uint8_t* data, size_t size, LocalDescriptorFields* fields)
+{
+    if (fields == nullptr || size < kLocalDescriptorHeaderBytes) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (ReadLe(data, 4) != kLocalDescriptorMagic ||
+        ReadLe(data + 4, 2) != kLocalDescriptorVersion ||
+        ReadLe(data + 6, 2) != 0) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    const uint32_t crc = static_cast<uint32_t>(
+        ReadLe(data + kLocalDescriptorCrcOffset, 4));
+    if (Crc32(data, kLocalDescriptorCrcOffset) != crc) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    fields->session_size = static_cast<uint32_t>(ReadLe(data + 8, 4));
+    fields->session_crc = static_cast<uint32_t>(ReadLe(data + 12, 4));
+    fields->total_count = static_cast<uint32_t>(ReadLe(data + 16, 4));
+    // Bounded fixed 37-byte field: must be NUL-terminated within it.
+    const char* uuid = reinterpret_cast<const char*>(data + 20);
+    size_t len = 0;
+    while (len < 37 && uuid[len] != '\0') ++len;
+    if (len == 37) return ESP_ERR_INVALID_RESPONSE;
+    fields->session_uuid.assign(uuid, len);
+    return ESP_OK;
+}
+
+esp_err_t DecodeLocalDescriptor(
+    const std::vector<uint8_t>& bytes,
+    const std::string& expected_session_id,
+    wqn::LocalWordSessionDescriptor* out)
+{
+    if (out == nullptr || bytes.size() < kLocalDescriptorHeaderBytes ||
+        bytes.size() > kLocalDescriptorMaxFileBytes) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    LocalDescriptorFields header;
+    esp_err_t parsed = ParseLocalDescriptorHeader(bytes.data(), bytes.size(),
+                                                  &header);
+    if (parsed != ESP_OK) return parsed;
+    // Full UUID in the header must equal BOTH the requested id and the encoded
+    // session's id (path-collision / mislabeled-file defence).
+    if (!wqn::IsValidLocalSessionUuid(header.session_uuid) ||
+        header.session_uuid != expected_session_id) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (header.session_size > kMaxSessionPayloadBytes ||
+        kLocalDescriptorHeaderBytes + header.session_size != bytes.size()) {
+        return ESP_ERR_INVALID_RESPONSE;  // strict length, no trailing bytes
+    }
+    std::vector<uint8_t> payload(
+        bytes.begin() + kLocalDescriptorHeaderBytes, bytes.end());
+    if (Crc32(payload.data(), payload.size()) != header.session_crc) {
+        return ESP_ERR_INVALID_CRC;
+    }
+    wqn::PersistedWordSession session;
+    if (!DecodeSession(payload, &session)) return ESP_ERR_INVALID_RESPONSE;
+    if (!wqn::IsValidLocalSessionUuid(session.remote.session_id) ||
+        session.remote.session_id != expected_session_id ||
+        session.remote.session_id != header.session_uuid) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    wqn::LocalWordSessionDescriptor descriptor;
+    descriptor.session = std::move(session);
+    descriptor.total_count = header.total_count;
+    if (!LocalDescriptorSemanticsValid(descriptor)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    *out = std::move(descriptor);
+    return ESP_OK;
+}
+
+// Read one descriptor file (primary or backup). NEVER a .tmp.  Distinguishes
+// NOT_FOUND (ENOENT) from corrupt/IO errors so an unknown failure is not
+// reinterpreted as a deletable/missing proof.
+esp_err_t ReadLocalDescriptorFile(
+    const char* path,
+    const std::string& expected_session_id,
+    wqn::LocalWordSessionDescriptor* out,
+    std::vector<uint8_t>* raw)
+{
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) {
+        return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    std::vector<uint8_t> bytes;
+    uint8_t buffer[512];
+    size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        if (bytes.size() + read > kLocalDescriptorMaxFileBytes) {
+            std::fclose(file);
+            return ESP_ERR_INVALID_RESPONSE;  // oversize -> corrupt, NOT IO missing
+        }
+        bytes.insert(bytes.end(), buffer, buffer + read);
+    }
+    const bool io_error = std::ferror(file) != 0;
+    const bool closed = std::fclose(file) == 0;
+    if (io_error || !closed) return ESP_FAIL;  // unknown IO -> conservative
+    if (raw != nullptr) *raw = bytes;
+    return DecodeLocalDescriptor(bytes, expected_session_id, out);
+}
+
+esp_err_t ReadLocalDescriptorFamily(
+    const std::string& id, wqn::LocalWordSessionDescriptor* out,
+    std::vector<uint8_t>* raw = nullptr)
+{
+    char p[40] = {}, t[40] = {}, b[40] = {};
+    if (!DeriveLocalDescriptorPaths(id, p, t, b)) return ESP_ERR_INVALID_ARG;
+    const esp_err_t primary = ReadLocalDescriptorFile(p, id, out, raw);
+    if (primary == ESP_OK) return ESP_OK;
+    const esp_err_t backup = ReadLocalDescriptorFile(b, id, out, raw);
+    if (backup == ESP_OK) return ESP_OK;
+    if (primary != ESP_ERR_NOT_FOUND) return primary;
+    if (backup != ESP_ERR_NOT_FOUND) return backup;
+    struct stat st = {};
+    if (stat(t, &st) == 0) return ESP_ERR_INVALID_RESPONSE;
+    return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+}
+
+// Read ONLY the full session UUID from a descriptor's header (bounded, with
+// CRC check).  Used by GC / collect to identify a family without decoding the
+// whole session.  An unreadable header is an unknown fact -> ESP_FAIL.
+esp_err_t ReadLocalDescriptorSessionId(const char* path, std::string* session_id)
+{
+    if (session_id == nullptr) return ESP_ERR_INVALID_ARG;
+    FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    uint8_t header[kLocalDescriptorHeaderBytes] = {};
+    const bool header_ok =
+        std::fread(header, 1, sizeof(header), file) == sizeof(header);
+    const bool io_error = std::ferror(file) != 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!header_ok || io_error || !closed) return ESP_FAIL;
+    LocalDescriptorFields fields;
+    esp_err_t parsed = ParseLocalDescriptorHeader(
+        header, sizeof(header), &fields);
+    if (parsed != ESP_OK) return parsed == ESP_ERR_INVALID_CRC
+        ? ESP_ERR_INVALID_CRC : ESP_FAIL;
+    if (!wqn::IsValidLocalSessionUuid(fields.session_uuid)) return ESP_FAIL;
+    *session_id = fields.session_uuid;
+    return ESP_OK;
+}
+
+// Enumerate existing descriptor families by scanning the /storage dir for the
+// "wl" + 24hex + ".v1" primary pattern.  Read-only; returns the primary paths.
+esp_err_t ListLocalDescriptorPrimaries(
+    std::vector<std::string, wqn::WordStorePsramAllocator<std::string>>* out)
+{
+    out->clear();
+    DIR* dir = opendir("/storage");
+    if (dir == nullptr) return ESP_FAIL;
+    esp_err_t result = ESP_OK;
+    for (;;) {
+        errno = 0;
+        const auto* entry = readdir(dir);
+        if (entry == nullptr) { if (errno != 0) result = ESP_FAIL; break; }
+        const std::string name(entry->d_name);
+        if (name.size() < 29 || name.compare(0, 2, "wl") != 0) continue;
+        const std::string ext = name.substr(26);
+        if (ext != ".v1" && ext != ".bak" && ext != ".tmp") continue;
+        if (!std::all_of(name.begin() + 2, name.begin() + 26, [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                (c >= 'A' && c <= 'F');
+        })) continue;
+        const std::string canonical = "/storage/" + name.substr(0, 26) + ".v1";
+        if (std::find(out->begin(), out->end(), canonical) == out->end()) {
+            out->push_back(canonical);
+            if (out->size() > kLocalDescriptorMaxFiles + 1) { result = ESP_ERR_INVALID_SIZE; break; }
+        }
+    }
+    if (closedir(dir) != 0) result = ESP_FAIL;
+    return result;
+}
+
+esp_err_t ReadCanonicalLocalFamily(const std::string& canonical,
+    wqn::LocalWordSessionDescriptor* out)
+{
+    const std::string backup = canonical.substr(0, canonical.size() - 3) + ".bak";
+    std::string id;
+    esp_err_t result = ReadLocalDescriptorSessionId(canonical.c_str(), &id);
+    if (result != ESP_OK) result = ReadLocalDescriptorSessionId(backup.c_str(), &id);
+    if (result != ESP_OK) return result;
+    char p[40] = {}, t[40] = {}, b[40] = {};
+    if (!DeriveLocalDescriptorPaths(id, p, t, b) || canonical != p)
+        return ESP_ERR_INVALID_RESPONSE;
+    return ReadLocalDescriptorFamily(id, out);
+}
+
+esp_err_t LocalFamiliesBytes(
+    const std::vector<std::string, wqn::WordStorePsramAllocator<std::string>>& paths,
+    size_t* bytes)
+{
+    *bytes = 0;
+    for (const auto& canonical : paths) {
+        const std::string stem = canonical.substr(0, canonical.size() - 3);
+        for (const char* ext : {".v1", ".bak", ".tmp"}) {
+            struct stat st = {};
+            if (stat((stem + ext).c_str(), &st) != 0) {
+                if (errno == ENOENT) continue;
+                return ESP_FAIL;
+            }
+            if (!S_ISREG(st.st_mode) || st.st_size < 0 ||
+                st.st_size > static_cast<off_t>(kLocalDescriptorMaxFileBytes))
+                return ESP_ERR_INVALID_SIZE;
+            *bytes += static_cast<size_t>(st.st_size);
+        }
+    }
+    return ESP_OK;
+}
+
+
+
+// Proof: does any durable outbox fact (pending / suspended / blocked-pending /
+// acknowledged) still reference this session_id? The caller supplies a FRESH
+// OutboxScan read from real disk via ScanOutbox (NOT the resident cache: a slot
+// written directly by the sync worker after the cache was first loaded would be
+// invisible there). A read error is NOT proof of "no reference" -- the caller
+// refuses to clean anything when ScanOutbox fails.
+esp_err_t LocalDescriptorHasOutboxReference(
+    const OutboxScan& scan,
+    const std::string& session_id,
+    bool* referenced,
+    bool* scan_ok)
+{
+    if (referenced == nullptr || scan_ok == nullptr) return ESP_ERR_INVALID_ARG;
+    *referenced = true;   // conservative default
+    *scan_ok = false;
+    const auto references = [&](const OutboxRecord& record) {
+        return std::strcmp(record.session_id, session_id.c_str()) == 0;
+    };
+    bool found =
+        std::any_of(scan.pending.begin(), scan.pending.end(), references) ||
+        std::any_of(scan.suspended.begin(), scan.suspended.end(), references) ||
+        std::any_of(scan.acknowledged.begin(), scan.acknowledged.end(), references);
+    // blocked pending = pending in a session that also has suspended records.
+    if (!found) {
+        for (const OutboxRecord& pending : scan.pending) {
+            const bool blocked = std::any_of(
+                scan.suspended.begin(), scan.suspended.end(),
+                [&](const OutboxRecord& parked) {
+                    return std::strcmp(pending.session_id,
+                                       parked.session_id) == 0;
+                });
+            if (blocked && references(pending)) { found = true; break; }
+        }
+    }
+    *referenced = found;
+    *scan_ok = true;
+    return ESP_OK;
+}
+
+// Proof: is this session_id one of the resumable/active per-mode session slots?
+// LoadSessionRaw applies its own scope-gen filter; for GC we only need the
+// session_id, so read the slot WITHOUT that filter via a raw file decode.
+esp_err_t LocalDescriptorIsResumableSlot(
+    const std::string& session_id, bool* resumable, bool* slots_ok)
+{
+    *resumable = true;
+    *slots_ok = false;
+    for (const auto mode : kPersistedSessionModes) {
+        SessionPaths paths = {};
+        if (!GetSessionPaths(mode, &paths)) return ESP_ERR_INVALID_ARG;
+        wqn::PersistedWordSession parsed;
+        esp_err_t result = LoadSessionFile(paths.primary, &parsed, false);
+        if (result == ESP_ERR_NOT_FOUND) result = LoadSessionFile(paths.backup, &parsed, false);
+        if (result == ESP_ERR_NOT_FOUND) continue;
+        if (result != ESP_OK) return result;
+        // Completed current slots carry the hand-off cursor until their
+        // successor is durably published; active=false does not authorize GC.
+        if (parsed.remote.session_id == session_id) { *slots_ok = true; return ESP_OK; }
+    }
+    *resumable = false;
+    *slots_ok = true;
+    return ESP_OK;
+}
+
+struct SaveLocalDescriptorContext {
+    const wqn::LocalWordSessionDescriptor* descriptor;
+    esp_err_t result;
+};
+
+esp_err_t SaveLocalDescriptorTransaction(void* opaque)
+{
+    auto* context = static_cast<SaveLocalDescriptorContext*>(opaque);
+    if (context == nullptr || context->descriptor == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const wqn::LocalWordSessionDescriptor& descriptor = *context->descriptor;
+    // NEW SAVE: reject a stale deck-scope generation (old-scope descriptors
+    // remain LOADable, but must not be minted after a scope switch).
+    if (descriptor.session.deck_scope_generation !=
+        wqn::GetDeckScopeGeneration()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!LocalDescriptorSemanticsValid(descriptor)) return ESP_ERR_INVALID_ARG;
+    char primary[40] = {}, temporary[40] = {}, backup[40] = {};
+    if (!DeriveLocalDescriptorPaths(descriptor.session.remote.session_id,
+                                    primary, temporary, backup)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    std::vector<uint8_t> bytes;
+    esp_err_t encode = EncodeLocalDescriptor(descriptor, &bytes);
+    if (encode != ESP_OK) return encode;
+
+    wqn::LocalWordSessionDescriptor existing;
+    std::vector<uint8_t> existing_raw;
+    const esp_err_t read = ReadLocalDescriptorFamily(
+        descriptor.session.remote.session_id, &existing, &existing_raw);
+    if (read == ESP_OK) return existing_raw == bytes ? ESP_OK : ESP_ERR_INVALID_STATE;
+    if (read != ESP_ERR_NOT_FOUND) return read;
+
+    std::vector<std::string, wqn::WordStorePsramAllocator<std::string>> primaries;
+    size_t total_bytes = 0;
+    ESP_RETURN_ON_ERROR(ListLocalDescriptorPrimaries(&primaries), kTag, "list local descriptors");
+    ESP_RETURN_ON_ERROR(LocalFamiliesBytes(primaries, &total_bytes), kTag, "size local descriptors");
+    if (primaries.size() >= kLocalDescriptorMaxFiles ||
+        total_bytes + bytes.size() > kLocalDescriptorMaxTotalBytes) {
+        ESP_RETURN_ON_ERROR(PruneLocalDescriptorsImpl(descriptor.session.remote.session_id),
+                            kTag, "prune local descriptors");
+        ESP_RETURN_ON_ERROR(ListLocalDescriptorPrimaries(&primaries), kTag, "relist local descriptors");
+        ESP_RETURN_ON_ERROR(LocalFamiliesBytes(primaries, &total_bytes), kTag, "resize local descriptors");
+        if (primaries.size() >= kLocalDescriptorMaxFiles ||
+            total_bytes + bytes.size() > kLocalDescriptorMaxTotalBytes) return ESP_ERR_NO_MEM;
+    }
+
+    // descriptor FIRST, then AtomicWrite (temp -> rename, old primary kept as
+    // backup). A flush/fsync/close/rename failure keeps the original intact.
+    return AtomicWrite(primary, temporary, backup, bytes.data(), bytes.size());
+}
+
+struct LoadLocalDescriptorContext {
+    const std::string* session_id;
+    wqn::LocalWordSessionDescriptor* out;
+    esp_err_t result;
+};
+
+esp_err_t LoadLocalDescriptorTransaction(void* opaque)
+{
+    auto* context = static_cast<LoadLocalDescriptorContext*>(opaque);
+    if (context == nullptr || context->session_id == nullptr || context->out == nullptr)
+        return ESP_ERR_INVALID_ARG;
+    *context->out = {};
+    return ReadLocalDescriptorFamily(*context->session_id, context->out);
+}
+
+esp_err_t PruneLocalDescriptorsImpl(const std::string& active_session_id)
+{
+    std::vector<std::string, wqn::WordStorePsramAllocator<std::string>> primaries;
+    ESP_RETURN_ON_ERROR(ListLocalDescriptorPrimaries(&primaries), kTag, "list descriptor GC");
+    OutboxScan fresh_scan;
+    if (ScanOutbox(&fresh_scan) != ESP_OK || fresh_scan.partial_tail || fresh_scan.backup_source)
+        return ESP_FAIL;
+    bool retained = true, proof = false;
+    ESP_RETURN_ON_ERROR(LocalDescriptorIsResumableSlot("", &retained, &proof),
+                        kTag, "validate descriptor slot proof");
+    for (const auto& canonical : primaries) {
+        wqn::LocalWordSessionDescriptor descriptor;
+        if (ReadCanonicalLocalFamily(canonical, &descriptor) != ESP_OK) continue;
+        const std::string& id = descriptor.session.remote.session_id;
+        bool referenced = true, outbox_ok = false, slots_ok = false;
+        ESP_RETURN_ON_ERROR(LocalDescriptorHasOutboxReference(fresh_scan, id, &referenced, &outbox_ok),
+                            kTag, "descriptor outbox proof");
+        ESP_RETURN_ON_ERROR(LocalDescriptorIsResumableSlot(id, &retained, &slots_ok),
+                            kTag, "descriptor slot proof");
+        if (!outbox_ok || !slots_ok) return ESP_FAIL;
+        if (referenced || retained || id == active_session_id) continue;
+        const std::string stem = canonical.substr(0, canonical.size() - 3);
+        for (const char* ext : {".v1", ".bak", ".tmp"}) {
+            if (std::remove((stem + ext).c_str()) != 0 && errno != ENOENT) return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
+struct CollectRetainedContext {
+    wqn::LocalDescriptorRetention* out;
+    esp_err_t result;
+};
+
+esp_err_t CollectRetainedLocalSnapshotsTransaction(void* opaque)
+{
+    auto* context = static_cast<CollectRetainedContext*>(opaque);
+    if (context == nullptr || context->out == nullptr) return ESP_ERR_INVALID_ARG;
+    context->out->pinned_sha256.clear();
+    std::vector<std::string, wqn::WordStorePsramAllocator<std::string>> families;
+    ESP_RETURN_ON_ERROR(ListLocalDescriptorPrimaries(&families), kTag, "list retained local pins");
+    for (const auto& path : families) {
+        wqn::LocalWordSessionDescriptor descriptor;
+        ESP_RETURN_ON_ERROR(ReadCanonicalLocalFamily(path, &descriptor), kTag, "read retained local pin");
+        for (const auto& snap : descriptor.session.remote.snapshot)
+            context->out->pinned_sha256.push_back(std::string(snap.sha256));
+    }
+    return ESP_OK;
+}
+
 template <typename Transaction>
 esp_err_t ExecuteWithStorageLease(
     const char* holder,
@@ -2473,6 +3103,25 @@ esp_err_t ClearPersistedWordSession(protocol::word_study_v1::Mode mode)
         "word-session-clear", ClearSessionTransaction, &context);
 }
 
+esp_err_t ClearPersistedWordSessionIfMatches(protocol::word_study_v1::Mode mode,
+    const std::string& session_id, uint32_t generation)
+{
+    struct Context { protocol::word_study_v1::Mode mode; const std::string* id; uint32_t generation; };
+    Context context{mode, &session_id, generation};
+    const auto transaction = [](void* opaque) -> esp_err_t {
+        const auto& ctx = *static_cast<Context*>(opaque);
+        if (ctx.generation != GetDeckScopeGeneration()) return ESP_ERR_INVALID_STATE;
+        PersistedWordSession current;
+        const esp_err_t result = LoadSessionSlotRaw(ctx.mode, &current);
+        if (result == ESP_ERR_NOT_FOUND) return ESP_OK;
+        if (result != ESP_OK) return result;
+        if (current.remote.session_id != *ctx.id) return ESP_ERR_INVALID_STATE;
+        ClearSessionContext clear{ctx.mode};
+        return ClearSessionTransaction(&clear);
+    };
+    return ExecuteWithStorageLease("word-session-retire", transaction, &context, true);
+}
+
 esp_err_t CommitWordObservation(
     const DurableWordObservation& observation,
     const PersistedWordSession& advanced_session)
@@ -2559,6 +3208,59 @@ esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot)
     if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
     *snapshot = {};
     return ExecuteWithStorageLease("word-outbox-snapshot", SnapshotTransaction, snapshot);
+}
+
+// ----- Local (offline) long-sequence descriptor durable APIs ----------------
+// All I/O runs on the StorageService sole owner via ExecuteWithStorageLease
+// (+ SleepLease). UI reaches these through the persist worker, never directly.
+// Kept BEFORE PrepareWordObservationOutboxForSleep so the existing host replay
+// fixture's section() boundaries stay unchanged.
+
+esp_err_t SaveLocalWordSessionDescriptor(
+    const LocalWordSessionDescriptor& descriptor)
+{
+    SaveLocalDescriptorContext context{&descriptor, ESP_OK};
+    return ExecuteWithStorageLease(
+        "word-local-descriptor-save",
+        SaveLocalDescriptorTransaction, &context);
+}
+
+esp_err_t LoadLocalWordSessionDescriptor(
+    const std::string& session_id,
+    LocalWordSessionDescriptor* out)
+{
+    if (out == nullptr) return ESP_ERR_INVALID_ARG;
+    *out = {};
+    LoadLocalDescriptorContext context{&session_id, out, ESP_OK};
+    return ExecuteWithStorageLease(
+        "word-local-descriptor-load",
+        LoadLocalDescriptorTransaction, &context);
+}
+
+esp_err_t PruneLocalWordSessionDescriptors(
+    const std::string& active_session_id)
+{
+    struct Context {
+        const std::string* active;
+        esp_err_t result;
+    } context{&active_session_id, ESP_OK};
+    auto transaction = [](void* opaque) -> esp_err_t {
+        auto* ctx = static_cast<Context*>(opaque);
+        ctx->result = PruneLocalDescriptorsImpl(*ctx->active);
+        return ctx->result;
+    };
+    return ExecuteWithStorageLease(
+        "word-local-descriptor-prune", transaction, &context);
+}
+
+esp_err_t CollectRetainedLocalSnapshots(LocalDescriptorRetention* out)
+{
+    if (out == nullptr) return ESP_ERR_INVALID_ARG;
+    out->pinned_sha256.clear();
+    CollectRetainedContext context{out, ESP_OK};
+    return ExecuteWithStorageLease(
+        "word-local-descriptor-collect",
+        CollectRetainedLocalSnapshotsTransaction, &context);
 }
 
 esp_err_t PrepareWordObservationOutboxForSleep(int64_t deadline_us, uint32_t generation)

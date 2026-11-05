@@ -89,6 +89,7 @@ idf_component_register(
         "problem_app.cpp"
         "word_pack.cpp"
         "word_app.cpp"
+        "word_local_session.cpp"
         "word_study_store.cpp"
         "wqn_api.cpp"
         "wqn_api_stream.cpp"

@@ -1687,6 +1687,18 @@ esp_err_t ApplyDeckScopeChangeLocked(uint32_t target_generation, const std::stri
     }
     ESP_RETURN_ON_ERROR(SaveU64ToNvsRaw(kDeckScopeGenKey, target_generation),
                         kTag, "deck change: save scope generation");
+    // [deck-scope] The library walk's cursor indexes the scoped library, so a
+    // default-deck change must reset it too. Use the SAME raw NVS helper the
+    // foreground SaveWordSequentialCursor writes through (kWordSequentialCursorKey
+    // is a u64 slot), inside this one StorageService transaction -- opening a
+    // second foreground transaction here would break the marker protocol's
+    // "one recoverable tail" property. Placed before the marker clear so a
+    // failure at any step leaves the marker present: boot recovery replays this
+    // whole idempotent tail, including the cursor reset, covering the window
+    // where the cursor write failed. Matches WordSessionScopeResetTransaction.
+    ESP_RETURN_ON_ERROR(
+        SaveU64ToNvsRaw(kWordSequentialCursorKey, 0), kTag,
+        "deck change: clear sequential cursor");
     ESP_RETURN_ON_ERROR(ClearNvsKeyRaw(kDeckScopeMarkerKey), kTag,
                         "deck change: clear marker");
     g_deck_scope_generation.store(target_generation, std::memory_order_release);
