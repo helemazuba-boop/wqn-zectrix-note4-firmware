@@ -37,6 +37,7 @@
 #include "services/server_error_codes.h"
 #include "word_app.h"
 #include "word_study_store.h"
+#include "word_local_session.h"
 #include "wqn_api.h"
 #include "error_recorder.h"
 
@@ -1080,6 +1081,16 @@ OutboxRetryCause g_word_outbox_retry_cause = OutboxRetryCause::kNone;
 // session lets every remaining record of it be quarantined immediately instead
 // of each one burning its own retry ladder against the same dead gap.
 std::string g_word_outbox_gap_terminal_session_id;
+
+// [local-longseq] Per-boot cache of a session id whose local descriptor was
+// already registered this boot. Registration is idempotent (the server keys on
+// the stable descriptor fingerprint), so a reboot simply re-registers; the
+// cache only avoids repeating it every upload round within one boot.
+std::string g_local_registered_session_id;
+// One batch request is bounded by the contract's 64-observation cap. A round
+// never re-sends a failing batch for every head: after one request-level
+// failure we fall back to the single-observation path for the rest of the round.
+constexpr size_t kMaxWordObservationBatchSize = 64;
 
 enum class SyncRoundOutcome : uint8_t {
     kSucceeded,
@@ -2300,6 +2311,7 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     size_t processed = 0;
     size_t uploaded = 0;
     size_t quarantined = 0;
+    bool use_batch = true;
     for (; processed < kMaxWordObservationsPerRound;) {
         if (!acknowledgements.empty() &&
             esp_timer_get_time() / 1000 - oldest_ack_ms >= 30000 &&
@@ -2344,6 +2356,127 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
             return WordOutboxUploadState::kPending;
         }
 
+        wqn::protocol::v3::Error word_error;
+        bool transport_failure = false;
+        bool batch_item_failed = false;
+        // Only a validated descriptor may authorize registration. Unknown local
+        // storage errors are never evidence that this is a server-issued SID.
+        wqn::LocalWordSessionDescriptor descriptor;
+        const esp_err_t local = wqn::LoadLocalWordSessionDescriptor(pending.session_id, &descriptor);
+        if (local != ESP_OK && local != ESP_ERR_NOT_FOUND) {
+            ScheduleWordOutboxRetry(pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+            return WordOutboxUploadState::kPending;
+        }
+        if (local == ESP_OK && g_local_registered_session_id != pending.session_id) {
+            wqn::protocol::word_study_v1::LocalSessionRegistrationRequest registration;
+            registration.metadata = MakeControlMetadata();
+            registration.metadata.request_id = "local_" + pending.session_id;
+            const auto& saved = descriptor.session.remote;
+            registration.session_id = saved.session_id;
+            registration.seed = saved.seed;
+            registration.start_index = descriptor.session.start_index;
+            registration.scope.include_mastered = saved.include_mastered;
+            for (const auto& d : saved.deck_ids) registration.scope.deck_ids.push_back(d.value);
+            for (const auto& pin : saved.snapshot) {
+                wqn::protocol::word_study_v1::PackSnapshot x;
+                x.deck_id = pin.deck_id; x.sha256 = pin.sha256;
+                x.content_revision = pin.content_revision; x.pack_revision = pin.pack_revision;
+                registration.snapshot.push_back(std::move(x));
+            }
+            for (const auto& item : saved.items) {
+                wqn::protocol::word_study_v1::SessionItem x;
+                x.item_id = item.item_id; x.deck_id = item.deck_id; x.ordinal = item.ordinal;
+                registration.items.push_back(std::move(x));
+            }
+            wqn::protocol::word_study_v1::LocalSessionRegistrationData receipt;
+            int http_status = 0;
+            result = wqn::RegisterLocalWordStudySessionV1(token, registration, &receipt,
+                &word_error, &http_status, &transport_failure);
+            if (result != ESP_OK) {
+                if (http_status == 401) return WordOutboxUploadState::kAuthenticationRequired;
+                if (http_status == 426) return WordOutboxUploadState::kProtocolBlocked;
+                if (word_error.code == "LOCAL_SESSION_ACTOR_CONFLICT" ||
+                    word_error.code == "LOCAL_SESSION_CONFLICT" ||
+                    word_error.code == "SESSION_ACTOR_MISMATCH") {
+                    if (flush_acknowledgements() != ESP_OK) return WordOutboxUploadState::kPending;
+                    if (wqn::SuspendPendingWordObservation(pending.request_id,
+                            SuspendReasonFor(word_error.code)) != ESP_OK) return WordOutboxUploadState::kPending;
+                    ++processed;
+                    continue;
+                }
+                // Includes an old server's 404: keep every unregistered fact.
+                ScheduleWordOutboxRetry(pending.request_id, word_error.retry_after_ms,
+                    RetryCauseFor(ClassifyOutboxFailure(word_error, transport_failure)));
+                return WordOutboxUploadState::kPending;
+            }
+            g_local_registered_session_id = pending.session_id;
+        }
+        if (use_batch) {
+            std::vector<wqn::DurableWordObservation> records{pending};
+            std::vector<std::string> excluded = acknowledgements;
+            excluded.push_back(pending.request_id);
+            while (records.size() < kMaxWordObservationBatchSize &&
+                   records.size() < kMaxWordObservationsPerRound - processed) {
+                wqn::DurableWordObservation next;
+                const esp_err_t peek = wqn::PeekPendingWordObservationExcluding(excluded, &next);
+                if (peek == ESP_ERR_NOT_FOUND) break;
+                if (peek != ESP_OK) return WordOutboxUploadState::kPending;
+                if (next.session_id != pending.session_id ||
+                    next.sequence != records.back().sequence + 1) break;
+                excluded.push_back(next.request_id);
+                records.push_back(std::move(next));
+            }
+            wqn::protocol::word_study_v1::ObservationBatchRequest batch;
+            batch.metadata = MakeControlMetadata();
+            batch.session_id = pending.session_id;
+            for (const auto& record : records) {
+                wqn::protocol::word_study_v1::BatchObservation item;
+                item.request_id = record.request_id; item.sequence = record.sequence;
+                item.item_id = record.item_id; item.action = record.action;
+                item.mode = record.mode; item.occurred_at = record.occurred_at;
+                batch.observations.push_back(std::move(item));
+            }
+            wqn::protocol::word_study_v1::ObservationBatchData receipt;
+            int http_status = 0;
+            result = wqn::SubmitWordStudyObservationBatchV1(token, batch, &receipt,
+                &word_error, &http_status, &transport_failure);
+            if (result == ESP_OK) {
+                if (wqn::protocol::word_study_v1::ValidateObservationBatchReceipt(receipt, batch) != ESP_OK) {
+                    ScheduleWordOutboxRetry(pending.request_id, 0, OutboxRetryCause::kServer);
+                    return WordOutboxUploadState::kPending;
+                }
+                if (acknowledgements.empty()) oldest_ack_ms = esp_timer_get_time() / 1000;
+                for (const auto& accepted : receipt.accepted) acknowledgements.push_back(accepted.request_id);
+                processed += receipt.accepted.size();
+                uploaded += receipt.accepted.size();
+                if (flush_acknowledgements() != ESP_OK) return WordOutboxUploadState::kPending;
+                ResetWordOutboxRetryBackoff();
+                if (!receipt.has_failure) continue;
+                pending = records[receipt.accepted.size()];
+                word_error.code = receipt.failure.code;
+                word_error.retryable = receipt.failure.retryable;
+                word_error.retry_after_ms = 0;
+                transport_failure = false;
+                batch_item_failed = true;
+                result = ESP_FAIL;
+            } else if (http_status == 401) {
+                return WordOutboxUploadState::kAuthenticationRequired;
+            } else if (http_status == 426) {
+                return WordOutboxUploadState::kProtocolBlocked;
+            } else if (http_status == 404 || http_status == 405 || http_status == 400 ||
+                       http_status == 413 || http_status == 422 ||
+                       (http_status == 0 && !transport_failure)) {
+                // Endpoint absence or whole-request validation does not identify
+                // a bad record. Isolate via the original single path this round.
+                use_batch = false;
+                word_error = {};
+                transport_failure = false;
+            } else {
+                ScheduleWordOutboxRetry(pending.request_id, word_error.retry_after_ms,
+                    RetryCauseFor(ClassifyOutboxFailure(word_error, transport_failure)));
+                return WordOutboxUploadState::kPending;
+            }
+        }
         wqn::protocol::word_study_v1::ObservationRequest request;
         request.metadata = MakeControlMetadata();
         request.metadata.request_id = pending.request_id;
@@ -2354,10 +2487,10 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
         request.mode = pending.mode;
         request.occurred_at = pending.occurred_at;
         wqn::protocol::word_study_v1::ObservationData response;
-        wqn::protocol::v3::Error word_error;
-        bool transport_failure = false;
-        result = wqn::SubmitWordStudyObservationV1(
-            token, request, &response, &word_error, &transport_failure);
+        if (!batch_item_failed) {
+            result = wqn::SubmitWordStudyObservationV1(
+                token, request, &response, &word_error, &transport_failure);
+        }
         if (result != ESP_OK) {
             OutboxFailureDisposition disposition =
                 ClassifyOutboxFailure(word_error, transport_failure);

@@ -4,8 +4,8 @@
 #include <cstdio>
 #include <string>
 #include <vector>
-using esp_err_t = int;
-constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NOT_FOUND=0x105;
+#include "word_study_store.h"
+#include "device_protocol/word_study.h"
 const char* esp_err_to_name(int) { return "fixture"; }
 constexpr const char* kTag="fixture";
 void Log(const char*,const char*,...) {}
@@ -17,17 +17,11 @@ enum class OutboxFailureDisposition { kTransientServer,kAuthenticationRequired,k
     kSequenceResolved,kSessionTerminal,kTombstoneRecoverable };
 enum class OutboxRetryCause { kLocalStorage,kServer };
 namespace wqn {
-@@MAINTENANCE_GATE@@
-enum class OutboxSuspendReason { kProtocol };
-const char* OutboxSuspendReasonName(OutboxSuspendReason) { return "fixture"; }
-struct Metadata { std::string request_id; };
-struct DurableWordObservation { std::string request_id,session_id,item_id,occurred_at; uint64_t sequence=0; int action=0,mode=0; };
-namespace protocol::v3 { struct Error { std::string code; bool retryable=false; int retry_after_ms=0; }; }
-namespace protocol::word_study_v1 {
-struct ObservationRequest { Metadata metadata; std::string session_id,item_id,occurred_at; uint64_t sequence=0; int action=0,mode=0; };
-struct ObservationData {};
+using Metadata = protocol::v3::RequestMetadata;
+struct LocalWordSessionDescriptor { PersistedWordSession session; uint32_t total_count=0; };
 }
-}
+std::string g_local_registered_session_id;
+constexpr size_t kMaxWordObservationBatchSize=64;
 std::atomic<uint32_t> g_word_interaction_generation{0};
 std::string g_word_outbox_gap_terminal_session_id;
 uint8_t g_word_outbox_retry_attempts=0;
@@ -49,7 +43,39 @@ bool WordOutboxRetryDeferred(const std::string&,int64_t) { return defer; }
 void ScheduleWordOutboxRetry(const std::string&,int,OutboxRetryCause) { ++retry_calls; }
 OutboxRetryCause RetryCauseFor(OutboxFailureDisposition) { return OutboxRetryCause::kServer; }
 OutboxFailureDisposition ClassifyOutboxFailure(const wqn::protocol::v3::Error&,bool) { return failure; }
-wqn::OutboxSuspendReason SuspendReasonFor(const std::string&) { return wqn::OutboxSuspendReason::kProtocol; }
+wqn::OutboxSuspendReason SuspendReasonFor(const std::string&) { return wqn::OutboxSuspendReason::kUnknownTerminal; }
+bool enable_batch=false, local_descriptor=false;
+int batch_calls=0, registration_calls=0, registration_status=200, batch_status=200;
+int batch_prefix=-1; bool bad_receipt=false;
+namespace wqn {
+esp_err_t LoadLocalWordSessionDescriptor(const std::string& id,LocalWordSessionDescriptor* out) {
+    if (!local_descriptor) return ESP_ERR_NOT_FOUND;
+    out->session.remote.session_id=id; out->session.remote.seed="local-seed";
+    out->session.remote.include_mastered=true;
+    return ESP_OK;
+}
+esp_err_t RegisterLocalWordStudySessionV1(const std::string&,
+ const protocol::word_study_v1::LocalSessionRegistrationRequest& req,
+ protocol::word_study_v1::LocalSessionRegistrationData* out,protocol::v3::Error* error,int* status,bool* transport) {
+    ++registration_calls;*transport=false;*status=registration_status;
+    if(*status!=200){if(*status==401)error->code="UNAUTHORIZED";return ESP_FAIL;}
+    out->registered=true;out->session_id=req.session_id;return ESP_OK;
+}
+esp_err_t SubmitWordStudyObservationBatchV1(const std::string&,
+ const protocol::word_study_v1::ObservationBatchRequest& req,
+ protocol::word_study_v1::ObservationBatchData* out,protocol::v3::Error* error,int* status,bool* transport) {
+    ++batch_calls;*transport=false;*status=enable_batch?batch_status:404;
+    if(*status!=200){if(*status==401)error->code="UNAUTHORIZED";return ESP_FAIL;}
+    out->session_id=bad_receipt?"bad":req.session_id;
+    const size_t n=batch_prefix<0?req.observations.size():std::min(req.observations.size(),size_t(batch_prefix));
+    for(size_t i=0;i<n;++i){protocol::word_study_v1::BatchAcceptedItem x;
+        x.request_id=req.observations[i].request_id;x.sequence=req.observations[i].sequence;
+        x.observation_id="44444444-4444-4444-8444-444444444444";out->accepted.push_back(x);}
+    if(n<req.observations.size()) {out->has_failure=true;out->failure.request_id=req.observations[n].request_id;
+        out->failure.sequence=req.observations[n].sequence;out->failure.code="TRANSIENT";out->failure.retryable=true;}
+    return ESP_OK;
+}
+}
 namespace wqn {
 esp_err_t PeekPendingWordObservationExcluding(const std::vector<std::string>& excluded,DurableWordObservation* out) {
     for(const auto& entry:queue) if(std::find(excluded.begin(),excluded.end(),entry.request_id)==excluded.end()) {
@@ -110,6 +136,8 @@ int passes=0,failures=0;
 void Check(bool okay,const char* label) { std::printf("%s: %s\n",okay?"PASS":"FAIL",label); okay?++passes:++failures; }
 void Reset(int count) {
     queue.clear(); ack_sizes.clear(); order.clear(); now_ms=0;
+    enable_batch=local_descriptor=bad_receipt=false;batch_calls=registration_calls=0;
+    registration_status=batch_status=200;batch_prefix=-1;g_local_registered_session_id.clear();
     attempts=fail_http_at=fail_ack_at=yield_at=retry_calls=ack_calls=0; defer=false; http_delay_ms=0;
     failure=OutboxFailureDisposition::kTransientServer; g_word_interaction_generation=0;
     maintenance_due=maintenance_proof_deferred=fail_maintenance=false;
@@ -175,6 +203,38 @@ int main() {
     Reset(0); fail_maintenance=true;
     Check(UploadPendingWordObservations("fixture")==S::kFailed && maintenance_checks==1 && attempts==0,
         "empty-queue maintenance I/O failure reaches the existing bounded sync retry path");
+    const auto ValidQueue=[](int count){Reset(count);for(auto& x:queue){
+        x.session_id="33333333-3333-4333-8333-333333333333";
+        x.request_id="observation_request_"+x.request_id;
+        x.item_id="22222222-2222-4222-8222-222222222222";
+        x.occurred_at="2026-11-05T10:00:00Z";}enable_batch=true;};
+    ValidQueue(64); Check(UploadPendingWordObservations("fixture")==S::kDrained &&
+        batch_calls==1 && attempts==0 && ack_sizes==std::vector<size_t>{64},
+        "64 facts use one validated batch and one durable ACK");
+    ValidQueue(4);batch_prefix=2;
+    Check(UploadPendingWordObservations("fixture")==S::kPending && ack_sizes==std::vector<size_t>{2} &&
+        queue.size()==2 && queue.front().sequence==2,"partial receipt ACKs only prefix and preserves failed item/tail");
+    ValidQueue(4);bad_receipt=true;
+    Check(UploadPendingWordObservations("fixture")==S::kPending && ack_calls==0 && queue.size()==4,
+        "malformed receipt ACKs nothing");
+    ValidQueue(4);fail_ack_at=1;
+    Check(UploadPendingWordObservations("fixture")==S::kPending && queue.size()==4 && ack_calls==1,
+        "batch ACK write failure retains identities for replay");
+    ValidQueue(4);local_descriptor=true;registration_status=404;
+    Check(UploadPendingWordObservations("fixture")==S::kPending && registration_calls==1 &&
+        attempts==0 && batch_calls==0 && queue.size()==4,"registration404 never sends unregistered facts or deletes them");
+    ValidQueue(4);local_descriptor=true;
+    Check(UploadPendingWordObservations("fixture")==S::kDrained && registration_calls==1 && batch_calls==1,
+        "local descriptor registered before batch");
+    ValidQueue(4);batch_status=400;
+    Check(UploadPendingWordObservations("fixture")==S::kDrained && batch_calls==1 && attempts==4,
+        "whole-request error falls back to single without blaming valid head");
+    ValidQueue(4);batch_status=429;
+    Check(UploadPendingWordObservations("fixture")==S::kPending && ack_calls==0 && queue.size()==4,
+        "batch rate limit retains every fact");
+    ValidQueue(4);batch_status=401;
+    Check(UploadPendingWordObservations("fixture")==S::kAuthenticationRequired && ack_calls==0,
+        "batch401 reaches credential recovery");
     std::printf("%d PASS / %d FAIL (production upload loop with host seams; NOT network/flash HIL)\n",passes,failures);
     return failures?1:0;
 }

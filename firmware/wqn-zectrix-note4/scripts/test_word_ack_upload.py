@@ -29,12 +29,6 @@ def main():
             raise SystemExit('FAIL: maintenance retry mutation boundary drift')
         body = body.replace(needle, 'ESP_OK')
     fixture = (root / 'scripts/testdata/word_ack_upload.cpp').read_text(encoding='utf-8')
-    header = (root / 'main/word_study_store.h').read_text(encoding='utf-8')
-    gate_start = 'struct WordOutboxMaintenanceGate {'
-    gate_end = '// Moves one permanently rejected observation'
-    if header.count(gate_start) != 1 or header.count(gate_end) != 1 or fixture.count('@@MAINTENANCE_GATE@@') != 1:
-        raise SystemExit('FAIL: production maintenance API boundary drift')
-    fixture = fixture.replace('@@MAINTENANCE_GATE@@', header[header.index(gate_start):header.index(gate_end)])
     if fixture.count('@@UPLOAD@@') != 1:
         raise SystemExit('FAIL: fixture marker drift')
     compiler = shutil.which('g++')
@@ -42,9 +36,17 @@ def main():
         raise SystemExit('FAIL: g++ unavailable')
     with tempfile.TemporaryDirectory(prefix='wqn-ack-upload-') as directory:
         unit, binary = Path(directory) / 'upload.cpp', Path(directory) / 'upload'
+        (Path(directory)/'esp_err.h').write_text('#pragma once\nusing esp_err_t=int;\nconstexpr int ESP_OK=0,ESP_FAIL=-1,ESP_ERR_INVALID_ARG=0x102,ESP_ERR_NO_MEM=0x101,ESP_ERR_INVALID_SIZE=0x104,ESP_ERR_INVALID_RESPONSE=0x108,ESP_ERR_NOT_FOUND=0x105;\n')
+        (Path(directory)/'esp_heap_caps.h').write_text('#pragma once\n#include <cstdlib>\n#define MALLOC_CAP_SPIRAM 1\ninline void* heap_caps_malloc(size_t n,int){return malloc(n);}\ninline void heap_caps_free(void*p){free(p);}\n')
+        (Path(directory)/'esp_check.h').write_text('#pragma once\n#include "esp_err.h"\n#define ESP_RETURN_ON_ERROR(x,...) do { int e=(x); if(e!=ESP_OK) return e; } while(0)\n')
         unit.write_text(fixture.replace('@@UPLOAD@@', body), encoding='utf-8')
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
-                        str(unit), '-o', str(binary)], check=True, timeout=30)
+                        '-I'+directory,'-I'+str(root/'main'),
+                        '-I'+str(root/'components/device_protocol/include'),
+                        '-I/home/unknow/esp/esp-idf-v5.5/components/json/cJSON',
+                        '-DWQN_WORD_STUDY_SCHEMA_SHA256="fixture"','-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="fixture"',
+                        str(unit),str(root/'components/device_protocol/word_study.cpp'),
+                        '/home/unknow/esp/esp-idf-v5.5/components/json/cJSON/cJSON.c', '-o', str(binary)], check=True, timeout=30)
         return subprocess.run([str(binary)], timeout=10).returncode
 
 
