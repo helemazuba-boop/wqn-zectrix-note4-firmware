@@ -15,9 +15,9 @@ request-id，也不能把它当作可信身份。跳过坏 ACK 会复活已确�
 事务，始终原样保全，不能因为 CRC 全部有效就自动选择为恢复来源。空的有效主文件
 也有实际语义，不能用非空旧备份擅自覆盖。
 
-云端已有 session `next_sequence` 和 observation 行，但这些不是完整的本地持久化
-回执接口。web session 查询属于 web actor；设备维修需要核对 user/device/domain
-归属。服务端序号也不能单独证明某条记录的接收情况，或恢复本地 next-position /
+云端已有 session `next_sequence` 和 observation 行。现新增独立的只读回执入口，
+本地实现与协议见下文；尚未部署或接入保全包对账工具。web session 查询属于 web actor；
+设备维修需要核对 user/device/domain 归属。服务端序号不能单独证明某条记录的接收情况，或恢复本地 next-position /
 next-phase / suspend 原因。证据不足时保留并停止，不能推测出“无损”修复结果。
 
 ## 离线保全入口
@@ -100,10 +100,30 @@ identity、未来版本、源文件变化、读取/写入/fsync 失败、不完�
 断言失败，不能把编译错误、异常、sanitizer 或超时当作成功检出。工具接入统一门禁，
 当前清单 65 项（30 运行时入口 / 10 UI / 25 负例）。
 
+## 设备认证的只读回执（2026-11-06，本地实现）
+
+云端新增 `POST /api/esp32/v3/study/observations/receipts`，协议独立镜像为
+[`outbox-reconciliation-v1`](../../contracts/outbox-reconciliation-v1/README.md)。
+现有 Word/Note schema、散列与正常上传代码未改动。
+
+从设备 token 得到 user/device 后，按 domain/session 和最多 64 个原 request ID
+查询规范 `study_observations`。数据库在同一 SELECT 快照中再次核对设备归属、账户
+active 与 session 归属，过期/退休 session 的保留事实也可读取。仅 service_role 可调用；
+STABLE 函数不写事实、投影、session、设备元数据或控制幂等表。
+
+`found` 返回原规范事实；同 actor/device 的 request ID 被其他 session 使用时返回
+`conflict`，不暴露其他会话内容；`not_found` 仅描述该快照未找到保留行，不证明从未
+接收过。数据库故障、畸形结果、归属/顺序不符均失败，不能当成缺失。成功回执固定
+`repair_authorized=false`，不会产生 ACK、skip、重放或维修指令。
+
+现有 Note `loadEquivalentAppliedObservation` 按序号等字段补偿，不比较原 request ID
+和 occurred_at，不能代替此逐请求证据。后续还须将已认证回执绑定原文 manifest、
+记录偏移/摘要和本地 checkpoint；完整维修、交付与 HIL 仍未完成。
+
 接下来按以下顺序推进完整维修流程：
 
-1. 提供受现有设备认证和 actor/domain/session 归属约束的只读逐记录回执对账；不通过
-   推进序号、skip observation 或创建新会话来伪装修复。
+1. 将新增的设备认证只读回执入口接入独立的保全包对账工具；核对 actor/domain/session
+   和原 request 字段，不通过推进序号、skip observation 或创建新会话来伪装修复。
 2. 将 manifest 摘要、原始记录身份、已核对的回执和可恢复字节绑定到显式维修计划；
    对未知 observation/ACK/suspend、缺失 cursor 与冲突证据明确保留未解决状态。
 3. 提供设备维护态的可靠导出/交付入口和 StorageService 事务，保留原始 bytes，

@@ -165,6 +165,8 @@ versioned contract so the scope is unambiguous.
 
 - `contracts/agent-gateway-v0/README.md` — Agent Gateway v0 wire contract.
 - `contracts/word-study-v1/README.md` — Word Study v1 wire contract.
+- `contracts/outbox-reconciliation-v1/README.md` — device-authenticated,
+  read-only receipt evidence for ongoing R-08 investigation.
 - `components/qr_code/README.md` — QR component usage and scope.
 - `components/wqn_wifi_provision/README.md` — Wi-Fi provisioning component;
   its `assets/*.html` files are captive-portal pages served by the firmware.
