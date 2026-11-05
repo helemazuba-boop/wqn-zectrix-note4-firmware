@@ -43,6 +43,7 @@ def cases():
         ('pack_json_boundaries', 'N-06: complete persisted pack text', ()),
         ('note_index_delivery', 'N-02: delayed results across full/targeted lanes', ()),
         ('storage_schema', 'R-18: explicit recovery intent, stale consent and boot replay', ()),
+        ('outbox_forensics', 'R-08 ongoing: offline raw preservation and native journal/SDK CRC parity', ()),
         ('sync_journal', 'N-06: opaque checkpoints and decode allocation faults', ()),
         ('sync_control', 'R-21: raw SEQUENCE_GAP, retry checkpoint and restart escalation', ()),
         ('sync_retry', 'R-21: bounded retries and independent outbox identities', ()),
@@ -78,6 +79,10 @@ def cases():
         result.append(Case(f'recovery-{mutation}', 'R-18: fresh held confirmation, presentation and uncertain writes', 'controls',
                            ('test_storage_recovery.py', '--part', 'model', '--mutation', mutation),
                            r'^FAIL recovery-model:', r'Storage recovery model: \d+ checks, [1-9]\d* failures'))
+    for mutation in ('wrong-crc', 'trust-analysis', 'legacy-word-capacity', 'ignore-descriptors'):
+        result.append(Case(f'forensics-{mutation}', 'R-08 ongoing: CRC, profile capacity, descriptors and independently recomputed reports', 'controls',
+                           ('test_outbox_forensics.py', '--mutation', mutation), r'^FAIL:',
+                           r'Outbox forensics: \d+ scenarios, [1-9]\d* failures, 0 errors \(NOT HIL\)'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

@@ -18,9 +18,11 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-60 个执行项：29 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-21 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+65 个执行项：30 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+25 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
 1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
+R-08 进行中的离线保全工具增加原生 codec/SDK CRC 检查和四个语义负例，
+涵盖新旧容量配置、动态描述文件、CRC 与报告重算；不代表 R-08 已关闭。
 已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
 HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原本缺失。
 
@@ -35,6 +37,7 @@ HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原�
 | 结果容量与 receive-before-ACK 前提 | `test_display_result_capacity.py`；[R-04 当前结论与边界](DISPLAY_RESULT_CAPACITY_20261030.md) |
 | WS 旧连接回调及待处理通知 | `test_ws_event_lifetime.py`；[R-25 生命周期与验证边界](WS_EVENT_LIFETIME_20261103.md) |
 | 启动恢复、显式重置与不确定写入 | `test_storage_schema.py`、`test_storage_recovery.py`；[R-18 恢复入口与边界](STORAGE_RECOVERY_20261105.md) |
+| R-08 进行中的原始保全与离线检查 | `test_outbox_forensics.py`；[保全和后续维修步骤](OUTBOX_RECOVERY_20261105.md) |
 | UUID/count 边界、独立 storage owner 与期限 | `test_v3_sync_response.py`、`test_storage_prepare_deadline.py` |
 | Word 错误、检查点与启动恢复联动 | `test_sync_control.py`、`test_sync_retry.py`、`test_word_ack_upload.py`；原有真实 Word 持久化/重放 CI |
 | 功能关闭 | `test_agent_disabled.py` 的真实关闭分支入口；不宣称这是 Agent-off SDK 构建 |
