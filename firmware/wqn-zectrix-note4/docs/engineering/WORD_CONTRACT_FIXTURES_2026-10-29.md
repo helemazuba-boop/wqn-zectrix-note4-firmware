@@ -30,7 +30,10 @@ validation or add a field to distinguish requests that already share a shape.
 The Word Schema digest changes from
 `3bfc6f455fe0f5a6aceabc348a38ea9297919e7190ee81739a143977a69bc663`
 to `e8e3603e0ed378ce2f30003c3ead5b65719aaa56362e74d77015d8508bf1f501`.
-Both schema/manifest copies and the cloud digest constant are updated. Word's
+Both schema/manifest copies and the cloud digest constant are updated.
+Long-sequence v1 later unifies both copies at
+`2f6482f890485258fae8bf921f4e10da3733cd820342c9dd04535e1fc649f4d1`; see the
+long-sequence section in `contracts/word-study-v1/README.md`. Word's
 Schema and manifest are now configure dependencies, so incremental builds rerun
 the existing hash gate when those files change. The generated Ninja configure
 edge includes both files and its compile definitions contain the new digest.

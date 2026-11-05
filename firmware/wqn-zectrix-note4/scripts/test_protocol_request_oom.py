@@ -32,6 +32,14 @@ def validate_word_fixtures(source, schema, checker):
         'skip-response.json': 'skipObservationResponse',
         'manifest-request.json': 'manifestRequest',
         'manifest-response.json': 'manifestResponse',
+        # Long-sequence local sessions (added by the word_study_long_sequence_v1
+        # contract). Classify every new wire fixture explicitly here so the
+        # inventory assertion below stays a real guard.
+        'local-session-request.json': 'localSessionRequest',
+        'local-session-response.json': 'localSessionResponse',
+        'observation-batch-request.json': 'observationBatchRequest',
+        'observation-batch-response.json': 'observationBatchResponse',
+        'observation-batch-partial-response.json': 'observationBatchResponse',
     }
     actual = {p.name for p in (fixtures/'valid').glob('*.json')}
     if actual != set(definitions) | {'candidate-order.json'}:

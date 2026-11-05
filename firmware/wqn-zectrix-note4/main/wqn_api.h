@@ -264,6 +264,35 @@ esp_err_t SkipWordStudyObservationV1(
     protocol::word_study_v1::ObservationData* observation,
     protocol::v3::Error* error,
     bool* transport_failure);
+// Long-sequence local sessions. Both use the existing v3 HTTP helper, error
+// mapping and bounded response path. Only a true HTTP 401 clears the device
+// token; 403/404/429/5xx/timeout keep pairing state. A LOCAL token-shape
+// failure is a pure guard (no ClearAccessToken, no invented UNAUTHORIZED).
+// The parser is given the exact expected input so a fully validated receipt is
+// the only ACK-able result returned to the caller.
+//
+// `http_status` (optional) is the exact HTTP status, or 0 when no response was
+// received (network wait / transport failure / local build error). The uploader
+// uses it to distinguish a real 404 "endpoint absent" from a SESSION_NOT_FOUND
+// semantic in an error string. `transport_failure` (optional) is true only for
+// a network-wait or HTTP transport failure, never for a local build error, a
+// non-200 HTTP status, or a malformed receipt. Both outputs are initialized at
+// entry. Keep baseline unrelated callers unchanged: these two wrappers never
+// call ValidateTokenOrClear.
+esp_err_t RegisterLocalWordStudySessionV1(
+    const std::string& token,
+    const protocol::word_study_v1::LocalSessionRegistrationRequest& request,
+    protocol::word_study_v1::LocalSessionRegistrationData* data,
+    protocol::v3::Error* error,
+    int* http_status = nullptr,
+    bool* transport_failure = nullptr);
+esp_err_t SubmitWordStudyObservationBatchV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationBatchRequest& request,
+    protocol::word_study_v1::ObservationBatchData* data,
+    protocol::v3::Error* error,
+    int* http_status = nullptr,
+    bool* transport_failure = nullptr);
 using WqnHttpChunkSink = esp_err_t (*)(
     void* context,
     const uint8_t* bytes,

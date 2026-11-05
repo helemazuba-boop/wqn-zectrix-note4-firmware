@@ -29,6 +29,16 @@ inline constexpr size_t kMaxPackEntries = 10000;
 inline constexpr size_t kMaxPackBytes = 4U * 1024U * 1024U;
 inline constexpr size_t kMaxPackLineBytes = 8191;
 
+// Long-sequence local sessions (word-study-v1 /v3/words/sessions/local and
+// /v3/words/observations/batch). These are transport-body byte caps enforced
+// by the server by counting streamed chunks; the device also fails closed if a
+// fully rendered request would exceed them.
+inline constexpr size_t kMaxLocalSessionRequestBytes = 128U * 1024U;  // 131072
+inline constexpr size_t kMaxObservationBatchRequestBytes = 64U * 1024U;  // 65536
+inline constexpr size_t kMaxObservationBatchItems = 64;
+inline constexpr uint64_t kMaxLocalStartIndex = 10000;
+inline constexpr size_t kLocalSeedMaxLength = 64;
+
 enum class Mode : uint8_t {
     kSequential,
     kRandom,
@@ -245,6 +255,99 @@ esp_err_t ParseManifestResponse(
     const std::string& body,
     const std::string& expected_request_id,
     ManifestData* data,
+    v3::Error* error);
+
+// === Long-sequence local sessions ===
+//
+// The server fixes domain/mode/purpose/ordering/candidate_policy_version to
+// word/sequential/study/sequential/sequential_v1 for local sessions. The wire
+// schema forbids extra properties, so the device MUST NOT send those legacy
+// session fields here. Reuse the existing Scope / PackSnapshot / SessionItem
+// protocol types so allocator and API shape stay identical to the rest of the
+// component.
+
+struct LocalSessionRegistrationRequest {
+    v3::RequestMetadata metadata;
+    std::string session_id;             // device-generated stable UUID
+    Scope scope;                        // deck_ids 1..32 unique, include_mastered=true
+    std::string seed;                   // 1..64 URL-safe
+    uint64_t start_index = 0;           // 0..kMaxLocalStartIndex
+    std::vector<PackSnapshot> snapshot; // 1..32, exact deck set == scope
+    std::vector<SessionItem> items;     // 1..500, ordinal 0..n-1, unique item_id
+};
+
+struct LocalSessionRegistrationData {
+    std::string session_id;
+    bool registered = false;            // must be true
+    bool replayed = false;
+};
+
+struct BatchObservation {
+    std::string request_id;             // 16..64 URL-safe, unique within batch
+    uint64_t sequence = 0;              // consecutive ascending, safe JSON counter
+    std::string item_id;                // UUID
+    ObservationAction action = ObservationAction::kShown;
+    Mode mode = Mode::kSequential;
+    std::string occurred_at;            // RFC3339 date-time
+};
+
+struct ObservationBatchRequest {
+    v3::RequestMetadata metadata;
+    std::string session_id;
+    std::vector<BatchObservation> observations;  // 1..kMaxObservationBatchItems
+};
+
+struct BatchAcceptedItem {
+    std::string request_id;
+    std::string observation_id;         // UUID
+    uint64_t sequence = 0;              // safe JSON counter
+    bool replayed = false;
+};
+
+struct BatchFailure {
+    std::string request_id;
+    uint64_t sequence = 0;              // safe JSON counter
+    std::string code;                   // 1..64, preserved verbatim (unknown codes kept)
+    bool retryable = false;
+};
+
+struct ObservationBatchData {
+    std::string session_id;
+    std::vector<BatchAcceptedItem> accepted;  // exact durable input prefix
+    bool has_failure = false;                 // false == JSON null
+    BatchFailure failure;                     // valid only when has_failure
+};
+
+esp_err_t BuildLocalSessionRegistrationRequest(
+    const LocalSessionRegistrationRequest& request,
+    std::string* body);
+esp_err_t BuildObservationBatchRequest(
+    const ObservationBatchRequest& request,
+    std::string* body);
+
+// Parsers first validate the v3 envelope (outer request_id, ok, error mapping)
+// and then strictly validate the data against the expected inputs. A malformed
+// receipt can never be returned as a successful ACK.
+esp_err_t ParseLocalSessionRegistrationResponse(
+    const std::string& body,
+    const std::string& expected_request_id,
+    const std::string& expected_session_id,
+    LocalSessionRegistrationData* data,
+    v3::Error* error);
+
+// Standalone validator: given a parsed receipt and the exact request that was
+// sent, enforces same-session, accepted == exact input prefix, failure (if any)
+// describing the immediately following input, full-success => failure null, and
+// rejection of empty-accepted + null-failure. Exposed for host verification.
+esp_err_t ValidateObservationBatchReceipt(
+    const ObservationBatchData& data,
+    const ObservationBatchRequest& expected);
+
+esp_err_t ParseObservationBatchResponse(
+    const std::string& body,
+    const std::string& expected_request_id,
+    const ObservationBatchRequest& expected,
+    ObservationBatchData* data,
     v3::Error* error);
 
 }  // namespace wqn::protocol::word_study_v1

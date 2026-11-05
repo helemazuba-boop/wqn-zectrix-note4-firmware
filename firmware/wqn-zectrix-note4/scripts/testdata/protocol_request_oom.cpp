@@ -119,6 +119,40 @@ std::vector<Case> Cases()
     po.action = problem::ReviewAction::kCorrect;
     po.occurred_at = wo.occurred_at;
     const std::string snapshot(64, 'a');
+    // Long-sequence local-session / observation-batch builders. These are the
+    // real production codecs; the OOM harness faults every cJSON allocation so
+    // a failed build must leave the caller's body untouched and leak nothing.
+    word::LocalSessionRegistrationRequest wl;
+    wl.metadata = m;
+    wl.session_id = kId;
+    wl.scope.deck_ids = {kId, kOtherId};
+    wl.scope.include_mastered = true;
+    wl.seed = "seed_789";
+    wl.start_index = 123;
+    word::PackSnapshot ps;
+    ps.deck_id = kId; ps.content_revision = 7; ps.pack_revision = 7;
+    ps.sha256 = std::string(64, '7');
+    word::PackSnapshot ps2 = ps; ps2.deck_id = kOtherId;
+    wl.snapshot = {ps, ps2};
+    word::SessionItem si1;
+    si1.item_id = kId; si1.deck_id = kId; si1.ordinal = 0;
+    word::SessionItem si2;
+    si2.item_id = kOtherId; si2.deck_id = kOtherId; si2.ordinal = 1;
+    wl.items = {si1, si2};
+    word::ObservationBatchRequest wb;
+    wb.metadata = m;
+    wb.session_id = kId;
+    word::BatchObservation bo1;
+    bo1.request_id = "obs_oom_request_00001";
+    bo1.sequence = 0; bo1.item_id = kId;
+    bo1.action = word::ObservationAction::kShown; bo1.mode = word::Mode::kSequential;
+    bo1.occurred_at = "2026-10-29T01:00:00Z";
+    word::BatchObservation bo2;
+    bo2.request_id = "obs_oom_request_00002";
+    bo2.sequence = 1; bo2.item_id = kOtherId;
+    bo2.action = word::ObservationAction::kKnown; bo2.mode = word::Mode::kSequential;
+    bo2.occurred_at = "2026-10-29T01:00:01Z";
+    wb.observations = {bo1, bo2};
     std::vector<Case> cases = {
         {"bootstrap", "device-control-v3", "bootstrapRequest", [=](auto* b) { return v3::BuildBootstrapRequest(m, b); }},
         {"sync", "device-control-v3", "syncRequest", [=](auto* b) { return v3::BuildSyncRequest(m, 15, b); }},
@@ -128,6 +162,8 @@ std::vector<Case> Cases()
         {"word-observation", "word-study-v1", "observationRequest", [=](auto* b) { return word::BuildObservationRequest(wo, b); }},
         {"word-candidate", "word-study-v1", "candidatePageRequest", [=](auto* b) { return word::BuildCandidatePageRequest(wp, b); }},
         {"word-manifest", "word-study-v1", "manifestRequest", [=](auto* b) { return word::BuildManifestRequest(m, 123, 100, b); }},
+        {"word-local-session", "word-study-v1", "localSessionRequest", [=](auto* b) { return word::BuildLocalSessionRegistrationRequest(wl, b); }},
+        {"word-observation-batch", "word-study-v1", "observationBatchRequest", [=](auto* b) { return word::BuildObservationBatchRequest(wb, b); }},
         {"note-session", "note-study-v1", "createSessionRequest", [=](auto* b) { return note::BuildCreateSessionRequest(nc, b); }},
         {"note-observation", "note-study-v1", "observationRequest", [=](auto* b) { return note::BuildObservationRequest(no, b); }},
         {"note-candidate", "note-study-v1", "candidatePageRequest", [=](auto* b) { return note::BuildCandidatePageRequest(np, b); }},
@@ -172,6 +208,40 @@ void InvalidInputs()
     nc.scope.notebook_ids = wc.scope.deck_ids;
     cases.push_back([=](auto* b) { return word::BuildCreateSessionRequest(wc, b); });
     cases.push_back([=](auto* b) { return note::BuildCreateSessionRequest(nc, b); });
+    // Long-sequence builders: invalid inputs must fail before any allocation
+    // and leave the output sentinel intact.
+    word::LocalSessionRegistrationRequest wl;
+    wl.metadata = Metadata();
+    wl.session_id = kId;
+    wl.scope.deck_ids = {kId};
+    wl.scope.include_mastered = true;
+    wl.seed = "seed_789";
+    wl.start_index = 0;
+    word::PackSnapshot ps;
+    ps.deck_id = kId; ps.content_revision = 7; ps.pack_revision = 7;
+    ps.sha256 = std::string(64, '7');
+    wl.snapshot = {ps};
+    word::SessionItem si;
+    si.item_id = kOtherId; si.deck_id = kId; si.ordinal = 0;
+    wl.items = {si};
+    word::LocalSessionRegistrationRequest wl_bad = wl;
+    wl_bad.scope.include_mastered = false;
+    cases.push_back([=](auto* b) { return word::BuildLocalSessionRegistrationRequest(wl_bad, b); });
+    word::LocalSessionRegistrationRequest wl_bad2 = wl;
+    wl_bad2.items[0].ordinal = 9;
+    cases.push_back([=](auto* b) { return word::BuildLocalSessionRegistrationRequest(wl_bad2, b); });
+    word::ObservationBatchRequest wb;
+    wb.metadata = Metadata();
+    wb.session_id = kId;
+    word::BatchObservation bo;
+    bo.request_id = "obs_oom_request_00001";
+    bo.sequence = 0; bo.item_id = kId;
+    bo.action = word::ObservationAction::kShown; bo.mode = word::Mode::kSequential;
+    bo.occurred_at = "2026-10-29T01:00:00Z";
+    wb.observations = {bo};
+    word::ObservationBatchRequest wb_bad = wb;
+    wb_bad.observations[0].occurred_at = "not-a-timestamp";
+    cases.push_back([=](auto* b) { return word::BuildObservationBatchRequest(wb_bad, b); });
     for (const auto& build : cases) {
         std::string body = kSentinel;
         const size_t before = live;

@@ -1777,6 +1777,152 @@ esp_err_t SkipWordStudyObservationV1(
         "word-study-observation-skip");
 }
 
+esp_err_t RegisterLocalWordStudySessionV1(
+    const std::string& token,
+    const protocol::word_study_v1::LocalSessionRegistrationRequest& request,
+    protocol::word_study_v1::LocalSessionRegistrationData* data,
+    protocol::v3::Error* error,
+    int* http_status,
+    bool* transport_failure)
+{
+    if (data == nullptr || error == nullptr) return ESP_ERR_INVALID_ARG;
+    *data = {};
+    *error = {};
+    if (http_status != nullptr) *http_status = 0;
+    if (transport_failure != nullptr) *transport_failure = false;
+    // Pure local token-shape guard: a malformed local token must NOT reach
+    // ClearAccessToken and must not invent an UNAUTHORIZED server error. Only a
+    // real HTTP 401 (below) has that authority.
+    if (token.empty() || !wqn::IsValidAccessToken(token)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (WaitForNetworkReadyForHttps() != ESP_OK) {
+        if (transport_failure != nullptr) *transport_failure = true;
+        return ESP_FAIL;
+    }
+
+    // A builder failure is a LOCAL error: no request reached the server, no
+    // receipt exists, and no per-observation blame is possible. It stays
+    // distinct from a transport/HTTP/parse failure (http_status stays 0).
+    std::string request_body;
+    const esp_err_t build_result =
+        protocol::word_study_v1::BuildLocalSessionRegistrationRequest(request, &request_body);
+    if (build_result != ESP_OK) return build_result;
+    const std::string url = BuildUrl("/v3/words/sessions/local");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id,
+        kWordSessionHttpTimeoutMs);
+    if (http_result != ESP_OK) {
+        if (transport_failure != nullptr) *transport_failure = true;
+        return http_result;
+    }
+    if (http_status != nullptr) *http_status = status_code;
+    if (status_code == 401) {
+        // Preserve original error semantics for the uploader's
+        // AuthenticationRequired disposition; clear the token only here.
+        error->code = "UNAUTHORIZED";
+        return ClearTokenOnUnauthorized("word-study-local-session");
+    }
+    // The expected session id is passed so a mismatched echo can never be
+    // returned as a successful registration. Only 401 clears the token; every
+    // other status (403/404/429/5xx) and transport errors keep pairing state.
+    const esp_err_t parse_result =
+        protocol::word_study_v1::ParseLocalSessionRegistrationResponse(
+            body, request.metadata.request_id, request.session_id, data, error);
+    NormalizeProtocolHttpError(status_code, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-study local session failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
+esp_err_t SubmitWordStudyObservationBatchV1(
+    const std::string& token,
+    const protocol::word_study_v1::ObservationBatchRequest& request,
+    protocol::word_study_v1::ObservationBatchData* data,
+    protocol::v3::Error* error,
+    int* http_status,
+    bool* transport_failure)
+{
+    if (data == nullptr || error == nullptr) return ESP_ERR_INVALID_ARG;
+    *data = {};
+    *error = {};
+    if (http_status != nullptr) *http_status = 0;
+    if (transport_failure != nullptr) *transport_failure = false;
+    // Pure local token-shape guard (see registration wrapper).
+    if (token.empty() || !wqn::IsValidAccessToken(token)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (WaitForNetworkReadyForHttps() != ESP_OK) {
+        if (transport_failure != nullptr) *transport_failure = true;
+        return ESP_FAIL;
+    }
+
+    // A builder failure or a request-level HTTP 400/413/422 identifies NO
+    // single bad observation. The wrapper keeps this distinct (http_status 0
+    // for a local build error; exact non-200 status otherwise) so the uploader
+    // falls back to the single-observation path instead of blaming the head.
+    std::string request_body;
+    const esp_err_t build_result =
+        protocol::word_study_v1::BuildObservationBatchRequest(request, &request_body);
+    if (build_result != ESP_OK) return build_result;
+    const std::string url = BuildUrl("/v3/words/observations/batch");
+    int status_code = 0;
+    std::string body;
+    const esp_err_t http_result = HttpRequest(
+        "POST",
+        url,
+        &token,
+        &request_body,
+        &status_code,
+        &body,
+        protocol::v3::kProtocolHeader,
+        &request.metadata.request_id,
+        kHttpTimeoutMs);
+    if (http_result != ESP_OK) {
+        if (transport_failure != nullptr) *transport_failure = true;
+        return http_result;
+    }
+    if (http_status != nullptr) *http_status = status_code;
+    if (status_code == 401) {
+        error->code = "UNAUTHORIZED";
+        return ClearTokenOnUnauthorized("word-study-observation-batch");
+    }
+    // The exact expected input (session + ordered observations) is passed so
+    // only a fully validated HTTP 200 receipt can be returned as an ACK-able
+    // result. Unknown server failure codes preserve their code/retryable
+    // rather than being reinterpreted as invalid facts. Only 401 clears token.
+    const esp_err_t parse_result =
+        protocol::word_study_v1::ParseObservationBatchResponse(
+            body, request.metadata.request_id, request, data, error);
+    NormalizeProtocolHttpError(status_code, error);
+    if (status_code != 200 || parse_result != ESP_OK) {
+        ESP_LOGW(
+            kTag,
+            "word-study observation batch failed: status=%d code=%s retryable=%d",
+            status_code,
+            error->code.c_str(),
+            error->retryable ? 1 : 0);
+        return parse_result == ESP_OK ? ESP_FAIL : parse_result;
+    }
+    return ESP_OK;
+}
+
 esp_err_t DownloadWordPackStream(
     const std::string& token,
     const protocol::v3::RequestMetadata& metadata,
