@@ -15,6 +15,14 @@
 #include "word_local_session.h"
 
 static int passes = 0, failures = 0;
+static bool count_comparisons = false;
+static uint64_t comparisons = 0;
+extern "C" int __real_strcmp(const char*, const char*);
+extern "C" int __wrap_strcmp(const char* left, const char* right)
+{
+    if (count_comparisons) ++comparisons;
+    return __real_strcmp(left, right);
+}
 static void Check(bool ok, const char* name)
 {
     std::printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
@@ -367,6 +375,27 @@ int main()
         Check(BuildLocalWordInitialSession(invalid,32,&initial)!=ESP_OK,"candidate outside descriptor scope rejected");
     }
 
+    {
+        const auto index = BuildIndex(330, 33, 1, 'a', false);
+        LocalWordSessionDescriptor descriptor;
+        Check(PrepareLocalWordSequence(index, Uuid(1000), 0, Uuid(99999), "s", 1, &descriptor) == ESP_OK &&
+              descriptor.total_count == 10 && descriptor.session.remote.deck_ids.size() == 1,
+              "a single selected deck works when the cache contains more than 32 decks");
+        Check(PrepareLocalWordSequence(index, "", 0, Uuid(99999), "s", 1, &descriptor) == ESP_ERR_INVALID_SIZE,
+              "an all-deck scope still enforces the 32-deck contract");
+    }
+    {
+        const auto index = BuildIndex(10000, 1, 1, 'a', false);
+        LocalWordSessionDescriptor descriptor;
+        comparisons = 0;
+        count_comparisons = true;
+        const auto result = PrepareLocalWordSequence(index, "", 0, Uuid(99999), "s", 1, &descriptor);
+        count_comparisons = false;
+        Check(result == ESP_OK && descriptor.total_count == 10000 && descriptor.session.remote.items.size() == 500,
+              "10k-word scope retains the exact first segment");
+        std::printf("10k preparation strcmp calls: %llu\n", static_cast<unsigned long long>(comparisons));
+        Check(comparisons < 1000000, "whole-scope duplicate validation avoids quadratic string comparisons");
+    }
     std::printf("%d PASS / %d FAIL (real word_local_session.cpp; NOT HIL)\n",
                 passes, failures);
     return failures ? 1 : 0;

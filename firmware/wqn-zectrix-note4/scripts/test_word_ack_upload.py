@@ -5,6 +5,7 @@ No network, flash, credentials or device are accessed. This does not prove HIL
 durability; the journal implementation has separate replay/libc tests.
 """
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -34,6 +35,9 @@ def main():
     compiler = shutil.which('g++')
     if not compiler:
         raise SystemExit('FAIL: g++ unavailable')
+    cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5')) / 'components/json/cJSON'
+    if not (cjson / 'cJSON.c').is_file():
+        raise SystemExit('FAIL: real SDK cJSON unavailable; activate ESP-IDF')
     with tempfile.TemporaryDirectory(prefix='wqn-ack-upload-') as directory:
         unit, binary = Path(directory) / 'upload.cpp', Path(directory) / 'upload'
         (Path(directory)/'esp_err.h').write_text('#pragma once\nusing esp_err_t=int;\nconstexpr int ESP_OK=0,ESP_FAIL=-1,ESP_ERR_INVALID_ARG=0x102,ESP_ERR_NO_MEM=0x101,ESP_ERR_INVALID_SIZE=0x104,ESP_ERR_INVALID_RESPONSE=0x108,ESP_ERR_NOT_FOUND=0x105;\n')
@@ -43,10 +47,10 @@ def main():
         subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-I'+directory,'-I'+str(root/'main'),
                         '-I'+str(root/'components/device_protocol/include'),
-                        '-I/home/unknow/esp/esp-idf-v5.5/components/json/cJSON',
+                        '-I'+str(cjson),
                         '-DWQN_WORD_STUDY_SCHEMA_SHA256="fixture"','-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="fixture"',
                         str(unit),str(root/'components/device_protocol/word_study.cpp'),
-                        '/home/unknow/esp/esp-idf-v5.5/components/json/cJSON/cJSON.c', '-o', str(binary)], check=True, timeout=30)
+                        str(cjson / 'cJSON.c'), '-o', str(binary)], check=True, timeout=30)
         return subprocess.run([str(binary)], timeout=10).returncode
 
 

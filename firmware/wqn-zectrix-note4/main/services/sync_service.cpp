@@ -2395,12 +2395,29 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
             if (result != ESP_OK) {
                 if (http_status == 401) return WordOutboxUploadState::kAuthenticationRequired;
                 if (http_status == 426) return WordOutboxUploadState::kProtocolBlocked;
+                // A deleted scope or pruned historical pack can permanently
+                // reject an immutable descriptor. Preserve/park that session
+                // so unrelated sessions can still upload; never ACK or discard
+                // its facts. Endpoint absence, rate limits, unknown errors and
+                // explicitly retryable results retain the existing retry path.
+                const bool descriptor_rejected = !transport_failure && !word_error.retryable &&
+                    (http_status == 403 || http_status == 409) &&
+                    (word_error.code == "WORD_SCOPE_NOT_VISIBLE" ||
+                     word_error.code == "SCOPE_SNAPSHOT_MISMATCH" ||
+                     word_error.code == "ITEM_NOT_IN_SCOPE" ||
+                     word_error.code == "ITEM_NOT_IN_DECK" ||
+                     word_error.code == "PACK_REVISION_CHANGED" ||
+                     word_error.code == "INVALID_SNAPSHOT" ||
+                     word_error.code == "INVALID_CANDIDATE_ORDINAL" ||
+                     word_error.code == "DUPLICATE_CANDIDATE_ITEM");
                 if (word_error.code == "LOCAL_SESSION_ACTOR_CONFLICT" ||
                     word_error.code == "LOCAL_SESSION_CONFLICT" ||
-                    word_error.code == "SESSION_ACTOR_MISMATCH") {
+                    word_error.code == "SESSION_ACTOR_MISMATCH" || descriptor_rejected) {
                     if (flush_acknowledgements() != ESP_OK) return WordOutboxUploadState::kPending;
                     if (wqn::SuspendPendingWordObservation(pending.request_id,
                             SuspendReasonFor(word_error.code)) != ESP_OK) return WordOutboxUploadState::kPending;
+                    ESP_LOGW(kTag, "local registration rejected; session facts preserved: code=%s",
+                        word_error.code.c_str());
                     ++processed;
                     continue;
                 }

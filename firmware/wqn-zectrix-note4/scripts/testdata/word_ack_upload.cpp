@@ -45,6 +45,9 @@ OutboxRetryCause RetryCauseFor(OutboxFailureDisposition) { return OutboxRetryCau
 OutboxFailureDisposition ClassifyOutboxFailure(const wqn::protocol::v3::Error&,bool) { return failure; }
 wqn::OutboxSuspendReason SuspendReasonFor(const std::string&) { return wqn::OutboxSuspendReason::kUnknownTerminal; }
 bool enable_batch=false, local_descriptor=false;
+bool model_suspension_fence=false, fail_suspend=false;
+std::vector<wqn::DurableWordObservation> parked;
+std::string registration_error, failed_registration_session;
 int batch_calls=0, registration_calls=0, registration_status=200, batch_status=200;
 int batch_prefix=-1; bool bad_receipt=false;
 namespace wqn {
@@ -57,8 +60,9 @@ esp_err_t LoadLocalWordSessionDescriptor(const std::string& id,LocalWordSessionD
 esp_err_t RegisterLocalWordStudySessionV1(const std::string&,
  const protocol::word_study_v1::LocalSessionRegistrationRequest& req,
  protocol::word_study_v1::LocalSessionRegistrationData* out,protocol::v3::Error* error,int* status,bool* transport) {
-    ++registration_calls;*transport=false;*status=registration_status;
-    if(*status!=200){if(*status==401)error->code="UNAUTHORIZED";return ESP_FAIL;}
+    ++registration_calls;*transport=false;
+    *status=failed_registration_session.empty() || req.session_id==failed_registration_session ? registration_status : 200;
+    if(*status!=200){error->code=*status==401?"UNAUTHORIZED":registration_error;error->retryable=false;return ESP_FAIL;}
     out->registered=true;out->session_id=req.session_id;return ESP_OK;
 }
 esp_err_t SubmitWordStudyObservationBatchV1(const std::string&,
@@ -78,7 +82,8 @@ esp_err_t SubmitWordStudyObservationBatchV1(const std::string&,
 }
 namespace wqn {
 esp_err_t PeekPendingWordObservationExcluding(const std::vector<std::string>& excluded,DurableWordObservation* out) {
-    for(const auto& entry:queue) if(std::find(excluded.begin(),excluded.end(),entry.request_id)==excluded.end()) {
+    for(const auto& entry:queue) if(std::find(excluded.begin(),excluded.end(),entry.request_id)==excluded.end() &&
+        (!model_suspension_fence || std::none_of(parked.begin(),parked.end(),[&](const auto& old){return old.session_id==entry.session_id;}))) {
         *out=entry; return ESP_OK;
     }
     return ESP_ERR_NOT_FOUND;
@@ -126,7 +131,9 @@ esp_err_t QuarantinePendingWordObservation(const std::string& id) {
     return ESP_OK;
 }
 esp_err_t SuspendPendingWordObservation(const std::string& id,OutboxSuspendReason) {
+    if (fail_suspend) return ESP_FAIL;
     order.push_back("park");
+    for(const auto& entry:queue) if(entry.request_id==id) parked.push_back(entry);
     queue.erase(std::remove_if(queue.begin(),queue.end(),[&](const auto& entry){return entry.request_id==id;}),queue.end());
     return ESP_OK;
 }
@@ -137,6 +144,7 @@ void Check(bool okay,const char* label) { std::printf("%s: %s\n",okay?"PASS":"FA
 void Reset(int count) {
     queue.clear(); ack_sizes.clear(); order.clear(); now_ms=0;
     enable_batch=local_descriptor=bad_receipt=false;batch_calls=registration_calls=0;
+    model_suspension_fence=fail_suspend=false;parked.clear();registration_error.clear();failed_registration_session.clear();
     registration_status=batch_status=200;batch_prefix=-1;g_local_registered_session_id.clear();
     attempts=fail_http_at=fail_ack_at=yield_at=retry_calls=ack_calls=0; defer=false; http_delay_ms=0;
     failure=OutboxFailureDisposition::kTransientServer; g_word_interaction_generation=0;
@@ -226,6 +234,24 @@ int main() {
     ValidQueue(4);local_descriptor=true;
     Check(UploadPendingWordObservations("fixture")==S::kDrained && registration_calls==1 && batch_calls==1,
         "local descriptor registered before batch");
+    for(const char* code:{"WORD_SCOPE_NOT_VISIBLE","PACK_REVISION_CHANGED"}) {
+        ValidQueue(4);local_descriptor=true;model_suspension_fence=true;
+        failed_registration_session=queue.front().session_id;
+        registration_status=std::string(code)=="WORD_SCOPE_NOT_VISIBLE"?403:409;registration_error=code;
+        for(size_t i=2;i<queue.size();++i){queue[i].session_id="55555555-5555-4555-8555-555555555555";queue[i].sequence=i-2;}
+        const auto held=queue.front();
+        Check(UploadPendingWordObservations("fixture")==S::kDrained && registration_calls==2 &&
+            batch_calls==1 && ack_sizes==std::vector<size_t>{2} && parked.size()==1 &&
+            parked.front().request_id==held.request_id && parked.front().item_id==held.item_id &&
+            queue.size()==1 && queue.front().session_id==held.session_id,
+            "permanent descriptor rejection preserves its facts and lets other sessions drain");
+    }
+    ValidQueue(4);local_descriptor=true;registration_status=404;registration_error="PACK_REVISION_CHANGED";
+    Check(UploadPendingWordObservations("fixture")==S::kPending && parked.empty() && queue.size()==4,
+        "endpoint absence cannot be reinterpreted as a terminal descriptor rejection");
+    ValidQueue(4);local_descriptor=true;registration_status=409;registration_error="PACK_REVISION_CHANGED";fail_suspend=true;
+    Check(UploadPendingWordObservations("fixture")==S::kPending && parked.empty() && queue.size()==4 && ack_calls==0,
+        "failed durable suspension keeps the whole unregistered queue for retry");
     ValidQueue(4);batch_status=400;
     Check(UploadPendingWordObservations("fixture")==S::kDrained && batch_calls==1 && attempts==4,
         "whole-request error falls back to single without blaming valid head");

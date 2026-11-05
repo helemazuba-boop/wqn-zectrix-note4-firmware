@@ -362,11 +362,16 @@ esp_err_t PrepareLocalWordSequence(
         }
     }
 
-    // Deterministic full ordering of the whole index (independent of input
-    // order).  PSRAM scratch, POD pointers, no per-word std::string.
+    // Apply the requested deck before deriving the traversal: the 32-deck
+    // session limit bounds the selected scope, not every cached manifest.
+    // PSRAM scratch, POD pointers, no per-word std::string.
     ScratchVector<OrderedWord> ordered;
     ordered.reserve(index.entries.size());
     for (const WordPackIndexEntry& entry : index.entries) {
+        if (!deck_id.empty() &&
+            !FixedTextEquals(entry.deck_id, sizeof(entry.deck_id), deck_id)) {
+            continue;
+        }
         ordered.push_back({&entry});
     }
     std::sort(ordered.begin(), ordered.end(), LocalCandidateLess);
@@ -399,12 +404,16 @@ esp_err_t PrepareLocalWordSequence(
 
     // Duplicate item ids anywhere in the scope must fail, not silently shift
     // global offsets across the 500 boundary.
-    for (size_t i = 0; i < scoped.size(); ++i) {
-        for (size_t j = 0; j < i; ++j) {
-            if (std::strcmp(scoped[i].entry->word_id,
-                            scoped[j].entry->word_id) == 0) {
-                return ESP_ERR_INVALID_RESPONSE;
-            }
+    // Reuse the already allocated ordering scratch for a UUID-only sort.
+    // Keep scoped in traversal order; 10k words must not require 50M strcmp
+    // calls just to prove uniqueness before preparing the first segment.
+    ordered.assign(scoped.begin(), scoped.end());
+    std::sort(ordered.begin(), ordered.end(), [](const OrderedWord& left, const OrderedWord& right) {
+        return std::strcmp(left.entry->word_id, right.entry->word_id) < 0;
+    });
+    for (size_t i = 1; i < ordered.size(); ++i) {
+        if (std::strcmp(ordered[i - 1].entry->word_id, ordered[i].entry->word_id) == 0) {
+            return ESP_ERR_INVALID_RESPONSE;
         }
     }
 

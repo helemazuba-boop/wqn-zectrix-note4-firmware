@@ -153,12 +153,12 @@ def main():
             encoding='utf-8')
         (d / 'fixture.cpp').write_text(fixture, encoding='utf-8')
         cmd = [
-            gpp, '-std=c++17', '-Wall', '-Wextra', '-Werror',
+            gpp, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-fno-builtin-strcmp',
             '-I' + str(d),
             '-DWQN_WORD_STUDY_SCHEMA_SHA256="host-fixture"',
             str(d / 'word_local_session.cpp'),
             str(d / 'policy.cpp'), str(d / 'extend.cpp'),
-            str(d / 'fixture.cpp'), '-o', str(d / 'test'),
+            str(d / 'fixture.cpp'), '-Wl,--wrap=strcmp', '-o', str(d / 'test'),
         ]
         subprocess.run(cmd, check=True, timeout=60)
         return subprocess.run([str(d / 'test')], timeout=30).returncode
