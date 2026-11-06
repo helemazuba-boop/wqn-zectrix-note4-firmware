@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import outbox_forensics as f
 import test_outbox_forensics as native
+from test_outbox_checkpoint import build_oracle as build_checkpoint_oracle
 
 ROOT = Path(__file__).resolve().parents[1]
 M = None
@@ -33,6 +34,9 @@ class ReconcileTests(unittest.TestCase):
     def setUpClass(cls):
         native.ForensicsTests.setUpClass()
         cls.native = native.ForensicsTests.root
+        (cls.native/'esp_err.h').write_text(native.ERR+'\nconstexpr int ESP_ERR_INVALID_VERSION=266;\n')
+        for domain in ('word', 'note'):
+            build_checkpoint_oracle(domain, cls.native/domain, cls.native/'sdk-crc.o')
         cls.wire = {}
         pieces = ['#include <cstdio>', '#include "device_protocol/word_study.h"', '#include "device_protocol/note_study.h"']
         for domain in ('word', 'note'):
@@ -65,6 +69,9 @@ class ReconcileTests(unittest.TestCase):
         for name, value in (names or {prefix+'.v1':vector}).items():
             data=value if isinstance(value,bytes) else (self.native/domain/value).read_bytes()
             (source/name).write_bytes(data)
+        if names is None:
+            (source/('wsq.v1' if domain=='word' else 'nses.v1')).write_bytes(
+                (self.native/domain/'checkpoint-session.bin').read_bytes())
         bundle=root/'source'; pin=f.capture(source,bundle,domain,True)['manifest_sha256']
         credential=root/'device-key';f.write_private(credential,TOKEN.encode())
         self.domain=domain;self.bundle=bundle;self.pin=pin;self.root=root;self.credential=credential
@@ -173,10 +180,35 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(any(d['action']=='preserve_suspended' for d in plan['decisions']))
         self.assertTrue(any(d['action']=='preserve_acknowledged' for d in plan['decisions']))
         self.assertFalse(plan['installation_ready']);self.assertFalse(plan['repair_authorized'])
+        self.assertEqual(op['checkpoint_candidate']['position'],1)
+        self.assertEqual(op['checkpoint_session_source']['file'],'wsq.v1')
+        self.assertIn('word_nvs_pause_not_exported',plan['blocking_preconditions'])
 
     def test_note_records_keep_independent_local_next_sequence(self):
         self.source('note');evidence,pin,_=self.collect();plan=M.review_plan(self.bundle,self.pin,evidence,pin)
         self.assertEqual(plan['proposed_operations'][0]['expected_local_checkpoint'],{'next_position':17,'next_sequence':10})
+
+    def test_matched_receipt_without_local_session_cannot_propose_ack(self):
+        self.source(names={'wout.v1':'healthy.bin'})
+        evidence,pin,_=self.collect();plan=M.review_plan(self.bundle,self.pin,evidence,pin)
+        self.assertEqual(plan['proposed_operations'],[])
+        self.assertEqual(plan['local_checkpoint_checks'][0]['reason'],'session_material_missing_or_invalid')
+
+    def test_receipt_match_does_not_prove_an_unrepresentable_checkpoint(self):
+        raw=bytearray((self.native/'word/healthy.bin').read_bytes());size=f.LAYOUTS['word'].record.size
+        struct.pack_into('<I',raw,4*size+20,55)
+        struct.pack_into('<I',raw,5*size-4,f.journal_crc(raw[4*size:5*size-4]))
+        self.source(names={'wout.v1':bytes(raw),'wsq.v1':'checkpoint-session.bin'})
+        evidence,pin,_=self.collect();plan=M.review_plan(self.bundle,self.pin,evidence,pin)
+        self.assertEqual(plan['proposed_operations'],[])
+        self.assertEqual(plan['local_checkpoint_checks'][0]['reason'],'checkpoint_ordinal_outside_candidate_window')
+
+    def test_descriptor_corruption_blocks_a_matching_pending_fact(self):
+        self.source(names={'wout.v1':'healthy.bin','wsq.v1':'checkpoint-local-session.bin',
+            'wl'+('1'*24)+'.v1':b'corrupt descriptor'})
+        evidence,pin,_=self.collect();plan=M.review_plan(self.bundle,self.pin,evidence,pin)
+        self.assertEqual(plan['proposed_operations'],[])
+        self.assertEqual(plan['local_checkpoint_checks'][0]['reason'],'descriptor_missing_or_invalid')
 
     def test_missing_and_conflicting_receipts_never_become_ack_proposals(self):
         for state in ('not_found','conflict'):

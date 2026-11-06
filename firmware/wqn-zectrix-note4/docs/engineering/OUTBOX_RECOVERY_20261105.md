@@ -98,7 +98,8 @@ identity、未来版本、源文件变化、读取/写入/fsync 失败、不完�
 四个语义负例分别改用错误 CRC 参数、信任未重算的报告、将新 Word 容量降回 1000、
 忽略动态描述文件；要求完成测试且只有行为
 断言失败，不能把编译错误、异常、sanitizer 或超时当作成功检出。工具接入统一门禁，
-当前清单 69 项（31 运行时入口 / 10 UI / 28 负例），新增对账客户端及三个语义负例。
+当前清单 72 项（32 运行时入口 / 10 UI / 30 负例），包含对账客户端、本地 checkpoint
+材料校验及五个相关语义负例。
 
 ## 设备认证的只读回执（2026-11-06，本地实现）
 
@@ -172,17 +173,50 @@ occurred_at；时区按精确微秒比较，非零超微秒精度暂列 unresolv
 `installation_ready=false`、`repair_authorized=false`，明确列出尚未完成的设备身份、
 原生 checkpoint、受控发布和显式维修授权前置条件。`verify-plan` 不能认可篡改的授权标记。
 
-27 个专项场景使用真实原生记录/枚举和本地 HTTP 故障服务器，取消会回收使用凭证的
+30 个对账专项场景使用真实原生记录/枚举和本地 HTTP 故障服务器，取消会回收使用凭证的
 网络子进程；三个语义负例保护
 完整 payload 比较、suspend 意图和派生报告重算。真实设备导出、线上认证对账、
 受控发布与 HIL 仍未完成。
+
+### 审查计划 v2：本地 checkpoint 材料
+
+`plan` 现在通过 `outbox_checkpoint.py` 核对 Word v4 / Note v1 session、Word v1
+descriptor 和 legacy cursor。原文 SHA、严格长度、SDK CRC 约定、枚举和计数均须
+有效，再应用更严格的维修策略核对 UUID、pin、唯一候选和序号范围。session 仅在
+primary 解码失败时考虑 backup；有效 primary 的 mode 不符不改选 backup，tmp 不晋升。
+读取后的源 manifest 再次按独立固定摘要核验。
+
+事实匹配但无可用 session、SID/mode 不符、item 不在当前窗口、Word ordinal 不能
+由候选窗口表示、Note next-position 越界或本地 next-sequence 与事实序号矛盾时，
+不再提出 ACK。已持久化更高序号的 session 不回退；Note opened 的 last-opened pin
+仍独立列为 checkpoint 更新，不能由更高 next-sequence 代替。存在 descriptor 家族时
+还要核对完整 SID、header/payload CRC、pins、start-index、scope-generation 及候选
+子集；损坏或只有 tmp 的描述文件继续保留。
+
+每个 `local_checkpoint_checks` 是单条事实相对保留 session 的结构检查，候选状态不是
+可安装的合并 session 文件。跨全部 pending/ACK/suspend 的原生重放、候选序列化、
+复验及发布仍受 `combined_native_candidate_not_validated` 阻止。新计划格式为
+`wqn-outbox-repair-review-v2`；旧 v1 审查计划需以原始证据重新生成，不会静默升级旧
+SHA 或授权标记。既有证据包和机器回执协议不变。
+
+Word 暂停值当前优先位于 NVS，`.cur` 只是一次迁移后备，`.ctp/.cbk` 不自动晋升。
+当前导出包没有 NVS 游标或已提交 deck-scope-generation，因此有效 `.cur` 也只作
+legacy 证据；计划保持 `word_nvs_pause_not_exported` 等未验证前提。当前 pack pins
+和 Word session 来源也尚未核验。不能把这些结构检查写成完整设备备份或安装许可。
+
+15 个 checkpoint 场景使用生产 EncodeSession / DecodeSession / LoadSessionFile、
+descriptor 解码、cursor 读取和 ReconcileSession 函数，与实际 SDK CRC 交叉对照；
+原生函数由源码原样提取，ASan/UBSan 编译执行。测试中的 scope-generation 外部值
+未被用来证明设备当前状态。两个语义负例分别放行窗口失配、把 legacy cursor 冒充
+NVS 权威来源，要求由断言检出且无异常或 sanitizer 错误。
 
 接下来按以下顺序推进完整维修流程：
 
 1. 用已核验的设备导出身份和真实凭证联调现有对账工具；补齐设备来源证明及时间精度
    未解决项，不通过推进序号、skip observation 或创建新会话来伪装修复。
-2. 在审查计划基础上实现原生 session/cursor/descriptor 检查与受控候选；对未知
-   observation/ACK/suspend、缺失 cursor 与冲突证据保留未解决状态。
+2. 已增加原生对照的 session/cursor/descriptor 结构检查；继续补齐可信 NVS/scope
+   导出、全体记录的合并原生候选验证。未知 observation/ACK/suspend、缺失 cursor
+   与冲突证据保持未解决，不由单条候选预览授权写回。
 3. 提供设备维护态的可靠导出/交付入口和 StorageService 事务，保留原始 bytes，
    先验证暂存候选，再按可重入的 intent 发布；重启、中断与失败均有明确回滚路径。
 4. 在可恢复测试介质上执行设备、SPIFFS/NVS、断电和序号对账验收，最后关闭 R-08。

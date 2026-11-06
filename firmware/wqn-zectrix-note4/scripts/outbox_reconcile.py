@@ -23,9 +23,10 @@ import urllib.request
 import uuid
 
 import outbox_forensics as f
+import outbox_checkpoint as checkpoint
 
 FORMAT = 'wqn-outbox-reconciliation-evidence-v1'
-PLAN_FORMAT = 'wqn-outbox-repair-review-v1'
+PLAN_FORMAT = 'wqn-outbox-repair-review-v2'
 CONTRACT = 'outbox-reconciliation-v1'
 SCHEMA_SHA = '8d8f8f8ed86f94eb8cca0999be0a0e97b2ea727f72c496f61e6a5bf3bbe83d69'
 ENDPOINT_PATH = '/api/esp32/v3/study/observations/receipts'
@@ -481,7 +482,8 @@ def verify(source, source_pin, evidence, evidence_pin):
 def review_plan(source, source_pin, evidence, evidence_pin):
     original, rows, assessment, manifest = verify(source, source_pin, evidence, evidence_pin)
     selected, blockers = None, ['device_source_identity_not_attested', 'maintenance_revalidation_required',
-        'local_checkpoint_material_not_validated', 'controlled_publication_not_implemented',
+        'checkpoint_runtime_context_not_attested', 'combined_native_candidate_not_validated',
+        'controlled_publication_not_implemented',
         'explicit_repair_authorization_required']
     for name in original['runtime_candidate_order']:
         if name not in original['files']:
@@ -513,7 +515,8 @@ def review_plan(source, source_pin, evidence, evidence_pin):
         elif row.get('kind') in ('ack', 'suspend') and 'pending' in local[key]:
             local[key].discard('pending')
             local[key].add('suspended' if row['kind'] == 'suspend' else 'acknowledged')
-    decisions, operations = [], []
+    decisions, operations, checkpoint_checks = [], [], []
+    material = checkpoint.Material(source, original)
     for row, item in zip(rows, assessment['records']):
         action = 'retain_raw_evidence'
         if row.get('kind') == 'observation' and row.get('identity_usable_for_lookup'):
@@ -529,15 +532,23 @@ def review_plan(source, source_pin, evidence, evidence_pin):
             elif state == {'pending'} and item['state'] == 'matched' and \
                     'runtime_source_has_partial_tail' not in blockers and \
                     'runtime_source_has_unusable_record_identity' not in blockers:
-                action = 'propose_ack_after_checkpoint'
-                if observed.get(row['request_id']) == row:
+                check = material.validate(row)
+                checkpoint_checks.append({'file': row['file'], 'offset': row['offset'], **check})
+                if check['state'] == 'held':
+                    action = 'hold_local_checkpoint_' + check['reason']
+                else:
+                    action = 'propose_ack_after_checkpoint'
+                if check['state'] != 'held' and observed.get(row['request_id']) == row:
                     operations.append({'operation': 'acknowledge_after_checkpoint', 'request_id': row['request_id'],
                         'session_id': row['session_id'], 'sequence': row['sequence'],
                         'source': {k: row[k] for k in ('file', 'offset', 'sha256')},
                         'canonical_observation_id': item['observation_id'],
                         'expected_local_checkpoint': row['local_checkpoint'],
+                        'checkpoint_candidate': check['candidate'],
+                        'checkpoint_session_source': check['session_source'],
                         'requires': ['maintenance_identity_check', 'fresh_receipt_revalidation',
-                                     'native_candidate_validation', 'durable_checkpoint', 'explicit_repair_authorization']})
+                                     'native_candidate_validation', 'durable_checkpoint', 'explicit_repair_authorization',
+                                     *check['unverified_context']]})
             else:
                 action = 'hold_pending_'+item['state']
         decisions.append({'file': row['file'], 'offset': row['offset'], 'action': action})
@@ -547,9 +558,17 @@ def review_plan(source, source_pin, evidence, evidence_pin):
         blockers.append('receipt_query_incomplete')
     if not assessment['authenticated_batches']:
         blockers.append('no_authenticated_receipts')
+    for check in checkpoint_checks:
+        for reason in check['unverified_context']:
+            if reason not in blockers:
+                blockers.append(reason)
+    # Material is read again after the initial receipt verification; retain
+    # the independent source pin across these extra file reads as well.
+    source_manifest(source, source_pin)
     return {'format': PLAN_FORMAT, 'source_manifest_sha256': source_pin,
         'evidence_manifest_sha256': evidence_pin, 'expected_actor': manifest['expected_actor'],
         'native_source': selected, 'proposed_operations': operations, 'decisions': decisions,
+        'local_checkpoint_checks': checkpoint_checks,
         'checkpoint_material': {name: {k: entry[k] for k in ('category', 'bytes', 'sha256')}
             for name, entry in original['files'].items() if entry['category'] in
             ('session', 'cursor', 'local-session-descriptor', 'opaque-word-descriptor')},
