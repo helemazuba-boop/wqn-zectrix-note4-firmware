@@ -30,6 +30,12 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/robustness-venv"
           "$RUNNER_TEMP/robustness-venv/bin/python" -m pip install -r scripts/robustness-requirements.txt
 
+      - name: Install independent native SHA oracle headers
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libssl-dev
+
       - name: Run mapped regressions and require semantic rejection of guard removals
         working-directory: firmware/wqn-zectrix-note4
         shell: bash

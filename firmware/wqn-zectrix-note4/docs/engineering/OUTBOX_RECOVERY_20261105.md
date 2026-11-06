@@ -365,13 +365,47 @@ SDK 构建和上述主机检查不能证明任务竞争、真实 NVS/SPIFFS、�
 恢复函数入口帧为 224 B，切换事务 176 B，专用读取 helper 112 B，均为静态入口帧。
 本批与启动保全补丁一起保留在独立工作树，按 `AGENTS.md` §7 等待审查与 HIL 后提交。
 
+### SPIFFS/NVS 逻辑证据采集（2026-11-06，核心实现待设备接入与 HIL）
+
+新增的固件采集核心只在 StorageService owner 内运行：调用方必须先进入本次启动的
+恢复维护态，SPIFFS 已挂载，且没有活动的临时文件或 pack 流 lease。它不负责挂载、
+修复或清理存储。维护模式发布本身没有文件 I/O；当前启动恢复入口尚未连接物理导出
+命令，因此代码编译不代表设备已能导出。
+
+采集器读取固定的 59 个 Word/Note outbox 原始文件名，以及受限的 `wl`、`wp_`、`np_`
+动态文件名；另读取配置 NVS namespace 中 11 个明确列出的游标、scope 和 deck 键。
+NVS 只读打开，不枚举 namespace 或读取凭证；标量按原始小端字节保存，string/blob
+不解码、不规范化。单文件上限 16 MiB、总原文上限 32 MiB、单个 NVS 值上限 64 KiB，
+超限或读取错误会留下显式错误实体，不会伪装成缺失。
+
+一次 owner 事务先枚举并流式散列原件，随后重新枚举、重读并复核文件/NVS 的存在性、
+类型、长度及 SHA-256；期间 scope 缓存变化会令结果失败。每个数据帧带顺序号、对象
+偏移和实体散列，结束帧覆盖整段原始 transcript。期限和取消在读、写帧及让出 CPU
+之间协作检查；它们不能打断一个已经阻塞的 VFS/NVS/sink 调用，未来传输层仍须提供
+自己的有界写入与交付确认。
+
+主机接收器要求操作者分别 pin capture ID、MAC 和 ELF SHA-256，校验完整 transcript
+后以私有目录保存 wire 与逐对象原始字节，并由独立 verifier 重放 wire、重建清单和
+逐字节对照输出文件。当前示例包是合成输入，不来自设备；pin 是操作者提供的上下文，
+不构成设备认证或硬件证明。清单仍固定为
+`complete_device_backup=false`、`identity_authenticated=false`、
+`installation_ready=false`、`repair_authorized=false`。它是逻辑文件/NVS 证据，不是
+Flash 分区镜像或完整备份；SPIFFS 未挂载时会拒绝采集，原始物理介质镜像仍需另行设计。
+
+本批主机专项记录 49 个通过情景，完整鲁棒性门禁 98/98 通过；ESP-IDF v5.5.6
+ai-local profile 构建、M8 和 UI 静态帧门禁完成且构建日志无 warning。以上不覆盖真实
+NVS/SPIFFS、任务竞争、串口/USB 交付、物理身份、断电、运行时栈水位或 HIL。高风险
+存储改动仍未提交，需先由独立审查与设备 HIL 验收。
+
 接下来按以下顺序推进完整维修流程：
 
 1. 用已核验的设备导出身份和真实凭证联调现有对账工具；补齐设备来源证明及时间精度
    未解决项，不通过推进序号、skip observation 或创建新会话来伪装修复。
-2. 已增加原生对照的 session/cursor/descriptor 结构检查及合并原生候选生成/复验；
-   继续补齐可信 NVS/scope/pack 导出及设备维护态复验。未知 observation/ACK/suspend、
-   缺失 cursor 与冲突证据保持未解决，不由主机候选验证授权写回。
-3. 提供设备维护态的可靠导出/交付入口和 StorageService 事务，保留原始 bytes，
-   先验证暂存候选，再按可重入的 intent 发布；重启、中断与失败均有明确回滚路径。
+2. 已增加原生对照的 session/cursor/descriptor 结构检查、候选生成/复验，以及
+   SPIFFS/NVS 逻辑原文采集核心；尚缺可信设备身份、用户确认的实体传输入口和真实设备
+   复验。未知 observation/ACK/suspend、缺失 cursor 与冲突证据保持未解决，不由主机
+   候选验证授权写回。
+3. 将采集核心接入有明确用户确认、背压/取消/交付 ACK 的设备维护传输；补足 SPIFFS
+   未挂载时的原始介质证据方案。之后再实现候选安装与回滚 intent，保持原始 bytes，
+   让重启、中断与失败都有可验证的回退路径。
 4. 在可恢复测试介质上执行设备、SPIFFS/NVS、断电和序号对账验收，最后关闭 R-08。

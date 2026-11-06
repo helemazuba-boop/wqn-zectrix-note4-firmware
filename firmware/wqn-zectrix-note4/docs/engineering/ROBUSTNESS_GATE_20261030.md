@@ -18,8 +18,8 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-93 个执行项：40 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-43 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+98 个执行项：41 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+47 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
 1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
 R-08 进行中的离线保全工具增加原生 codec/SDK CRC 检查和四个语义负例，
 涵盖新旧容量配置、动态描述文件、CRC 与报告重算；不代表 R-08 已关闭。
@@ -33,6 +33,9 @@ deck-scope 入口再增加四个负例，保护 generation 不截断、异常标
 不能用主机门禁通过替代其提交/设备验收条件。
 运行时 scope 就绪屏障补充 auto/manual 状态机与完整 descriptor/session 文件入口，
 再增加三个负例，检出跳过旧尾部、失败后重新放行，以及 session/GC 绕过就绪屏障。
+SPIFFS/NVS 逻辑证据采集器和主机端独立传输复验再增加一个运行时入口与四个负例，
+覆盖维护态准入、只读原文重读、取消/期限、接收端身份 pin 与 transcript 重算。
+这是主机及源码端证据，不表示设备导出通道或可信硬件身份已经落地。
 已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
 HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原本缺失。
 
@@ -54,6 +57,7 @@ HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原�
 | R-08 NVS/暂停与 pin 证据 | `test_storage_maintenance.py`、`test_word_cursor_guards.py`、`test_word_session_replay.py`、`test_pack_prune.py`；49/43/204 项读写与回放检查、pack 原生故障及语义负例 |
 | R-08/R-18 deck scope 原文保全 | `test_word_deck_scope_tail.py`；245 项主机 NVS 端口检查，14 个写边界前后故障、合法中断恢复、失败就绪屏障及六个负例；未完成存储协议 HIL |
 | R-08 manual/auto 与真实文件 | `test_word_scope_autorepair.py` 102 项；`test_word_local_descriptor.py` 96 项，真实生产 C++/libc 与 NVS/StorageService 端口，未确认 scope 下原文件保持不变 |
+| R-08 SPIFFS/NVS 逻辑证据采集 | `test_storage_evidence_capture.py` 49 个主机情景；另有门禁运行时入口与四个语义负例。主机接收器保留原始 wire 并独立重算；无设备传输/HIL/身份认证证明 |
 | UUID/count 边界、独立 storage owner 与期限 | `test_v3_sync_response.py`、`test_storage_prepare_deadline.py` |
 | Word 错误、检查点与启动恢复联动 | `test_sync_control.py`、`test_sync_retry.py`、`test_word_ack_upload.py`；原有真实 Word 持久化/重放 CI |
 | 功能关闭 | `test_agent_disabled.py` 的真实关闭分支入口；不宣称这是 Agent-off SDK 构建 |
@@ -87,7 +91,8 @@ Python 异常、sanitizer 错误、信号终止、超时或变异边界漂移均
 
 ## 证据边界
 
-工作流已接入上述入口；本地运行和 SDK 构建不能充当远端 CI 执行结果。合成 HIL
+工作流已接入上述入口；原生采集器的主机独立 SHA 预言机依赖 `libssl-dev`，由 CI 安装。
+本地运行和 SDK 构建不能充当远端 CI 执行结果。合成 HIL
 smoke 保持解析器测试身份，动态栈水位、真实 EPD/BUSY、SPIFFS/掉电、网络阻塞、
 PCM 连续性、功耗与发布验收仍按统一清单执行。R-18 已增加本地恢复入口，设备验收
 后置；R-08 无副本无损维修仍待实现。R-04 普通背压触发链当前未证实；异常

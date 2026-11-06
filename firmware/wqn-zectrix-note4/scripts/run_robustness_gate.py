@@ -48,6 +48,7 @@ def cases():
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
         ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
+        ('storage_evidence_capture', 'R-08 ongoing: frozen owner raw files/NVS, pinned stream receive and independent replay', ()),
         ('word_cursor_guards', 'R-08 ongoing: pause source validation, migration and explicit read errors', ()),
         ('word_deck_scope_tail', 'R-08/R-18: preserve unknown scope metadata and replay only valid interrupted changes', ()),
         ('word_scope_autorepair', 'R-08: storage readiness and accepted manual/auto scope obligations', ()),
@@ -109,6 +110,10 @@ def cases():
         result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
                            ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',
                            r'Storage maintenance NVS: \d+ checks, [1-9]\d* failures \(host ports; NOT HIL\)'))
+    for mutation in ('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript'):
+        result.append(Case(f'evidence-capture-{mutation}', 'R-08: maintenance admission, raw source recheck, read-only NVS and transcript integrity', 'controls',
+                           ('test_storage_evidence_capture.py', '--mutation', mutation), r'^FAIL evidence:',
+                           r'Storage evidence: \d+ scenarios, [1-9]\d* failures, 0 errors \(host ports; NOT HIL\)'))
     result.append(Case('word-cursor-swallow-error', 'R-08: failed cursor cannot restore an unpaused session', 'controls',
                        ('test_word_session_replay.py', '--mutation', 'swallow-cursor-error'), r'^FAIL: cursor read failure',
                        r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))
