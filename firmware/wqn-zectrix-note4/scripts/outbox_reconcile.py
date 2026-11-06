@@ -579,14 +579,14 @@ def review_plan(source, source_pin, evidence, evidence_pin):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    for command in ('collect', 'verify', 'plan', 'verify-plan'):
+    for command in ('collect', 'verify', 'plan', 'verify-plan', 'candidate', 'verify-candidate'):
         item = sub.add_parser(command)
         item.add_argument('--source-bundle', type=Path, required=True)
         item.add_argument('--source-manifest-sha256', required=True)
         if command != 'collect':
             item.add_argument('--evidence', type=Path, required=True)
             item.add_argument('--evidence-manifest-sha256', required=True)
-        if command in ('collect', 'plan'):
+        if command in ('collect', 'plan', 'candidate'):
             item.add_argument('--output', type=Path, required=True)
         if command == 'collect':
             item.add_argument('--endpoint', required=True)
@@ -595,9 +595,12 @@ def main():
             item.add_argument('--expected-device-id', required=True)
             item.add_argument('--allow-insecure-loopback-test', action='store_true')
             item.add_argument('--timeout-seconds', type=float, default=300)
-        if command == 'verify-plan':
+        if command in ('verify-plan', 'candidate', 'verify-candidate'):
             item.add_argument('--plan', type=Path, required=True)
             item.add_argument('--plan-sha256', required=True)
+        if command == 'verify-candidate':
+            item.add_argument('--candidate', type=Path, required=True)
+            item.add_argument('--candidate-manifest-sha256', required=True)
     args = parser.parse_args()
     try:
         if args.command == 'collect':
@@ -608,6 +611,14 @@ def main():
             _, _, assessment, _ = verify(args.source_bundle, args.source_manifest_sha256,
                 args.evidence, args.evidence_manifest_sha256)
             result = {'status': 'verified', 'query_complete': assessment['query_complete'], 'repair_authorized': False}
+        elif args.command in ('candidate', 'verify-candidate'):
+            import outbox_candidate as native_candidate
+            common = (sys.modules[__name__], args.source_bundle, args.source_manifest_sha256,
+                args.evidence, args.evidence_manifest_sha256, args.plan, args.plan_sha256)
+            if args.command == 'candidate':
+                result = native_candidate.generate(*common, args.output)
+            else:
+                result = native_candidate.verify(*common, args.candidate, args.candidate_manifest_sha256)
         else:
             plan = review_plan(args.source_bundle, args.source_manifest_sha256, args.evidence, args.evidence_manifest_sha256)
             if args.command == 'plan':

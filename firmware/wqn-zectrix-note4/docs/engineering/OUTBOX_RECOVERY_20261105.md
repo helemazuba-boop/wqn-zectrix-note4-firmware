@@ -1,8 +1,9 @@
 # R-08：原始记录保全与维修流程（进行中）
 
 R-08 尚未关闭。本地已增加离线原始保全、Word/Note 解码、设备认证回执对账与
-审查计划工具；后续还要完成真实介质身份核验、受控候选验证/交付、失败回滚和 HIL。
-保全工具不会修改设备、数据库或源文件，也不会生成、安装或授权“修复后”日志。
+审查计划与原生候选工具；后续还要完成真实介质身份核验、设备候选复验/交付、失败回滚和 HIL。
+保全工具只复制原文；候选工具额外生成供离线审查的 journal/checkpoint 文件。
+设备安装、数据库变更与维修授权仍未实现，源文件保持不变。
 
 ## 已确认的维修边界
 
@@ -98,8 +99,8 @@ identity、未来版本、源文件变化、读取/写入/fsync 失败、不完�
 四个语义负例分别改用错误 CRC 参数、信任未重算的报告、将新 Word 容量降回 1000、
 忽略动态描述文件；要求完成测试且只有行为
 断言失败，不能把编译错误、异常、sanitizer 或超时当作成功检出。工具接入统一门禁，
-当前清单 72 项（32 运行时入口 / 10 UI / 30 负例），包含对账客户端、本地 checkpoint
-材料校验及五个相关语义负例。
+当前清单 75 项（33 运行时入口 / 10 UI / 32 负例），包含对账客户端、本地 checkpoint
+材料校验、原生合并候选及七个相关语义负例。
 
 ## 设备认证的只读回执（2026-11-06，本地实现）
 
@@ -204,19 +205,75 @@ Word 暂停值当前优先位于 NVS，`.cur` 只是一次迁移后备，`.ctp/.
 legacy 证据；计划保持 `word_nvs_pause_not_exported` 等未验证前提。当前 pack pins
 和 Word session 来源也尚未核验。不能把这些结构检查写成完整设备备份或安装许可。
 
-15 个 checkpoint 场景使用生产 EncodeSession / DecodeSession / LoadSessionFile、
+18 个 checkpoint 场景使用生产 EncodeSession / DecodeSession / LoadSessionFile、
 descriptor 解码、cursor 读取和 ReconcileSession 函数，与实际 SDK CRC 交叉对照；
 原生函数由源码原样提取，ASan/UBSan 编译执行。测试中的 scope-generation 外部值
 未被用来证明设备当前状态。两个语义负例分别放行窗口失配、把 legacy cursor 冒充
 NVS 权威来源，要求由断言检出且无异常或 sanitizer 错误。
 
+### Note 回放修复（2026-11-06）
+
+原实现按 acknowledged → pending → suspended 三组逐次覆盖 last-opened pin。
+这三个组是处置状态而不是时间顺序：较旧的挂起事实可能在最后覆盖较新的 pending，
+而 next-sequence 已经推进到最新。`ReconcileSessionFromOutbox` 现在跨三个组按每项
+最高 observation sequence 选一次 pin；cursor 推进、磁盘格式和持久化顺序不变。
+不按 occurred-at 字符串排序，设备时钟回拨也按逻辑序号选择；已完成的 checkpoint
+再次回放不会因中间旧 pin 请求重写。新增原生场景复现了修复前 00:00:03 被
+00:00:02 覆盖的问题，并验证重复回放及回拨时钟。该纯内存选择逻辑没有新增堆分配。
+
+### 原生合并候选（主机工具，不授权安装）
+
+在审查计划生成后，可使用当前源码及实际 SDK CRC 编译并运行原生编解码、扫描与
+完整回放。需要本地 `gcc`、`g++`、ESP-IDF（`IDF_PATH`；默认
+`/home/unknow/esp/esp-idf-v5.5`）及前述 Python 依赖，不需要设备/提供商凭证。
+
+```sh
+python scripts/outbox_reconcile.py candidate \
+  --source-bundle /tmp/wqn-word-evidence --source-manifest-sha256 <原文摘要> \
+  --evidence /tmp/wqn-receipt-evidence --evidence-manifest-sha256 <回执摘要> \
+  --plan /tmp/wqn-repair-review --plan-sha256 <审查计划摘要> \
+  --output /tmp/wqn-native-candidate
+python scripts/outbox_reconcile.py verify-candidate \
+  --source-bundle /tmp/wqn-word-evidence --source-manifest-sha256 <原文摘要> \
+  --evidence /tmp/wqn-receipt-evidence --evidence-manifest-sha256 <回执摘要> \
+  --plan /tmp/wqn-repair-review --plan-sha256 <审查计划摘要> \
+  --candidate /tmp/wqn-native-candidate --candidate-manifest-sha256 <候选摘要>
+```
+
+工具先重新计算计划并核对独立摘要，再把已核对的输入复制到私有临时目录。
+原始导出路径不会进入原生写入入口。候选保留选中 journal 的完整原始字节前缀，只
+追加原生编码器产生的 ACK 标记；不会 compact、删除坏块、恢复 suspend 或改写事实。
+当前入口要求已有完整可解析源及可用提案，不能重构无法解释的坏 observation/ACK/suspend。
+
+每个受提案影响的 session 都用同一份完整候选 journal，跨三种处置组进行原生回放；
+核对 ACK 前后 checkpoint 字节等价、挂起处置/原因不变、ACK 覆盖及候选 session
+原生重新加载。原 session 也必须精确 decode/encode 往返，不能悄悄归一化未解释字节。
+输出包含 `journal.v1`、`checkpoint-XX.v1`、`proof.json` 和 manifest，绑定原文/回执/
+计划摘要、生产源/头文件、生成单元、编译器与 SDK CRC/头文件摘要。候选包上限 8 MiB，
+新增 ACK 后仍须满足原文配置的分析记录预算；不满足时保留未知，不能静默截断。
+
+输出采用 0700/0600 权限与 fsync/incomplete 提交流程。原生编译/验证失败、来源改变
+或提交未完成时不会发布成功包；编译器/sanitizer 诊断最多保留 16 KiB 于私有
+`native-error.json`，保留 incomplete 标记。`verify-candidate` 会重新编译、生成及逐字节比较全部
+输出，拒绝自造 SHA、授权标记、遗漏/增加文件和候选字节篡改。当前源码、编译器或
+SDK 改变会使旧候选不能按当前规则通过复验，需要明确重新生成和审查。
+
+11 个候选场景覆盖 Word/Note、跨模式 session、完整字节前缀、挂起保留、Note 最新
+pin、未解释 session 字节、独立重算、原文变化、失败 incomplete 及 CLI。两个语义
+负例分别信任篡改后的候选、跳过原 session 精确往返，要求断言检出且无运行异常。
+
+原生验证完成只消除当前提案的合并候选检查缺口，不能证明运行设备使用了相同固件。
+manifest 继续声明 `installation_ready=false`、`repair_authorized=false`，保留设备身份、
+维护态重核验、NVS/scope/pack、受控发布和显式维修授权条件，并增加目标原生固件未
+核验条件。它不是可直接交给设备执行的维修包。
+
 接下来按以下顺序推进完整维修流程：
 
 1. 用已核验的设备导出身份和真实凭证联调现有对账工具；补齐设备来源证明及时间精度
    未解决项，不通过推进序号、skip observation 或创建新会话来伪装修复。
-2. 已增加原生对照的 session/cursor/descriptor 结构检查；继续补齐可信 NVS/scope
-   导出、全体记录的合并原生候选验证。未知 observation/ACK/suspend、缺失 cursor
-   与冲突证据保持未解决，不由单条候选预览授权写回。
+2. 已增加原生对照的 session/cursor/descriptor 结构检查及合并原生候选生成/复验；
+   继续补齐可信 NVS/scope/pack 导出及设备维护态复验。未知 observation/ACK/suspend、
+   缺失 cursor 与冲突证据保持未解决，不由主机候选验证授权写回。
 3. 提供设备维护态的可靠导出/交付入口和 StorageService 事务，保留原始 bytes，
    先验证暂存候选，再按可重入的 intent 发布；重启、中断与失败均有明确回滚路径。
 4. 在可恢复测试介质上执行设备、SPIFFS/NVS、断电和序号对账验收，最后关闭 R-08。

@@ -46,6 +46,7 @@ def cases():
         ('outbox_forensics', 'R-08 ongoing: offline raw preservation and native journal/SDK CRC parity', ()),
         ('outbox_reconcile', 'R-08 ongoing: pinned raw evidence, authenticated receipts and non-authorizing review plans', ()),
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
+        ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
         ('sync_journal', 'N-06: opaque checkpoints and decode allocation faults', ()),
         ('sync_control', 'R-21: raw SEQUENCE_GAP, retry checkpoint and restart escalation', ()),
         ('sync_retry', 'R-21: bounded retries and independent outbox identities', ()),
@@ -93,6 +94,10 @@ def cases():
         result.append(Case(f'checkpoint-{mutation}', 'R-08 ongoing: representable checkpoint and unverified NVS context', 'controls',
                            ('test_outbox_checkpoint.py', '--mutation', mutation), r'^FAIL checkpoint:',
                            r'Outbox checkpoint: \d+ scenarios, [1-9]\d* failures, 0 errors \(NOT HIL\)'))
+    for mutation in ('trust-candidate', 'normalize-unknown-session'):
+        result.append(Case(f'native-candidate-{mutation}', 'R-08 ongoing: independent native recomputation and exact retained bytes', 'controls',
+                           ('test_outbox_candidate.py', '--mutation', mutation), r'^FAIL native-candidate:',
+                           r'Native outbox candidate: \d+ scenarios, [1-9]\d* failures, 0 errors \(NOT HIL\)'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),
