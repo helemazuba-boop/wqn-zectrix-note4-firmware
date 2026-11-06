@@ -18,14 +18,16 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-75 个执行项：33 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-32 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+83 个执行项：37 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+36 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
 1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
 R-08 进行中的离线保全工具增加原生 codec/SDK CRC 检查和四个语义负例，
 涵盖新旧容量配置、动态描述文件、CRC 与报告重算；不代表 R-08 已关闭。
 其后增加原文绑定对账/审查计划入口与三个负例，保护完整 payload、suspend 和派生报告。
 本地 checkpoint 材料入口另增加两个负例，保护候选窗口约束和 NVS 证据边界。
 原生候选入口再增加两个负例，保护独立重算和原始 session 的精确字节往返。
+维护 NVS 证据、游标保护、session 回放和 pack prune 纳入统一门禁，再增加四个负例，
+保护存在性、原始长度、只读模式及读失败向调用者传播。
 已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
 HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原本缺失。
 
@@ -44,6 +46,7 @@ HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原�
 | R-08 原文绑定对账与审查计划 | `test_outbox_reconcile.py`；原生枚举、7014 事实、本地 HTTP 故障与三个语义负例 |
 | R-08 本地 checkpoint 材料 | `test_outbox_checkpoint.py`；生产 session/descriptor/cursor 编解码与回放对照，窗口、暂停证据和两个语义负例 |
 | R-08 原生合并候选 | `test_outbox_candidate.py`；完整 journal 前缀、跨分组回放、多模式 checkpoint、篡改拒绝和两个语义负例 |
+| R-08 NVS/暂停与 pin 证据 | `test_storage_maintenance.py`、`test_word_cursor_guards.py`、`test_word_session_replay.py`、`test_pack_prune.py`；49/40/198 项读路径检查、pack 原生故障及四个负例 |
 | UUID/count 边界、独立 storage owner 与期限 | `test_v3_sync_response.py`、`test_storage_prepare_deadline.py` |
 | Word 错误、检查点与启动恢复联动 | `test_sync_control.py`、`test_sync_retry.py`、`test_word_ack_upload.py`；原有真实 Word 持久化/重放 CI |
 | 功能关闭 | `test_agent_disabled.py` 的真实关闭分支入口；不宣称这是 Agent-off SDK 构建 |

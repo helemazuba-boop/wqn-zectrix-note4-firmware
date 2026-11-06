@@ -11,6 +11,8 @@ constexpr esp_err_t ESP_OK = 0;
 constexpr esp_err_t ESP_FAIL = -1;
 constexpr esp_err_t ESP_ERR_INVALID_ARG = 0x102;
 constexpr esp_err_t ESP_ERR_INVALID_STATE = 0x103;
+constexpr esp_err_t ESP_ERR_INVALID_SIZE = 0x104;
+constexpr esp_err_t ESP_ERR_INVALID_CRC = 0x109;
 constexpr esp_err_t ESP_ERR_NVS_INVALID_STATE = 0x110b;
 constexpr const char* kTag = "cursor-fixture";
 const char* esp_err_to_name(esp_err_t) { return "injected-error"; }
@@ -161,6 +163,28 @@ int main(int argc, char** argv) {
     Reset(); paused = false;
     Check(!ReadSessionCursorPaused(Mode::kReview, sid, &paused) && fake.saves == 0,
           "empty mode does not create an NVS cursor");
+
+    for (esp_err_t fault : {ESP_FAIL, ESP_ERR_INVALID_SIZE}) {
+        Reset(); Legacy(Record()); fake.load_error = fault; paused = false;
+        esp_err_t error = ESP_OK;
+        Check(!ReadSessionCursorPaused(Mode::kReview, sid, &paused, &error) &&
+              error == fault && fake.saves == 0,
+              "NVS error is explicit and cannot become legacy fallback or unpaused success");
+    }
+    Reset(); fake.found = true; fake.record = Record(); fake.record.crc ^= 1;
+    esp_err_t cursor_error = ESP_OK;
+    Check(!ReadSessionCursorPaused(Mode::kReview, sid, &paused, &cursor_error) &&
+          cursor_error == ESP_ERR_INVALID_CRC && fake.saves == 0,
+          "invalid existing NVS cursor carries a terminal read error");
+    Reset(); Legacy(Record(), sizeof(SessionCursorRecord)-1); cursor_error = ESP_OK;
+    Check(!ReadSessionCursorPaused(Mode::kReview, sid, &paused, &cursor_error) &&
+          cursor_error == ESP_ERR_INVALID_SIZE, "short legacy cursor is an error rather than absence");
+    Reset(); cursor_error = ESP_FAIL;
+    Check(!ReadSessionCursorPaused(Mode::kReview, sid, &paused, &cursor_error) && cursor_error == ESP_OK,
+          "genuine absence resets the error output without manufacturing a cursor");
+    Reset(); fake.found = true; fake.record = Record(); cursor_error = ESP_FAIL; paused = false;
+    Check(ReadSessionCursorPaused(Mode::kReview, sid, &paused, &cursor_error) &&
+          cursor_error == ESP_OK && paused, "valid NVS cursor resets stale caller error state");
 
     for (esp_err_t error : {ESP_OK, ESP_FAIL, ESP_ERR_NVS_INVALID_STATE}) {
         Reset(); Legacy(Record()); fake.clear_error = error;

@@ -99,8 +99,8 @@ identity、未来版本、源文件变化、读取/写入/fsync 失败、不完�
 四个语义负例分别改用错误 CRC 参数、信任未重算的报告、将新 Word 容量降回 1000、
 忽略动态描述文件；要求完成测试且只有行为
 断言失败，不能把编译错误、异常、sanitizer 或超时当作成功检出。工具接入统一门禁，
-当前清单 75 项（33 运行时入口 / 10 UI / 32 负例），包含对账客户端、本地 checkpoint
-材料校验、原生合并候选及七个相关语义负例。
+当前清单 83 项（37 运行时入口 / 10 UI / 36 负例），包含对账客户端、本地 checkpoint
+材料校验、原生合并候选、维护 NVS/游标/pin 保护及十一个相关语义负例。
 
 ## 设备认证的只读回执（2026-11-06，本地实现）
 
@@ -266,6 +266,42 @@ pin、未解释 session 字节、独立重算、原文变化、失败 incomplete
 manifest 继续声明 `installation_ready=false`、`repair_authorized=false`，保留设备身份、
 维护态重核验、NVS/scope/pack、受控发布和显式维修授权条件，并增加目标原生固件未
 核验条件。它不是可直接交给设备执行的维修包。
+
+### 只读 NVS 上下文与暂停读取保护（2026-11-06）
+
+`InspectWordRecoveryNvsOnStorageOwner` 提供真实设备代码侧的有界只读采集原语。
+调用者必须已在 StorageService 内部栈 owner 的事务中；不在 owner 时拒绝且不访问 NVS。
+它只以 `NVS_READONLY` 打开 `wqn`，观测 7 个当前模式的游标原文、已提交的完整 u64
+scope-generation、RAM generation 前后值，以及 scope-change marker 的存在性/长度。
+不初始化 NVS、读凭证、迁移/清理字段，也不建立维护态冻结或跨文件快照。
+
+每个游标分别保留 error、found、stored-bytes、copied-bytes 和最多 64 B 原文。53/64 B
+等未知小布局原样保留，不当作有效暂停值；超过 64 B 明确失败且 copied-bytes=0，
+不能把截断前缀冒充完整原文。类型/I/O/长度变化错误继续记录，并采集其余独立字段。
+只有 error=ESP_OK 时 found=false 才证明缺失；read-complete 只证明这些已知字段读取
+完成，不证明 CRC、运行时兼容、来源身份或维修许可。u64 generation 不截断为 u32，
+也不把 RAM 缓存当成缺失 NVS 值的替代。API 未采集完整 NVS 分区或 pack pins。
+
+NVS 输出先进入 owner 内部栈 scratch，再复制到调用者的 POD，即使输出位于 PSRAM
+也不让 flash-backed NVS API 直接写它。49 项实际函数/主机端口检查覆盖缺失、未知
+布局、超限、类型/读取错误、cache 漂移、只读/无凭证访问与原文保留；SDK 编译对象
+的该函数入口帧为 720 B。此静态帧不证明完整调用栈或设备 HWM。
+
+同时修复暂停读取：存在但长度不符的 NVS 值不再伪装成“没有值”而回退旧 `.cur`；
+测量与数据读取后的长度都检查。读取错误、CRC/布局错误、legacy 短记录/尾随字节
+和文件 I/O 错误通过独立 error 输出传给 `LoadSessionTransaction`，不再沿用旧快照
+暂停值并返回恢复成功。真实缺失和上一 SID 的有效旧游标仍保持原有正常路径；有效
+legacy 迁移写失败时继续使用已核对的 legacy 内存值，源文件保留。
+
+现有 load 仍可能先执行原来的备份提升、checkpoint 或尾部修复，它不是取证导出 API。
+新的只读 NVS 入口避免调用这些 load/migration 路径。pack prune 对任一 session
+读取错误（除 NOT_FOUND）停止删除，不能把“pin 未知”当成“没有 pin”。故障注入已
+复现旧实现误报恢复成功、以及错误下删除原词包；修复后分别通过 198 项回放、40 项
+游标保护和 32518 项 publication/prune 检查（含 740 个单次 encoder 分配故障）。
+
+四个新负例分别重新吞掉游标错误、把异常长度当缺失、截断原长度信息、使用 NVS
+读写模式。这个入口尚未接到设备维护态导出通道；导出身份、冻结/传输、scope/pack
+一致性及真机验收仍需实现或验证，既有候选的 NVS/身份安装前提保持未满足。
 
 接下来按以下顺序推进完整维修流程：
 

@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path,
                         default=root / 'main/word_study_store.cpp')
-    parser.add_argument('--mutation', choices=('disable-interaction-gate', 'gate-forced-repair'))
+    parser.add_argument('--mutation', choices=('disable-interaction-gate', 'gate-forced-repair', 'swallow-cursor-error'))
     args = parser.parse_args()
     compiler = shutil.which('g++')
     if compiler is None:
@@ -41,6 +41,11 @@ def main():
         if source.count(needle) != 1:
             raise SystemExit('FAIL: mandatory maintenance mutation boundary drift')
         source = source.replace(needle, 'if (!context->for_sleep &&')
+    elif args.mutation == 'swallow-cursor-error':
+        needle = 'ESP_RETURN_ON_ERROR(cursor_error, kTag, "read authoritative word pause cursor");'
+        if source.count(needle) != 1:
+            raise SystemExit('FAIL: cursor error mutation boundary drift')
+        source = source.replace(needle, '(void)cursor_error;')
     header = (root / 'main/word_study_store.h').read_text(encoding='utf-8')
     pieces = {
         '@@MAINTENANCE_GATE@@': section(header, 'struct WordOutboxMaintenanceGate {',

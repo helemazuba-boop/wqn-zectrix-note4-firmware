@@ -47,6 +47,10 @@ def cases():
         ('outbox_reconcile', 'R-08 ongoing: pinned raw evidence, authenticated receipts and non-authorizing review plans', ()),
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
+        ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
+        ('word_cursor_guards', 'R-08 ongoing: pause source validation, migration and explicit read errors', ()),
+        ('word_session_replay', 'R-08 ongoing: checkpoint replay and terminal cursor read failures', ()),
+        ('pack_prune', 'R-08: unknown session pins preserve current and rollback packs', ()),
         ('sync_journal', 'N-06: opaque checkpoints and decode allocation faults', ()),
         ('sync_control', 'R-21: raw SEQUENCE_GAP, retry checkpoint and restart escalation', ()),
         ('sync_retry', 'R-21: bounded retries and independent outbox identities', ()),
@@ -98,6 +102,13 @@ def cases():
         result.append(Case(f'native-candidate-{mutation}', 'R-08 ongoing: independent native recomputation and exact retained bytes', 'controls',
                            ('test_outbox_candidate.py', '--mutation', mutation), r'^FAIL native-candidate:',
                            r'Native outbox candidate: \d+ scenarios, [1-9]\d* failures, 0 errors \(NOT HIL\)'))
+    for mutation in ('ignore-nvs-size', 'truncate-size', 'write-open'):
+        result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
+                           ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',
+                           r'Storage maintenance NVS: \d+ checks, [1-9]\d* failures \(host ports; NOT HIL\)'))
+    result.append(Case('word-cursor-swallow-error', 'R-08: failed cursor cannot restore an unpaused session', 'controls',
+                       ('test_word_session_replay.py', '--mutation', 'swallow-cursor-error'), r'^FAIL: cursor read failure',
+                       r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

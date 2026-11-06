@@ -398,8 +398,12 @@ void PruneUnreferencedPackFiles(const wqn::WqnWordPackManifest& current)
 
     for (const auto mode : kPersistedSessionModes) {
         wqn::PersistedWordSession pinned_session;
-        if (wqn::LoadPersistedWordSession(mode, &pinned_session) == ESP_OK &&
-            pinned_session.active) {
+        const esp_err_t loaded = wqn::LoadPersistedWordSession(mode, &pinned_session);
+        if (loaded != ESP_OK && loaded != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(kTag, "session pins unavailable; skip word pack prune");
+            return;
+        }
+        if (loaded == ESP_OK && pinned_session.active) {
             for (const auto& snapshot : pinned_session.remote.snapshot) {
                 const std::string sha256 = snapshot.sha256;
                 if (sha256.size() >= kPackHashStemChars) {

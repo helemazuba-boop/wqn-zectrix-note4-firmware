@@ -1131,7 +1131,7 @@ esp_err_t ClearWordSessionCursorNvs(const char* key)
 
 esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found)
 {
-    if (found == nullptr || record == nullptr) {
+    if (found == nullptr || record == nullptr || key == nullptr || size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
     *found = false;
@@ -1150,15 +1150,15 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
     }
     ESP_RETURN_ON_ERROR(result, kTag, "measure word session cursor");
     if (stored_size != size) {
-        // A size change means a different schema generation of the cursor
-        // record. Treat it as absent rather than as corrupt: the legacy
-        // .cur file below is a better source than a half-shaped NVS value.
-        ESP_LOGW(kTag, "word session cursor size %u != %u, ignoring", (unsigned)stored_size,
+        // Present unknown bytes are not absence. A stale legacy cursor cannot
+        // establish the disposition of a newer/corrupt NVS value.
+        ESP_LOGW(kTag, "word session cursor size %u != %u, preserving", (unsigned)stored_size,
                  (unsigned)size);
-        return ESP_OK;
+        return ESP_ERR_INVALID_SIZE;
     }
     ESP_RETURN_ON_ERROR(
         nvs_get_blob(nvs.handle, key, record, &stored_size), kTag, "read word session cursor");
+    if (stored_size != size) return ESP_ERR_INVALID_SIZE;
     *found = true;
     return ESP_OK;
 }
@@ -1882,6 +1882,82 @@ esp_err_t ResetWordSessionScope()
 uint32_t GetDeckScopeGeneration()
 {
     return g_deck_scope_generation.load(std::memory_order_acquire);
+}
+
+esp_err_t InspectWordRecoveryNvsOnStorageOwner(WordRecoveryNvsSnapshot* snapshot)
+{
+    if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
+    *snapshot = {};
+    if (!services::IsStorageServiceTask()) {
+        snapshot->error = ESP_ERR_INVALID_STATE;
+        return snapshot->error;
+    }
+    snapshot->cached_scope_generation_before = GetDeckScopeGeneration();
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READONLY, &nvs.handle);
+    snapshot->namespace_error = result;
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        snapshot->namespace_error = snapshot->scope_error = snapshot->pending_marker_error = ESP_OK;
+        for (auto& cursor : snapshot->cursors) cursor.error = ESP_OK;
+        result = ESP_OK;
+    } else if (result == ESP_OK) {
+        snapshot->namespace_found = true;
+        // Flash-backed NVS writes into internal-stack scratch only, even when
+        // the caller's POD output lives in PSRAM.
+        uint64_t scope = 0;
+        snapshot->scope_error = nvs_get_u64(nvs.handle, kDeckScopeGenKey, &scope);
+        if (snapshot->scope_error == ESP_OK) {
+            snapshot->scope_found = true;
+            snapshot->committed_scope_generation = scope;  // Preserve all 64 bits.
+        } else if (snapshot->scope_error == ESP_ERR_NVS_NOT_FOUND) {
+            snapshot->scope_error = ESP_OK;
+        }
+        if (snapshot->scope_error != ESP_OK) result = snapshot->scope_error;
+        size_t pending_size = 0;
+        snapshot->pending_marker_error = nvs_get_str(nvs.handle, kDeckScopeMarkerKey, nullptr, &pending_size);
+        if (snapshot->pending_marker_error == ESP_OK) {
+            snapshot->pending_marker_found = true;
+            snapshot->pending_marker_bytes = pending_size;
+        } else if (snapshot->pending_marker_error == ESP_ERR_NVS_NOT_FOUND) {
+            snapshot->pending_marker_error = ESP_OK;
+        }
+        if (result == ESP_OK && snapshot->pending_marker_error != ESP_OK) result = snapshot->pending_marker_error;
+        constexpr const char* keys[] = {"cur_seq", "cur_rnd", "cur_dic", "cur_rev", "cur_int", "cur_shf", "cur_mis"};
+        static_assert(sizeof(keys) / sizeof(keys[0]) == 7);
+        for (size_t i = 0; i < snapshot->cursors.size(); ++i) {
+            auto& cursor = snapshot->cursors[i];
+            size_t measured = 0;
+            cursor.error = nvs_get_blob(nvs.handle, keys[i], nullptr, &measured);
+            if (cursor.error == ESP_ERR_NVS_NOT_FOUND) {
+                cursor.error = ESP_OK;
+                continue;
+            }
+            if (cursor.error == ESP_OK) {
+                cursor.found = true;
+                cursor.stored_bytes = measured;
+                if (measured > cursor.bytes.size()) {
+                    cursor.error = ESP_ERR_INVALID_SIZE;
+                } else {
+                    std::array<uint8_t, 64> raw{};
+                    size_t copied = measured;
+                    cursor.error = nvs_get_blob(nvs.handle, keys[i], raw.data(), &copied);
+                    if (cursor.error == ESP_OK && copied != measured) cursor.error = ESP_ERR_INVALID_SIZE;
+                    if (cursor.error == ESP_OK) {
+                        std::memcpy(cursor.bytes.data(), raw.data(), copied);
+                        cursor.copied_bytes = copied;
+                    }
+                }
+            }
+            if (result == ESP_OK && cursor.error != ESP_OK) result = cursor.error;
+        }
+    }
+    snapshot->cached_scope_generation_after = GetDeckScopeGeneration();
+    if (result == ESP_OK && snapshot->cached_scope_generation_before != snapshot->cached_scope_generation_after) {
+        result = ESP_ERR_INVALID_STATE;
+    }
+    snapshot->error = result;
+    snapshot->read_complete = result == ESP_OK;
+    return result;
 }
 
 std::string AutoSyncIntervalLabel(uint32_t minutes)

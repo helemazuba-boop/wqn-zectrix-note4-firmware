@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -35,6 +36,8 @@ esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t s
 // `*found` stays false and the result stays ESP_OK when no cursor is stored --
 // that is the "this mode is unused / not migrated yet" case, not an error. The
 // caller then falls back to the legacy .cur file. found must not be null.
+// A present value with the wrong size/type or an I/O failure is an error;
+// it must not be used as permission to fall back to stale legacy state.
 esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found);
 // [word-session-cursor-nvs] Erase one mode's cursor. ClearSessionTransaction
 // needs this because it used to unlink .cur/.ctp/.cbk, and once the value moved
@@ -42,6 +45,38 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
 // orphan blob behind (4 entries of the 504-entry budget, §五之十). NOT_FOUND is
 // success: clearing a mode that never had a cursor is the normal case.
 esp_err_t ClearWordSessionCursorNvs(const char* key);
+
+// Fixed current Word modes: sequential/random/dictionary/review/intake/shuffle/mistakes.
+// Read-only observations, not decoded pause values or a complete NVS backup.
+struct WordRecoveryCursorBytes {
+    esp_err_t error = ESP_FAIL;
+    bool found = false;  // false proves absence only when error == ESP_OK.
+    size_t stored_bytes = 0;
+    size_t copied_bytes = 0;
+    std::array<uint8_t, 64> bytes{};
+};
+
+struct WordRecoveryNvsSnapshot {
+    esp_err_t error = ESP_FAIL;
+    esp_err_t namespace_error = ESP_FAIL;
+    bool namespace_found = false;
+    bool read_complete = false;
+    esp_err_t scope_error = ESP_FAIL;
+    bool scope_found = false;
+    uint64_t committed_scope_generation = 0;
+    uint32_t cached_scope_generation_before = 0;
+    uint32_t cached_scope_generation_after = 0;
+    esp_err_t pending_marker_error = ESP_FAIL;
+    bool pending_marker_found = false;
+    size_t pending_marker_bytes = 0;  // Includes the string terminator.
+    std::array<WordRecoveryCursorBytes, 7> cursors{};
+};
+
+// Must run on StorageService's internal-stack owner in the caller's transaction.
+// Copies <=64 raw bytes per known key; larger/typed/I/O failures remain explicit.
+// Does not initialize NVS, migrate cursors, read credentials, or establish a
+// maintenance freeze, filesystem snapshot, device identity or repair permission.
+esp_err_t InspectWordRecoveryNvsOnStorageOwner(WordRecoveryNvsSnapshot* snapshot);
 
 struct DeviceControlState {
     uint64_t config_revision = 0;

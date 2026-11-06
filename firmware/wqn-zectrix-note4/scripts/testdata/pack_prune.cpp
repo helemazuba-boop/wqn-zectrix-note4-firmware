@@ -104,13 +104,17 @@ static void JsonFree(void* pointer)
 
 // Persisted Word sessions are a controlled port; the prune/hash matching is real.
 static std::string pinned_sha;
+static esp_err_t session_load_error = ESP_OK, local_retention_error = ESP_OK;
 namespace wqn {
+struct LocalDescriptorRetention { std::vector<std::string> pinned_sha256; };
+static int CollectRetainedLocalSnapshots(LocalDescriptorRetention*) { return local_retention_error; }
 struct PersistedWordSession {
     bool active = false;
     struct { std::vector<protocol::word_study_v1::PackSnapshot> snapshot; } remote;
 };
 static int LoadPersistedWordSession(protocol::word_study_v1::Mode, PersistedWordSession* session)
 {
+    if (session_load_error != ESP_OK) return session_load_error;
     if (pinned_sha.empty()) return ESP_ERR_NOT_FOUND;
     session->active = true;
     protocol::word_study_v1::PackSnapshot snapshot; snapshot.sha256 = pinned_sha;
@@ -215,6 +219,7 @@ static void Reset(const std::string& base, unsigned domain)
     backup_file = nullptr; backup_opens = 0; json_allocs = 0;
     fault = Fault::kNone; fail_json_at = -1; count_json = false; removals.clear(); pinned_sha.clear();
     encode_mode = false; fail_once = false; json_failures = 0; write_opens = 0;
+    session_load_error = local_retention_error = ESP_OK;
 }
 static void SeedPacks(unsigned domain)
 {
@@ -403,6 +408,11 @@ int main(int argc, char** argv)
         if (std::strcmp(argv[2], "all") == 0 || std::strcmp(argv[2], domains[domain]) == 0) {
             TestDomain(argv[1], domain);
             TestEncoding(argv[1], domain);
+            if (domain == 2) for (esp_err_t error : {ESP_FAIL, ESP_ERR_INVALID_SIZE}) {
+                Reset(argv[1], domain); SeedPacks(domain); session_load_error = error;
+                std::fprintf(stderr, "session-pin-read-failure: error=%d\n", error);
+                Prune(domain); CheckSurvivors(domain, true); CHECK(removals.empty());
+            }
         }
     }
     CHECK(live_json == 0);
