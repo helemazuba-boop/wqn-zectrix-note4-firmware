@@ -68,7 +68,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--before', help='compile the client from a git revision')
     parser.add_argument('--mutation', choices=('no-deadline','ignore-waiting','failed-reply-clears',
-                                               'ignore-reply-session','unvalidated-progress'))
+                                               'ignore-reply-session','unvalidated-progress','wire-unbounded-budget'))
     args = parser.parse_args()
     code = (subprocess.check_output(['git', 'show', f'{args.before}:firmware/wqn-zectrix-note4/main/opencode_client.cpp'],
                                    cwd=root, text=True) if args.before else (root/'main/opencode_client.cpp').read_text())
@@ -94,13 +94,16 @@ def main():
             'ignore-reply-session': ('owner == pending_owner', '(owner == pending_owner || true)'),
             'unvalidated-progress': ('if (DispatchAgentEvent(event_name, event_data, request.callback, request.callback_ctx, &event))',
                                      'if (DispatchAgentEvent(event_name, event_data, request.callback, request.callback_ctx, &event) || true)'),
+            'wire-unbounded-budget': ('kAgentStreamIdleTimeoutMs * 1000LL',
+                                      'kAgentStreamIdleTimeoutMs * 1000000000LL'),
         }
         needle, replacement = mutations[args.mutation]
-        target = code if args.mutation == 'unvalidated-progress' else policy
+        client_mutation = args.mutation in ('unvalidated-progress', 'wire-unbounded-budget')
+        target = code if client_mutation else policy
         if target.count(needle) != 1:
             raise SystemExit('FAIL: Agent progress mutation boundary drift')
         target = target.replace(needle,replacement)
-        if args.mutation == 'unvalidated-progress': code = target
+        if client_mutation: code = target
         else: policy = target
     cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5'))/'components/json/cJSON'
     macros = []

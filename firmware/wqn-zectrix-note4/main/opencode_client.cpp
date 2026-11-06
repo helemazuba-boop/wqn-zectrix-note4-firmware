@@ -136,6 +136,12 @@ constexpr char kTag[] = "wqn_opencode_api";
 // -ESP_ERR_HTTP_EAGAIN once a second so the loop can poll the flag; real data
 // still arrives long before the window closes, so no bytes are lost.
 constexpr int kAgentStreamIdleReadTimeoutMs = 1000;
+// [net-watchdog] The relay emits a keepalive comment roughly every 14 s
+// (seven 2 s poll ticks), so 60 s of silence is four missed heartbeats. Before
+// this byte-level bound was added, liveness depended on business progress or
+// a terminal/socket event. Keep this independent from the first-event/progress
+// deadlines: waiting for a user reply pauses business time, not wire health.
+constexpr int64_t kAgentStreamIdleTimeoutMs = 60000;
 
 std::string AgentUrl(const char* path)
 {
@@ -500,6 +506,7 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
     // device records it as a failed run). Waiting for `idle` after an `error`
     // left the device reading a stream the gateway had already finished.
     bool terminal_seen = false;
+    int64_t last_rx_us = esp_timer_get_time();
     while (request_result == ESP_OK && !terminal_seen) {
         if (request.interrupt_requested != nullptr &&
             request.interrupt_requested->load(std::memory_order_acquire)) {
@@ -559,9 +566,26 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         }
         const int count = esp_http_client_read(client, buffer.data(), buffer.size());
         if (count == -ESP_ERR_HTTP_EAGAIN) {
-            // The idle window closed with no bytes: a quiet stream, not a
-            // transport failure. Loop so the interrupt flag is re-checked;
-            // the next window picks up whatever arrives.
+            // Input can arrive while the SDK read blocks. Let the loop's
+            // explicit cancel/switch handling run before reporting wire loss.
+            if ((request.interrupt_requested != nullptr &&
+                 request.interrupt_requested->load(std::memory_order_acquire)) ||
+                (request.switch_requested != nullptr &&
+                 request.switch_requested->load(std::memory_order_acquire))) {
+                continue;
+            }
+            // The idle window closed with no bytes: either a quiet stream or a
+            // black-holed socket. The keepalive cadence is what separates them,
+            // so only a run of missed heartbeats is treated as a failure.
+            if (esp_timer_get_time() - last_rx_us >
+                kAgentStreamIdleTimeoutMs * 1000LL) {
+                SetResultError(request.result, request.result->http_status,
+                               "stream_stalled", "Agent stream idle for too long");
+                request_result = ESP_FAIL;
+                break;
+            }
+            // Loop so the interrupt flag is re-checked; the next window picks
+            // up whatever arrives.
             continue;
         }
         if (count < 0) {
@@ -571,6 +595,7 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         if (count == 0) {
             break;
         }
+        last_rx_us = esp_timer_get_time();
         if (!parser.feed(buffer.data(), static_cast<size_t>(count))) {
             // A frame past the device's JSON budget cannot be parsed even when
             // complete, so this is a broken stream rather than a dropped frame.

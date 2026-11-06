@@ -1858,6 +1858,9 @@ std::string AgentStreamFailureMessage(const wqn::OpenCodeResult& result)
     if (result.error_code == "network_lost") {
         return "网络已断开，任务可能还在云端跑，可重新进入查看";
     }
+    if (result.error_code == "stream_stalled") {
+        return "连接中断，任务可能还在云端跑，可重新进入查看";
+    }
     return result.detail.empty() ? "连接失败，请重试" : result.detail;
 }
 

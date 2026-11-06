@@ -110,6 +110,9 @@ def cases():
     result.append(Case('word_offline_dispatch-force-network', 'Offline words: reject network demand for cached controls', 'controls',
                        ('test_word_offline_dispatch.py', '--mutation', 'force-network'), r'^FAIL:',
                        r'Offline word dispatch: \d+ checks, [1-9]\d* failures \(NOT HIL\)'))
+    result.append(Case('agent-wire-unbounded-budget', 'Agent: wire health remains bounded while business progress waits', 'controls',
+                       ('test_agent_run_progress.py', '--mutation', 'wire-unbounded-budget'), r'^FAIL ',
+                       r'Agent stream/client: \d+ checks, [1-9]\d* failures;'))
     for mutation in ('ignore-nvs-size', 'truncate-size', 'write-open'):
         result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
                            ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',

@@ -148,6 +148,17 @@ void Event(int64_t at, const std::string& name, const std::string& json = "{}")
 {
     packets.push_back({at, "event: " + name + "\ndata: " + json + "\n\n"});
 }
+// Healthy gateway streams emit comments while tools or user prompts wait.
+// Keep the old business-progress tests alive on the wire without treating
+// those comments as business progress. Silent-wire cases below omit this.
+void HealthyKeepalives()
+{
+    for (int64_t at = 14000; at <= 7200000; at += 14000)
+        packets.push_back({at, ": keepalive\n\n"});
+    std::stable_sort(packets.begin(), packets.end(),
+                     [](const Packet& a, const Packet& b) { return a.at < b.at; });
+    scenario.max_reads = 10000;
+}
 void ActionAt(int64_t at, std::function<void()> run) { actions.push_back({at, std::move(run)}); }
 void Callback(const wqn::OpenCodeEvent& event, void*) { delivered.push_back(event); }
 void ReplyFailed(const wqn::OpenCodeOutboundReply&, esp_err_t, void*) { ++failed_replies; }
@@ -260,11 +271,13 @@ int main()
     Event(250000, "agent.text.delta", "{\"delta\":\"working\"}");
     Event(500000, "agent.reasoning.delta", "{\"delta\":\"still working\"}");
     Event(750000, "agent.status", "{\"status\":\"idle\"}");
+    HealthyKeepalives();
     Check(Run(&result) == ESP_OK && clock_ms == 750000, "validated business progress renews idle budget");
     OneRunOnly();
     Reset();
     Event(1000, "agent.accepted");
     Event(10000, "agent.tool", "{\"tool\":\"test\",\"call_id\":\"c1\",\"status\":\"running\",\"preview\":\"started\"}");
+    HealthyKeepalives();
     Check(Run(&result) == ESP_ERR_TIMEOUT && result.error_code == "run_progress_timeout", "stalled run after real work detaches with unknown outcome");
     Check(clock_ms >= 10000 + progress_ms && clock_ms <= 11000 + progress_ms, "progress timeout uses last business update");
     OneRunOnly();
@@ -272,6 +285,7 @@ int main()
     Question(1000);
     ActionAt(1800000, [] { Reply(true, "q1"); });
     Event(1802000, "agent.status", "{\"status\":\"idle\"}");
+    HealthyKeepalives();
     Check(Run(&result) == ESP_OK && clock_ms == 1802000, "waiting for user can exceed progress deadline");
     Check(reply_posts == 1 && reply_url.find("/ses_child/question") != std::string::npos && peak_clients == 2,
           "accepted subagent reply is session-bound and uses existing short reply lane");
@@ -281,6 +295,7 @@ int main()
     ActionAt(1000000, [] { Reply(false, "p1"); });
     ActionAt(2000000, [] { Reply(true, "q1"); });
     Event(2002000, "agent.status", "{\"status\":\"idle\"}");
+    HealthyKeepalives();
     Check(Run(&result) == ESP_OK && clock_ms == 2002000, "permission reply does not expire a deferred question");
     Check(reply_posts == 2, "both pending ask identities are answered");
     OneRunOnly();
@@ -288,6 +303,7 @@ int main()
     Permission(1000); Question(2000); Question(3000, "q_unshown");
     ActionAt(1000000, [] { Reply(false, "p1"); });
     ActionAt(2000000, [] { Reply(true, "q1"); });
+    HealthyKeepalives();
     Check(Run(&result) == ESP_ERR_TIMEOUT && result.error_code == "run_progress_timeout",
           "unshown third ask cannot replace the answerable deferred question");
     Check(clock_ms >= 2000000 + progress_ms && clock_ms <= 2001000 + progress_ms,
@@ -296,6 +312,7 @@ int main()
     Reset();
     Question(1000); Permission(2000);
     ActionAt(1000000, [] { Reply(false, "p1"); });
+    HealthyKeepalives();
     Check(Run(&result) == ESP_ERR_TIMEOUT && result.error_code == "run_progress_timeout",
           "permission supersedes an obsolete question exactly like UI policy");
     Check(clock_ms >= 1000000 + progress_ms && clock_ms <= 1001000 + progress_ms,
@@ -306,6 +323,7 @@ int main()
     scenario.reply_failures = 1;
     ActionAt(500000, [] { Reply(true, "q1"); });
     ActionAt(1000000, [] { Reply(true, "q1"); });
+    HealthyKeepalives();
     Check(Run(&result) == ESP_ERR_TIMEOUT && result.error_code == "run_progress_timeout", "successful reply resumes bounded progress wait");
     Check(failed_replies == 1 && reply_posts == 2 && clock_ms >= 1000000 + progress_ms && clock_ms <= 1001000 + progress_ms,
           "failed reply preserves waiting; successful retry starts a fresh progress budget");
@@ -314,6 +332,7 @@ int main()
     Question(1000);
     ActionAt(500000, [] { Reply(true, "q1", "ses_wrong"); });
     ActionAt(1000000, [] { switch_requested = true; });
+    HealthyKeepalives();
     Check(Run(&result) == ESP_OK && switch_delivered && clock_ms == 1000000,
           "mismatched reply cannot disarm waiting for the actual ask");
     Check(interrupts == 0, "detaching waiting stream does not stop cloud execution");
@@ -321,10 +340,12 @@ int main()
     Question(1000);
     ActionAt(500000, [] { Reply(true, "q_old_step"); });
     ActionAt(1000000, [] { switch_requested = true; });
+    HealthyKeepalives();
     Check(Run(&result) == ESP_OK && switch_delivered && clock_ms == 1000000,
           "stale question-step reply cannot clear current question identity");
     Reset();
     Event(7200000, "agent.status", "{\"status\":\"idle\"}");
+    HealthyKeepalives();
     Check(Run(&result, true) == ESP_OK && clock_ms == 7200000 && run_posts == 0,
           "intentional GET observation has no new run progress deadline");
     Reset();
@@ -349,6 +370,32 @@ int main()
     scenario.fail_timeout_config = true;
     Check(Run(&result) != ESP_OK && scenario.reads == 0, "failed short-read configuration does not enter unbounded read");
     OneRunOnly();
+    Reset();
+    Event(1000, "agent.accepted");
+    Check(Run(&result) == ESP_FAIL && result.error_code == "stream_stalled",
+          "wire silence after acceptance is bounded before the business deadline");
+    Check(clock_ms > 61000 && clock_ms <= 63000, "wire deadline uses last received byte");
+    OneRunOnly();
+    Reset();
+    Question(1000);
+    Check(Run(&result) == ESP_FAIL && result.error_code == "stream_stalled" && reply_posts == 0,
+          "waiting for a user does not hide a black-holed wire");
+    OneRunOnly();
+    Reset();
+    Check(Run(&result, true) == ESP_FAIL && result.error_code == "stream_stalled" && run_posts == 0,
+          "GET observation has wire health even without a submitted-run deadline");
+    Check(closes == 1 && cleanups == 1 && live_clients == 0, "silent observer releases its client");
+    Reset();
+    Question(1000);
+    ActionAt(62000, [] { cancel_requested = true; });
+    Check(Run(&result) == ESP_OK && cancel_delivered && interrupts == 1,
+          "cancel arriving in the final read wins over the wire deadline");
+    Check(cleanups == 1 && live_clients == 0 && run_posts == 1, "wire-boundary cancel cleans without replay");
+    Reset();
+    Question(1000);
+    ActionAt(62000, [] { switch_requested = true; });
+    Check(Run(&result) == ESP_OK && switch_delivered && interrupts == 0,
+          "view switch arriving in the final read wins without interrupting cloud work");
     // Fault every cJSON builder allocation; failed construction must not reach
     // esp_http_client_init even if the missing field was only request_id.
     cJSON_Hooks hooks{Allocate, std::free};

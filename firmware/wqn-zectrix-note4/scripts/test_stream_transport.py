@@ -78,9 +78,9 @@ void HostLog(const char*, const char*, ...) __attribute__((format(printf, 2, 3))
 #define ESP_LOGE(tag, ...) HostLog(tag, __VA_ARGS__)
 ''',
     'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
-    # The stream checks the connectivity service directly; the host build has
-    # no netif, so it is stubbed as permanently online.
-    'services/connectivity_service.h': '#pragma once\nnamespace wqn { namespace services {\ninline bool IsConnectivityOnline() { return true; }\n} }\n',
+    'services/connectivity_service.h': '''#pragma once
+namespace wqn::services { bool IsConnectivityOnline(); }
+''',
     'esp_mac.h': '''#pragma once
 #include <cstdint>
 #include "esp_err.h"
@@ -133,7 +133,7 @@ def main():
     parser.add_argument('--mutation', choices=('http-sticky', 'ws-sticky', 'ws-continue',
                         'reset-sticky', 'no-deadline', 'renew-budget', 'no-data-deadline',
                         'late-terminal', 'early-status', 'fixed-host', 'json-advertised',
-                        'json-cumulative', 'control-cap', 'control-deferred'))
+                        'json-cumulative', 'control-cap', 'control-deferred', 'ignore-network'))
     parser.add_argument('--before', help='Use production sources from a git revision')
     parser.add_argument('--unit', choices=('http', 'ws', 'buffered'), help='run a single transport suite')
     parser.add_argument('--validate-pages', action='store_true', help='check generated pages with Python jsonschema')
@@ -183,6 +183,7 @@ def main():
         'no-data-deadline': ('!CheckDeadline(ctx) || ctx->fatal', 'ctx->fatal'),
         'late-terminal': ('if (ctx->terminal_event_seen) {\n          break;', 'if (false) {\n          break;'),
         'early-status': ('CaptureHttpStatus(ctx, evt->client);', '/* status ignored in buffered body */'),
+        'ignore-network': ('if (!wqn::services::IsConnectivityOnline()) {', 'if (false) {'),
     }
     if args.mutation in mutations:
         needle, replacement = mutations[args.mutation]
