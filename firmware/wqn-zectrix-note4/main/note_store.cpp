@@ -894,25 +894,6 @@ void ReconcileSession(
         if (session->remote.session_id != observation.session_id) {
             continue;
         }
-        // [last-viewed-pin] Replay opened actions into the pinned last-viewed
-        // label regardless of cursor progress: the observation commit hot path
-        // does not rewrite the session snapshot, so after a reboot the pins
-        // only exist in these outbox records until a checkpoint persists them.
-        if (observation.action ==
-            static_cast<uint8_t>(wqn::protocol::note_study_v1::ObservationAction::kOpened)) {
-            for (auto& item : session->remote.items) {
-                if (std::strcmp(item.item_id, observation.item_id) != 0) continue;
-                if (std::strcmp(item.last_opened_at, observation.occurred_at) != 0) {
-                    std::snprintf(
-                        item.last_opened_at,
-                        sizeof(item.last_opened_at),
-                        "%s",
-                        observation.occurred_at);
-                    *changed = true;
-                }
-                break;
-            }
-        }
         if (observation.sequence < session->remote.next_sequence) {
             continue;
         }
@@ -924,6 +905,47 @@ void ReconcileSession(
     }
 }
 
+
+// [last-viewed-pin] ACK/pending/suspended are lifecycle partitions, not time
+// order. Restore each item's latest retained opened fact by sequence across
+// ALL partitions, once. This also avoids treating an intermediate older pin
+// as a session mutation when the final snapshot was already checkpointed.
+void ReconcileSessionFromOutbox(
+    const OutboxScan& scan,
+    wqn::PersistedNoteSession* session,
+    bool* changed)
+{
+    if (session == nullptr || changed == nullptr) return;
+    ReconcileSession(scan.acknowledged, session, changed);
+    ReconcileSession(scan.pending, session, changed);
+    ReconcileSession(scan.suspended, session, changed);
+    for (auto& item : session->remote.items) {
+        const OutboxRecord* latest = nullptr;
+        const auto consider = [&](const auto& records) {
+            for (const OutboxRecord& record : records) {
+                if (record.action != static_cast<uint8_t>(
+                        wqn::protocol::note_study_v1::ObservationAction::kOpened) ||
+                    session->remote.session_id != record.session_id ||
+                    std::strcmp(item.item_id, record.item_id) != 0) {
+                    continue;
+                }
+                if (latest == nullptr || record.sequence > latest->sequence) {
+                    latest = &record;
+                }
+            }
+        };
+        consider(scan.acknowledged);
+        consider(scan.pending);
+        consider(scan.suspended);
+        if (latest != nullptr &&
+            std::strcmp(item.last_opened_at, latest->occurred_at) != 0) {
+            std::snprintf(item.last_opened_at, sizeof(item.last_opened_at),
+                          "%s", latest->occurred_at);
+            *changed = true;
+        }
+    }
+}
+
 esp_err_t CheckpointSessionFromOutbox(const OutboxScan& scan)
 {
     wqn::PersistedNoteSession session;
@@ -931,9 +953,7 @@ esp_err_t CheckpointSessionFromOutbox(const OutboxScan& scan)
     if (load_result == ESP_ERR_NOT_FOUND) return ESP_OK;
     ESP_RETURN_ON_ERROR(load_result, kTag, "load session for outbox checkpoint");
     bool changed = false;
-    ReconcileSession(scan.acknowledged, &session, &changed);
-    ReconcileSession(scan.pending, &session, &changed);
-    ReconcileSession(scan.suspended, &session, &changed);
+    ReconcileSessionFromOutbox(scan, &session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(
             SaveSessionRaw(session), kTag, "checkpoint session before outbox compaction");
@@ -971,9 +991,7 @@ esp_err_t LoadSessionTransaction(void* opaque)
     OutboxScan* scan = nullptr;
     ESP_RETURN_ON_ERROR(EnsureOutboxCache(&scan), kTag, "load note outbox");
     bool changed = false;
-    ReconcileSession(scan->acknowledged, session, &changed);
-    ReconcileSession(scan->pending, session, &changed);
-    ReconcileSession(scan->suspended, session, &changed);
+    ReconcileSessionFromOutbox(*scan, session, &changed);
     if (changed) {
         ESP_RETURN_ON_ERROR(SaveSessionRaw(*session), kTag, "repair note session cursor");
     }

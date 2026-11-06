@@ -36,6 +36,8 @@ def build_oracle(domain, directory, crc_object):
     if word:
         code += '\n' + native.function(source, 'bool SetSessionCursorOrdinal(')
     code += '\n' + native.function(source, 'void ReconcileSession(')
+    if not word:
+        code += '\n' + native.function(source, 'void ReconcileSessionFromOutbox(')
     extra, declarations = '', ''
     if word:
         local = (ROOT/'main/word_local_session.cpp').read_text()
@@ -215,6 +217,22 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(result['state'],'requires_last_opened_pin_checkpoint')
         self.assertEqual(result['candidate']['next_sequence'],20)
         self.assertEqual(result['candidate'].get('last_opened_pin_update',{}).get('after'),'2026-11-05T00:00:00Z')
+
+    def test_note_latest_pin_is_independent_of_ack_pending_suspend_partition(self):
+        result=json.loads(subprocess.check_output([str(self.native/'note/checkpoint-oracle'),'replay-sets'],
+            text=True,timeout=10))
+        self.assertEqual(result['next_sequence'],10)
+        self.assertEqual(result['last_opened_at'],'2026-11-05T00:00:03Z')
+
+    def test_note_latest_pin_uses_sequence_when_device_clock_moves_backwards(self):
+        result=json.loads(subprocess.check_output([str(self.native/'note/checkpoint-oracle'),'replay-sets'],
+            text=True,timeout=10))
+        self.assertEqual(result['reversed_clock_pin'],'2026-11-05T00:00:00Z')
+
+    def test_note_checkpointed_snapshot_does_not_rewrite_for_intermediate_old_pins(self):
+        result=json.loads(subprocess.check_output([str(self.native/'note/checkpoint-oracle'),'replay-sets'],
+            text=True,timeout=10))
+        self.assertFalse(result['second_changed'])
 
     def test_legacy_pause_does_not_attest_current_nvs(self):
         cursor=(self.native/'word/checkpoint-cursor.bin').read_bytes()

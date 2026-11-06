@@ -73,6 +73,36 @@ Session GoodSession() {
 }
 
 int main(int argc, char** argv) {
+#if !WORD
+    if (argc == 2 && std::strcmp(argv[1], "replay-sets") == 0) {
+        auto session = GoodSession();
+        OutboxRecord old{}, newest{}, parked{};
+        for (auto* record : {&old, &newest, &parked}) {
+            std::snprintf(record->session_id, sizeof(record->session_id), "%s", kSessionId);
+            std::snprintf(record->item_id, sizeof(record->item_id), "%s", session.remote.items[0].item_id);
+            record->next_position = 17;
+        }
+        old.sequence = 7; parked.sequence = 8; newest.sequence = 9;
+        std::snprintf(old.occurred_at, sizeof(old.occurred_at), "2026-11-05T00:00:01Z");
+        std::snprintf(parked.occurred_at, sizeof(parked.occurred_at), "2026-11-05T00:00:02Z");
+        std::snprintf(newest.occurred_at, sizeof(newest.occurred_at), "2026-11-05T00:00:03Z");
+        OutboxScan scan;
+        scan.acknowledged.push_back(old); scan.pending.push_back(newest); scan.suspended.push_back(parked);
+        bool changed = false;
+        ReconcileSessionFromOutbox(scan, &session, &changed);
+        const std::string first_pin = session.remote.items[0].last_opened_at;
+        changed = false;
+        ReconcileSessionFromOutbox(scan, &session, &changed);
+        const bool second_changed = changed;
+        std::snprintf(scan.pending[0].occurred_at, sizeof(scan.pending[0].occurred_at), "2026-11-05T00:00:00Z");
+        auto reversed_clock = GoodSession();
+        ReconcileSessionFromOutbox(scan, &reversed_clock, &changed);
+        std::printf("{\"last_opened_at\":\"%s\",\"next_sequence\":%llu,\"second_changed\":%s,\"reversed_clock_pin\":\"%s\"}\n",
+            first_pin.c_str(), static_cast<unsigned long long>(session.remote.next_sequence),
+            second_changed ? "true" : "false", reversed_clock.remote.items[0].last_opened_at);
+        return 0;
+    }
+#endif
     if (argc >= 3) {
         Session session;
         int error = LoadSessionFile(argv[2], &session@@LOAD_SCOPE@@);
@@ -130,7 +160,13 @@ int main(int argc, char** argv) {
     record.next_phase = 1;
 #endif
     std::vector<OutboxRecord, wqn::@@DOMAIN@@StorePsramAllocator<OutboxRecord>> records{record};
-    bool changed = false; ReconcileSession(records, &good, &changed);
+    bool changed = false;
+#if WORD
+    ReconcileSession(records, &good, &changed);
+#else
+    OutboxScan scan; scan.pending = records;
+    ReconcileSessionFromOutbox(scan, &good, &changed);
+#endif
     std::printf("{\"position\":%u,\"next_sequence\":%llu,\"changed\":%s",
         good.position, static_cast<unsigned long long>(good.remote.next_sequence), changed ? "true" : "false");
 #if !WORD
