@@ -303,6 +303,68 @@ legacy 迁移写失败时继续使用已核对的 legacy 内存值，源文件�
 读写模式。这个入口尚未接到设备维护态导出通道；导出身份、冻结/传输、scope/pack
 一致性及真机验收仍需实现或验证，既有候选的 NVS/身份安装前提保持未满足。
 
+### Deck scope 恢复证据保全补丁（2026-11-06，待审查与 HIL）
+
+原来的 `RecoverDeckScopeTransaction` 把 NVS u64 generation 直接转成 u32；
+marker 只用 C-string/宽松数字解析和 UUID 长度检查，异常 marker 会被删除并返回
+成功。源码级故障端口复现了截断、异常字段清理/重放、提前发布缓存，以及同
+generation 下 marker 与已提交 deck 冲突仍被覆盖的情况。最终保全专项在旧源码上
+为 167 项、32 个行为失败；不是 32 个独立设备故障。
+
+补丁拒绝超过 u32 的 committed generation，区分缺失与存在但为空的 marker；
+NVS 字符串只读到内部栈上的最多 48 B 缓冲，检查两次长度、末尾 NUL 和嵌入 NUL，
+不按外部长度分配。数字按逐位 u32 边界解析，deck 检查完整 UUID 形状；请求入口
+使用同一 UUID 规则。无效、未知、类型/I/O 错误均保留原值并返回错误，缓存只在
+无 marker 或合法恢复完成后发布。同 generation 意味着 deck 已先保存，故恢复前
+还要核对已提交 deck，冲突不能作为新切换重放。
+
+合法的 marker-first 写入顺序、四种 session 清理、deck/generation 保存、顺序游标
+归零、marker 最后清除仍沿用原协议。生产函数加 NVS 端口的 171 项检查涵盖其
+14 个 session/staging/commit 边界的前后故障与重启回放；最大 48 B marker、
+u32 上界、回绕、all-decks 及大小写 UUID 均有正例。session 删除仍为端口，不能
+据此证明真实 SPIFFS/NVS、逐文件删除、任务竞争或物理断电安全。
+
+`InitStorage` 已将恢复错误向上传出，`app_main` 的现有分支进入存储恢复模式；
+这是源码调用路径证据，未在设备上验证。此补丁改变存储恢复决策，按 `AGENTS.md`
+§7 要求，提交前仍需审查和设备 HIL，当前保留为独立工作树的未提交补丁。它不提供
+维护态导出、设备身份、候选安装或自动处置未知元数据的权限。
+
+### 运行时 scope 就绪与尾部重试（2026-11-06，待审查与 HIL）
+
+启动保全之外，手动 default-deck 切换失败 ACK 原先会清 worker op-id，但没有自动
+修复的 `must_complete` 阻塞义务；磁盘 generation 可能已改变，缓存却仍是旧值。
+单靠 generation 相等不能授权旧 session 的写入。新的切换也原先直接写 marker，
+可能覆盖尚未恢复的原标记。生产函数加主机端口已复现这些控制路径。
+
+新增原子 `IsWordDeckScopeReady()`，默认关闭，启动核验成功才开启。新切换先关闭
+并验证 NVS generation、marker 和完整 default-deck 字符串；先完成已有合法尾部，
+同一目标的重试复用原意图，不重写 marker。不同目标等旧尾部完成后再写新 marker，
+两段之间不对业务重新放行。失败一直保持关闭，即使已完成持久化但返回错误，
+直到显式重试或启动重新核验；该布尔值不是持久化事务标识，不能据此宣称一般的
+exactly-once。无 marker 时也不把非法 default-deck 原文降级成 all-decks。
+
+session load/save、游标、单条/批量 observation、descriptor 发布/回收与 pin 证明
+在 storage owner 上检查就绪。未知 scope 返回错误而不是 NOT_FOUND；outbox GC
+明确延期，已知独立 ACK 仍可持久化。合法尾部清理通过 owner 专属、RAII 有界的
+清理例外执行，不临时把业务就绪设为 true。临时 scope reset 和顺序游标写入也不能
+跨过一个未完成的 default-deck 切换。此处未重新设计临时 reset 自身的断电协议。
+
+UI 另保留 `default_deck_manual_pending`：提交前布置，已接受的失败和重试间隙不
+清除，只有匹配的成功 ACK 完成词库/session/界面状态安装后释放。已在 flight 的
+Confirm 不替换 op-id；重试提交被拒绝时仍保留原来的恢复义务。新作用域的业务
+即使观察到 storage 就绪，也要等 UI 安装完成，不依赖 worker busy 的瞬时状态。
+失败提示明确为切换未完成，通知用户在设置中重试，不宣称失败意味着没有写入。
+
+当前主机专项为 NVS/tail 245、session 回放 204、游标保护 43、auto/manual 状态机
+102 项；完整生产 Word store 与 local-session C++ 加 libc 文件测试 96 项，实际
+session/descriptor 文件和 NVS 游标端口在拒绝操作后逐字节不变。补充三类语义
+负例；完整门禁为 93 项。原生候选的主机就绪函数只是编解码 oracle 的端口，不能
+作为目标设备就绪证明；候选仍缺 NVS/身份/维护态安装前提，始终不授权写回。
+
+SDK 构建和上述主机检查不能证明任务竞争、真实 NVS/SPIFFS、断电或设备 HWM。
+恢复函数入口帧为 224 B，切换事务 176 B，专用读取 helper 112 B，均为静态入口帧。
+本批与启动保全补丁一起保留在独立工作树，按 `AGENTS.md` §7 等待审查与 HIL 后提交。
+
 接下来按以下顺序推进完整维修流程：
 
 1. 用已核验的设备导出身份和真实凭证联调现有对账工具；补齐设备来源证明及时间精度

@@ -321,6 +321,10 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
             return RefreshSchedule::kConfig;
         }
         if (short_press && event.button == wqn::ButtonId::kConfirm) {
+            if (settings.word_deck_save_op_id != 0) {
+                settings.notice = "正在保存，请稍后切换";
+                return RefreshSchedule::kConfig;
+            }
             const bool word_observations_busy =
                 wqn::HasBufferedWordObservations(state->word_app) ||
                 state->word_app.session.commit_state ==
@@ -360,11 +364,14 @@ static RefreshSchedule ReduceSettingsButtonEvent(const wqn::ButtonEvent& event, 
                 settings.pending_word_deck_id = option.deck_id;
                 settings.pending_word_deck_title = option.title;
                 settings.word_deck_pending_valid = true;
+                const bool previous_manual_pending = state->word_app.default_deck_manual_pending;
+                state->word_app.default_deck_manual_pending = true;
                 const uint32_t op_id = SubmitDefaultDeckChange(option.deck_id);
                 if (op_id != 0) {
                     settings.word_deck_save_op_id = op_id;
                     settings.notice = "正在保存…";
                 } else {
+                    state->word_app.default_deck_manual_pending = previous_manual_pending;
                     settings.word_deck_save_op_id = 0;
                     settings.notice =
                         IsPersistKindBusy(PersistKind::kSettingsDefaultDeck)

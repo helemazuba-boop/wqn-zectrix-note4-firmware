@@ -64,14 +64,17 @@ struct WordState {
     bool buffered=false;
     bool cloud_sync_failed=false;
     struct { bool has_manifest=true,pack_error=false; } pack_index;
-    std::string default_deck_id,default_deck_title;
+    std::string default_deck_id,default_deck_title,message;
     std::vector<WordDeckInfo> deck_catalog;
     DefaultDeckRepairState default_deck_repair;
+    bool default_deck_manual_pending=false;
     bool default_deck_missing=false,scope_reset_pending_valid=false;
     uint32_t scope_reset_save_op_id=0;
 };
 using WordAppState=WordState;
 uint32_t GetDeckScopeGeneration() { return 1; }
+bool scope_ready=true;
+bool IsWordDeckScopeReady() { return scope_ready; }
 @@DECK_REPAIR_MACHINE@@
 struct NoteState { struct { NoteObservationCommitState commit_state=NoteObservationCommitState::kIdle; } session; };
 struct ProblemState { ProblemVerdictCommitState commit_state=ProblemVerdictCommitState::kIdle; };
@@ -474,6 +477,27 @@ int main(int argc,char** argv) {
     CHECK(state.word_app.default_deck_repair.op_id==submit_id);
     runtime.DispatchDefaultDeckChangeResult(ESP_OK,submit_id);
     CHECK(!state.word_app.default_deck_repair.must_complete&&state.word_app.default_deck_id.empty());
+    state=wqn::UiState{};submit_id=170;
+    state.word_app.deck_catalog={{"live","真实词库"}};
+    OpenSettingsDialog(&state,Dialog::kDefaultWordDeck);s.word_deck_selected=1;
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(s.word_deck_save_op_id==170&&state.word_app.default_deck_manual_pending);
+    const auto accepted_choice=s.pending_word_deck_id;const int accepted_submits=submits;
+    s.dialog=Dialog::kDefaultWordDeck;s.word_deck_selected=0;
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(submits==accepted_submits&&s.word_deck_save_op_id==170&&s.pending_word_deck_id==accepted_choice);
+    runtime.DispatchDefaultDeckChangeResult(ESP_OK,171);
+    CHECK(s.word_deck_save_op_id==170&&state.word_app.default_deck_manual_pending);
+    runtime.DispatchDefaultDeckChangeResult(ESP_FAIL,170);
+    CHECK(s.word_deck_save_op_id==0&&state.word_app.default_deck_manual_pending&&wqn::DefaultDeckRepairBlocking(state.word_app));
+    submit_id=0;s.dialog=Dialog::kDefaultWordDeck;
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(state.word_app.default_deck_manual_pending&&s.word_deck_pending_valid);
+    submit_id=172;s.dialog=Dialog::kDefaultWordDeck;
+    event(state,Button::kConfirm,Event::kShortPress);
+    CHECK(state.word_app.default_deck_manual_pending&&s.word_deck_save_op_id==172);
+    runtime.DispatchDefaultDeckChangeResult(ESP_OK,172);
+    CHECK(!state.word_app.default_deck_manual_pending&&!wqn::DefaultDeckRepairBlocking(state.word_app));
     state=wqn::UiState{};submit_id=71;
 #if CONFIG_WQN_DEV_MENU_ENABLE
     s.view=wqn::SettingsView::kDev;s.dev_selected=wqn::kDevRowDevInfo;
@@ -504,7 +528,7 @@ int main(int argc,char** argv) {
         event(state,Button::kConfirm,Event::kShortPress);CHECK(submits==saved_submits+1);CHECK(s.auto_sync_interval_min==30&&s.volume_percent==75&&s.auto_follow);
         const auto ack=[&](int result,uint32_t id){switch(dialog){case Dialog::kAutoSync:runtime.DispatchAutoSyncSaveResult(result,id);break;case Dialog::kVolume:runtime.DispatchVolumeSaveResult(result,id);break;case Dialog::kImageRendering:runtime.DispatchImageRenderSaveResult(result,id);break;case Dialog::kAiFollow:runtime.DispatchAiFollowSaveResult(result,id);break;default:runtime.DispatchDefaultDeckChangeResult(result,id);}};
         event(state,Button::kConfirm,Event::kShortPress);CHECK(submits==saved_submits+1);
-        ack(ESP_OK,submit_id+1);CHECK(s.notice=="正在保存，请稍候");ack(ESP_FAIL,submit_id);CHECK(s.notice.find("保存")!=std::string::npos);
+        ack(ESP_OK,submit_id+1);CHECK(s.notice=="正在保存，请稍候");ack(ESP_FAIL,submit_id);CHECK(s.notice.find(dialog==Dialog::kDefaultWordDeck?"切换未完成":"保存")!=std::string::npos);
         OpenSettingsDialog(&state,dialog);event(state,Button::kConfirm,Event::kShortPress);ack(ESP_OK,submit_id);
         CHECK(!s.auto_sync_pending_valid&&!s.volume_pending_valid&&!s.image_render_pending_valid&&!s.auto_follow_pending_valid&&!s.word_deck_pending_valid);
         if(dialog==Dialog::kAutoSync) CHECK(s.auto_sync_interval_min==0);

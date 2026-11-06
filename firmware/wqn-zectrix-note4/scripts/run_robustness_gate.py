@@ -49,6 +49,9 @@ def cases():
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
         ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
         ('word_cursor_guards', 'R-08 ongoing: pause source validation, migration and explicit read errors', ()),
+        ('word_deck_scope_tail', 'R-08/R-18: preserve unknown scope metadata and replay only valid interrupted changes', ()),
+        ('word_scope_autorepair', 'R-08: storage readiness and accepted manual/auto scope obligations', ()),
+        ('word_local_descriptor', 'R-08: full native session/descriptor file preservation when scope is unresolved', ()),
         ('word_session_replay', 'R-08 ongoing: checkpoint replay and terminal cursor read failures', ()),
         ('pack_prune', 'R-08: unknown session pins preserve current and rollback packs', ()),
         ('sync_journal', 'N-06: opaque checkpoints and decode allocation faults', ()),
@@ -108,6 +111,14 @@ def cases():
                            r'Storage maintenance NVS: \d+ checks, [1-9]\d* failures \(host ports; NOT HIL\)'))
     result.append(Case('word-cursor-swallow-error', 'R-08: failed cursor cannot restore an unpaused session', 'controls',
                        ('test_word_session_replay.py', '--mutation', 'swallow-cursor-error'), r'^FAIL: cursor read failure',
+                       r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))
+    for mutation in ('truncate-generation', 'erase-invalid-marker', 'accept-invalid-uuid', 'publish-unverified-cache',
+                     'skip-prior-tail', 'reopen-after-failure'):
+        result.append(Case(f'deck-scope-{mutation}', 'R-08/R-18: unknown scope evidence cannot authorize destructive replay', 'controls',
+                           ('test_word_deck_scope_tail.py', '--mutation', mutation), r'^FAIL scope-recovery:',
+                           r'Deck scope recovery: \d+ checks, [1-9]\d* failures \(host NVS ports; NOT HIL\)'))
+    result.append(Case('word-ignore-scope-fence', 'R-08: unresolved scope cannot authorize journal/session/GC changes', 'controls',
+                       ('test_word_session_replay.py', '--mutation', 'ignore-scope-fence'), r'^FAIL: unready scope',
                        r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),

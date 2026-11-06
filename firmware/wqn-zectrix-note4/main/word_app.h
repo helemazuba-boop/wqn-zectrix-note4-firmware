@@ -312,6 +312,9 @@ struct WordAppState {
     // A boot/unloaded catalog (authoritative=false) leaves it false, so boot
     // never deletes NVS.
     bool default_deck_missing = false;
+    // Manual accepted switch owns the scope through durable result installation,
+    // including a failed ACK and the retry gap (independent of worker busy).
+    bool default_deck_manual_pending = false;
     // [deck-autorepair] The independent auto-repair intent (see above).
     DefaultDeckRepairState default_deck_repair;
 

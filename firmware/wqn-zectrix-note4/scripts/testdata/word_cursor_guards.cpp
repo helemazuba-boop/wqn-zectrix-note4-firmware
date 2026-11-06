@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 
 using esp_err_t = int;
 constexpr esp_err_t ESP_OK = 0;
@@ -63,6 +64,9 @@ struct FakeNvs {
 namespace wqn {
 uint32_t scope_generation = 42;
 uint32_t GetDeckScopeGeneration() { return scope_generation; }
+bool scope_ready=true, cleanup_authorized=false;
+bool IsWordDeckScopeReady() { return scope_ready; }
+bool IsDeckScopeCleanupOnStorageOwner() { return cleanup_authorized; }
 struct PersistedWordSession {
     struct Remote { Mode mode = Mode::kReview; std::string session_id; } remote;
     uint32_t deck_scope_generation = 42;
@@ -91,6 +95,7 @@ void Check(bool condition, const char* name) {
     condition ? ++passes : ++failures;
 }
 void Reset() {
+    wqn::scope_ready=true; wqn::cleanup_authorized=false;
     fake = {};
     for (const auto& name : session_names) std::remove(name.c_str());
     for (const auto& name : cursor_names) std::remove(name.c_str());
@@ -238,6 +243,20 @@ int main(int argc, char** argv) {
     Reset(); session.remote.mode = Mode::kReview; fake.save_error = ESP_FAIL;
     Check(WriteSessionCursor(session) == ESP_FAIL && fake.saves == 1,
           "cursor write failure propagates");
+    Reset(); session.deck_scope_generation=wqn::scope_generation; wqn::scope_ready=false;
+    Check(WriteSessionCursor(session)==ESP_ERR_INVALID_STATE && fake.saves==0,
+          "unready scope refuses cursor write despite matching cached generation");
+    Reset(); Legacy(Record()); wqn::scope_ready=false;
+    ClearSessionContext blocked={Mode::kReview};
+    const auto generation_before_block=g_session_mutation_generation;
+    Check(ClearSessionTransaction(&blocked)==ESP_ERR_INVALID_STATE && fake.clears==0 &&
+          g_session_mutation_generation==generation_before_block &&
+          ::access(cursor_names[0].c_str(),F_OK)==0,
+          "unready scope refuses unowned session clear and preserves legacy bytes");
+    Reset(); Legacy(Record()); wqn::scope_ready=false; wqn::cleanup_authorized=true;
+    Check(ClearSessionTransaction(&blocked)==ESP_OK && fake.clears==1 &&
+          ::access(cursor_names[0].c_str(),F_OK)!=0,
+          "validated owner tail alone can clear sessions while scope is fenced");
     Reset();
     std::printf("%d PASS / %d FAIL (host I/O mocks; NOT physical power-loss or migration HIL)\n", passes, failures);
     return failures ? 1 : 0;

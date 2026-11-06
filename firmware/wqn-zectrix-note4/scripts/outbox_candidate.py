@@ -98,7 +98,7 @@ class Driver:
         unit = native_template()
         replacements = {'@@HEADER@@': '#include "'+header.name+'"', '@@CONSTANTS@@': '\n'.join(constants),
             '@@RECORDS@@': records, '@@FUNCTIONS@@': '\n'.join(functions), '@@DOMAIN@@': 'Word' if word else 'Note',
-            '@@DECLARATIONS@@': 'namespace wqn { uint32_t GetDeckScopeGeneration(){return 0;} }' if word else '',
+            '@@DECLARATIONS@@': 'namespace wqn { uint32_t GetDeckScopeGeneration(){return 0;} bool IsWordDeckScopeReady(){return true;} }' if word else '',
             '@@LOAD_SCOPE@@': ', false' if word else ''}
         for marker, value in replacements.items():
             if marker not in unit:

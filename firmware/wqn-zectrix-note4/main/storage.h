@@ -218,6 +218,11 @@ esp_err_t RecoverDefaultDeckScopeChange();
 // rejected on load when it no longer matches (second line of defense behind
 // the marker protocol). Atomic; safe from any task.
 uint32_t GetDeckScopeGeneration();
+// False during an unresolved default-deck transaction or failed metadata read.
+// Generation equality alone does not authorize session use while this is false.
+bool IsWordDeckScopeReady();
+// Narrow exception for session cleanup within a validated storage-owner tail.
+bool IsDeckScopeCleanupOnStorageOwner();
 // [word-scope-reset] Drops every word session after a word-page scope switch
 // that does not change the default deck: commits a new scope generation first
 // (making existing session files inert), then removes the four session files and

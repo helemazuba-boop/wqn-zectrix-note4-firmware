@@ -105,6 +105,8 @@ struct WordPackIndex {
 #include "esp_err.h"
 namespace wqn {
 uint32_t GetDeckScopeGeneration();
+bool IsWordDeckScopeReady();
+bool IsDeckScopeCleanupOnStorageOwner();
 esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size);
 esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found);
 esp_err_t ClearWordSessionCursorNvs(const char* key);

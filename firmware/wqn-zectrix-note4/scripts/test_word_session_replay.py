@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path,
                         default=root / 'main/word_study_store.cpp')
-    parser.add_argument('--mutation', choices=('disable-interaction-gate', 'gate-forced-repair', 'swallow-cursor-error'))
+    parser.add_argument('--mutation', choices=('disable-interaction-gate', 'gate-forced-repair', 'swallow-cursor-error', 'ignore-scope-fence'))
     args = parser.parse_args()
     compiler = shutil.which('g++')
     if compiler is None:
@@ -46,6 +46,11 @@ def main():
         if source.count(needle) != 1:
             raise SystemExit('FAIL: cursor error mutation boundary drift')
         source = source.replace(needle, '(void)cursor_error;')
+    elif args.mutation == 'ignore-scope-fence':
+        needle = '!wqn::IsWordDeckScopeReady()'
+        if source.count(needle) < 10:
+            raise SystemExit('FAIL: scope fence mutation boundary drift')
+        source = source.replace(needle, 'false')
     header = (root / 'main/word_study_store.h').read_text(encoding='utf-8')
     pieces = {
         '@@MAINTENANCE_GATE@@': section(header, 'struct WordOutboxMaintenanceGate {',

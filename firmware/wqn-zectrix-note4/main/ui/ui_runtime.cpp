@@ -810,6 +810,7 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
         settings.notice = settings.pending_word_deck_id.empty()
             ? "默认词库：全部词库"
             : "默认词库：" + settings.pending_word_deck_title;
+        state_.word_app.default_deck_manual_pending = false;
         settings.pending_word_deck_id.clear();
         settings.pending_word_deck_title.clear();
         settings.word_deck_pending_valid = false;
@@ -822,7 +823,9 @@ UiUpdate UiRuntime::DispatchDefaultDeckChangeResult(
         // re-open preselects the intended deck and re-Confirm retries. If the
         // transaction died mid-way, the NVS marker makes boot recovery replay
         // it -- the UI never shows a half-switched state.
-        settings.notice = "默认词库未保存，请重试";
+        settings.notice = "词库切换未完成，请重试";
+        if (!wqn::IsWordDeckScopeReady())
+            state_.word_app.message = "词库切换未完成，请在设置中重试";
         ESP_LOGW(kTag, "deck change failed: %s", esp_err_to_name(result));
     }
     const RefreshSchedule refresh = state_.screen == wqn::UiScreen::kSettings
