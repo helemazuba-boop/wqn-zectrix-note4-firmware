@@ -457,7 +457,9 @@ bool ValidateLocalRegistration(const LocalSessionRegistrationRequest& r)
         return false;
     }
     if (r.scope.deck_ids.empty() || r.scope.deck_ids.size() > kMaxDecks ||
-        !r.scope.include_mastered) {
+        !((r.mode == Mode::kSequential && r.scope.include_mastered) ||
+          (r.mode == Mode::kShuffle && !r.scope.include_mastered)) ||
+        r.progress_revision > v3::kMaxSafeJsonInteger) {
         return false;
     }
     std::vector<std::string> decks = r.scope.deck_ids;
@@ -1071,6 +1073,83 @@ esp_err_t ParseManifestResponse(
     return ESP_OK;
 }
 
+esp_err_t BuildEligibilityRequest(const EligibilityRequest& request, std::string* body)
+{
+    if (body == nullptr || request.snapshot.empty() || request.snapshot.size() > kMaxDecks)
+        return ESP_ERR_INVALID_ARG;
+    JsonDocument doc(cJSON_CreateObject());
+    if (doc.root() == nullptr)
+        return ESP_ERR_NO_MEM;
+    auto result = AddLocalSessionMetadata(doc.root(), request.metadata);
+    if (result != ESP_OK)
+        return result;
+    cJSON* pins = cJSON_AddArrayToObject(doc.root(), "snapshot");
+    if (pins == nullptr)
+        return ESP_ERR_NO_MEM;
+    std::vector<std::string> ids;
+    for (const auto& pin : request.snapshot)
+    {
+        if (!IsUuid(pin.deck_id) || !IsSha256(pin.sha256) || pin.pack_revision < 1 ||
+            pin.pack_revision > v3::kMaxSafeJsonInteger ||
+            pin.content_revision > v3::kMaxSafeJsonInteger ||
+            std::find(ids.begin(), ids.end(), pin.deck_id) != ids.end())
+            return ESP_ERR_INVALID_ARG;
+        ids.push_back(pin.deck_id);
+        cJSON* value = cJSON_CreateObject();
+        if (value == nullptr)
+            return ESP_ERR_NO_MEM;
+        if (cJSON_AddStringToObject(value, "deck_id", pin.deck_id.c_str()) == nullptr ||
+            cJSON_AddStringToObject(value, "sha256", pin.sha256.c_str()) == nullptr ||
+            cJSON_AddNumberToObject(value, "pack_revision",
+                                    static_cast<double>(pin.pack_revision)) == nullptr ||
+            cJSON_AddNumberToObject(value, "content_revision",
+                                    static_cast<double>(pin.content_revision)) == nullptr)
+        {
+            cJSON_Delete(value);
+            return ESP_ERR_NO_MEM;
+        }
+        if (!cJSON_AddItemToArray(pins, value))
+        {
+            cJSON_Delete(value);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    char* rendered = cJSON_PrintUnformatted(doc.root());
+    if (!rendered)
+        return ESP_ERR_NO_MEM;
+    *body = rendered;
+    cJSON_free(rendered);
+    return body->size() <= 16U * 1024U ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+esp_err_t ParseEligibilityResponse(const std::string& body, const std::string& request_id,
+                                   EligibilityData* data, v3::Error* error)
+{
+    if (data == nullptr || error == nullptr)
+        return ESP_ERR_INVALID_ARG;
+    *data = {};
+    if (body.size() > 16U * 1024U)
+        return ESP_ERR_INVALID_SIZE;
+    JsonDocument doc(body);
+    cJSON* payload = nullptr;
+    auto result = ParseEnvelope(doc.root(), request_id, &payload, error);
+    if (result != ESP_OK)
+        return result;
+    if (!HasExactlyKeys(payload, {"progress_revision", "item_ids_sha256", "mastered_bitmap"}))
+        return ESP_ERR_INVALID_RESPONSE;
+    EligibilityData parsed;
+    parsed.item_ids_sha256 = StringField(payload, "item_ids_sha256");
+    parsed.mastered_bitmap = StringField(payload, "mastered_bitmap");
+    if (!U64Field(payload, "progress_revision", &parsed.progress_revision) ||
+        !IsSha256(parsed.item_ids_sha256) || parsed.mastered_bitmap.empty() ||
+        parsed.mastered_bitmap.size() > 10000 ||
+        !std::all_of(parsed.mastered_bitmap.begin(), parsed.mastered_bitmap.end(),
+                     [](char c) { return c == '0' || c == '1'; }))
+        return ESP_ERR_INVALID_RESPONSE;
+    *data = std::move(parsed);
+    return ESP_OK;
+}
+
 esp_err_t BuildLocalSessionRegistrationRequest(
     const LocalSessionRegistrationRequest& request,
     std::string* body)
@@ -1086,10 +1165,14 @@ esp_err_t BuildLocalSessionRegistrationRequest(
             document.root(), "session_id", request.session_id.c_str()) == nullptr) {
         return ESP_ERR_NO_MEM;
     }
+    // Preserve byte/semantic compatibility for legacy sequential registrations.
+    if (request.mode == Mode::kShuffle &&
+        (cJSON_AddStringToObject(document.root(),"mode","shuffle")==nullptr ||
+         cJSON_AddNumberToObject(document.root(),"progress_revision",static_cast<double>(request.progress_revision))==nullptr)) return ESP_ERR_NO_MEM;
     cJSON* scope = cJSON_AddObjectToObject(document.root(), "scope");
     cJSON* deck_ids = scope != nullptr ? cJSON_AddArrayToObject(scope, "deck_ids") : nullptr;
     if (scope == nullptr || deck_ids == nullptr ||
-        cJSON_AddBoolToObject(scope, "include_mastered", true) == nullptr) {
+        cJSON_AddBoolToObject(scope, "include_mastered", request.scope.include_mastered) == nullptr) {
         return ESP_ERR_NO_MEM;
     }
     for (const std::string& id : request.scope.deck_ids) {

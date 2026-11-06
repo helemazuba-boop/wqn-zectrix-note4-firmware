@@ -171,6 +171,25 @@ int main()
           "build-batch-ok");
     std::printf("BUILD_BATCH %s\n", batch_body.c_str());
 
+    auto shuffle=reg;
+    shuffle.mode=word::Mode::kShuffle;shuffle.scope.include_mastered=false;shuffle.progress_revision=41;
+    std::string shuffled_body;
+    Check(word::BuildLocalSessionRegistrationRequest(shuffle,&shuffled_body)==ESP_OK,"build-shuffle-preserves-mode");
+    std::printf("BUILD_SHUFFLE %s\n",shuffled_body.c_str());
+    word::EligibilityRequest eligibility;eligibility.metadata=reg.metadata;eligibility.snapshot=reg.snapshot;
+    std::string eligibility_body;
+    Check(word::BuildEligibilityRequest(eligibility,&eligibility_body)==ESP_OK,"build-complete-eligibility-request");
+    std::printf("BUILD_ELIGIBILITY %s\n",eligibility_body.c_str());
+    word::EligibilityData data;v3::Error eligibility_error;
+    auto bitmap=Envelope("{\"progress_revision\":41,\"item_ids_sha256\":\""+std::string(64,'a')+"\",\"mastered_bitmap\":\"01\"}",kReqId);
+    Check(word::ParseEligibilityResponse(bitmap,kReqId,&data,&eligibility_error)==ESP_OK && data.mastered_bitmap=="01" && data.progress_revision==41,"parse-complete-eligibility");
+    Check(word::ParseEligibilityResponse(bitmap,kBatchReqId,&data,&eligibility_error)!=ESP_OK,"reject-foreign-eligibility-request-id");
+    Check(word::ParseEligibilityResponse(Envelope("{\"progress_revision\":41,\"item_ids_sha256\":\""+std::string(64,'a')+"\",\"mastered_bitmap\":\"01x\"}",kReqId),kReqId,&data,&eligibility_error)!=ESP_OK,"reject-invalid-eligibility-bit");
+    auto bad_shuffle=shuffle;bad_shuffle.mode=word::Mode::kReview;
+    ExpectBuildFail([&](auto* b){return word::BuildLocalSessionRegistrationRequest(bad_shuffle,b);},"reject-unsupported-local-review-mode");
+    bad_shuffle=shuffle;bad_shuffle.scope.include_mastered=true;
+    ExpectBuildFail([&](auto* b){return word::BuildLocalSessionRegistrationRequest(bad_shuffle,b);},"reject-shuffle-mastered-semantic-drift");
+
     // The registration request must NOT carry server-fixed semantics fields.
     {
         cJSON* root = cJSON_Parse(reg_body.c_str());

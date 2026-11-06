@@ -81,6 +81,10 @@ def main():
         for line in proc.stdout.splitlines():
             if line.startswith('BUILD_REGISTER '):
                 built['register'] = line[len('BUILD_REGISTER '):]
+            elif line.startswith('BUILD_SHUFFLE '):
+                built['shuffle'] = line[len('BUILD_SHUFFLE '):]
+            elif line.startswith('BUILD_ELIGIBILITY '):
+                built['eligibility'] = line[len('BUILD_ELIGIBILITY '):]
             elif line.startswith('BUILD_BATCH '):
                 built['batch'] = line[len('BUILD_BATCH '):]
             elif line.startswith('CASE '):
@@ -132,8 +136,19 @@ def main():
             raise SystemExit('FAIL: built batch request != golden fixture')
         print('2 built requests are value-identical to the golden fixtures')
 
+        for kind, name, definition in [
+            ('shuffle', 'local-session-shuffle-request.json', 'localSessionRequest'),
+            ('eligibility', 'eligibility-request.json', 'eligibilityRequest'),
+        ]:
+            payload=json.loads(built[kind])
+            validate(payload,definition)
+            if payload != json.loads((fixtures/name).read_text()):
+                raise SystemExit('FAIL: '+kind+' differs from its golden fixture')
+        print('shuffle and eligibility requests match pinned Schema and golden fixtures')
+
         # ---- Validate the golden response fixtures against the schema ----
         responses = {
+            'eligibility-response.json': 'eligibilityResponse',
             'local-session-response.json': 'localSessionResponse',
             'observation-batch-response.json': 'observationBatchResponse',
             'observation-batch-partial-response.json': 'observationBatchResponse',

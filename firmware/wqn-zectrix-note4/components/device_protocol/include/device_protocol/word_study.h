@@ -259,17 +259,17 @@ esp_err_t ParseManifestResponse(
 
 // === Long-sequence local sessions ===
 //
-// The server fixes domain/mode/purpose/ordering/candidate_policy_version to
-// word/sequential/study/sequential/sequential_v1 for local sessions. The wire
-// schema forbids extra properties, so the device MUST NOT send those legacy
-// session fields here. Reuse the existing Scope / PackSnapshot / SessionItem
-// protocol types so allocator and API shape stay identical to the rest of the
-// component.
+// Legacy requests omit mode and retain sequential semantics and fingerprints.
+// Shuffle explicitly declares mode + frozen progress_revision; the server derives
+// its pure_random_v1 ordering. Offline is a transport capability, never a Mode.
+// Existing Scope / PackSnapshot / SessionItem types remain the shared wire types.
 
 struct LocalSessionRegistrationRequest {
     v3::RequestMetadata metadata;
+    Mode mode = Mode::kSequential;      // sequential or shuffle, never an offline mode
+    uint64_t progress_revision = 0;     // frozen eligibility revision for shuffle
     std::string session_id;             // device-generated stable UUID
-    Scope scope;                        // deck_ids 1..32 unique, include_mastered=true
+    Scope scope;                        // 1..32 decks; sequential=true, shuffle=false
     std::string seed;                   // 1..64 URL-safe
     uint64_t start_index = 0;           // 0..kMaxLocalStartIndex
     std::vector<PackSnapshot> snapshot; // 1..32, exact deck set == scope
@@ -317,6 +317,19 @@ struct ObservationBatchData {
     bool has_failure = false;                 // false == JSON null
     BatchFailure failure;                     // valid only when has_failure
 };
+
+struct EligibilityRequest {
+    v3::RequestMetadata metadata;
+    std::vector<PackSnapshot> snapshot;
+};
+struct EligibilityData {
+    uint64_t progress_revision = 0;
+    std::string item_ids_sha256;
+    std::string mastered_bitmap;
+};
+esp_err_t BuildEligibilityRequest(const EligibilityRequest& request, std::string* body);
+esp_err_t ParseEligibilityResponse(const std::string& body, const std::string& request_id,
+    EligibilityData* data, v3::Error* error);
 
 esp_err_t BuildLocalSessionRegistrationRequest(
     const LocalSessionRegistrationRequest& request,

@@ -163,6 +163,8 @@ std::vector<Case> Cases()
         {"word-candidate", "word-study-v1", "candidatePageRequest", [=](auto* b) { return word::BuildCandidatePageRequest(wp, b); }},
         {"word-manifest", "word-study-v1", "manifestRequest", [=](auto* b) { return word::BuildManifestRequest(m, 123, 100, b); }},
         {"word-local-session", "word-study-v1", "localSessionRequest", [=](auto* b) { return word::BuildLocalSessionRegistrationRequest(wl, b); }},
+        {"word-shuffle-session", "word-study-v1", "localSessionRequest", [=](auto* b) { auto r=wl;r.mode=word::Mode::kShuffle;r.scope.include_mastered=false;r.progress_revision=41;return word::BuildLocalSessionRegistrationRequest(r,b); }},
+        {"word-eligibility", "word-study-v1", "eligibilityRequest", [=](auto* b) { word::EligibilityRequest r;r.metadata=wl.metadata;r.snapshot=wl.snapshot;return word::BuildEligibilityRequest(r,b); }},
         {"word-observation-batch", "word-study-v1", "observationBatchRequest", [=](auto* b) { return word::BuildObservationBatchRequest(wb, b); }},
         {"note-session", "note-study-v1", "createSessionRequest", [=](auto* b) { return note::BuildCreateSessionRequest(nc, b); }},
         {"note-observation", "note-study-v1", "observationRequest", [=](auto* b) { return note::BuildObservationRequest(no, b); }},

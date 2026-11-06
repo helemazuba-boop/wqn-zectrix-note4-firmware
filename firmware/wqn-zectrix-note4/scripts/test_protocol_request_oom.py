@@ -36,6 +36,9 @@ def validate_word_fixtures(source, schema, checker):
         # contract). Classify every new wire fixture explicitly here so the
         # inventory assertion below stays a real guard.
         'local-session-request.json': 'localSessionRequest',
+        'local-session-shuffle-request.json': 'localSessionRequest',
+        'eligibility-request.json': 'eligibilityRequest',
+        'eligibility-response.json': 'eligibilityResponse',
         'local-session-response.json': 'localSessionResponse',
         'observation-batch-request.json': 'observationBatchRequest',
         'observation-batch-response.json': 'observationBatchResponse',
