@@ -147,7 +147,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/STORAGE_RECOVERY_20261105.md` — boot recovery diagnostics,
   physically confirmed reset intent and remaining storage/device acceptance.
 - `docs/engineering/OUTBOX_RECOVERY_20261105.md` — ongoing R-08 offline raw
-  preservation, native CRC inspection and remaining reconciliation/repair work.
+  preservation, native CRC inspection, pinned receipt collection/review plans,
+  and remaining controlled repair/device work.
 - `docs/engineering/WIFI_CONNECTIVITY_REPAIR.md` — provisioning and network
   switching repair record.
 

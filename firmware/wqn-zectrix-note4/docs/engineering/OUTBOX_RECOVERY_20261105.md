@@ -1,7 +1,7 @@
 # R-08：原始记录保全与维修流程（进行中）
 
-R-08 尚未关闭。本批增加离线原始文件保全、当前 Word/Note 日志解码和证据包验证；
-后续还要完成按 actor/session/request 对账、明确维修计划、设备端受控交付及失败回滚。
+R-08 尚未关闭。本地已增加离线原始保全、Word/Note 解码、设备认证回执对账与
+审查计划工具；后续还要完成真实介质身份核验、受控候选验证/交付、失败回滚和 HIL。
 保全工具不会修改设备、数据库或源文件，也不会生成、安装或授权“修复后”日志。
 
 ## 已确认的维修边界
@@ -16,7 +16,7 @@ request-id，也不能把它当作可信身份。跳过坏 ACK 会复活已确�
 也有实际语义，不能用非空旧备份擅自覆盖。
 
 云端已有 session `next_sequence` 和 observation 行。现新增独立的只读回执入口，
-本地实现与协议见下文；尚未部署或接入保全包对账工具。web session 查询属于 web actor；
+本地实现与协议见下文；尚未部署或完成真实设备联调。web session 查询属于 web actor；
 设备维修需要核对 user/device/domain 归属。服务端序号不能单独证明某条记录的接收情况，或恢复本地 next-position /
 next-phase / suspend 原因。证据不足时保留并停止，不能推测出“无损”修复结果。
 
@@ -98,7 +98,7 @@ identity、未来版本、源文件变化、读取/写入/fsync 失败、不完�
 四个语义负例分别改用错误 CRC 参数、信任未重算的报告、将新 Word 容量降回 1000、
 忽略动态描述文件；要求完成测试且只有行为
 断言失败，不能把编译错误、异常、sanitizer 或超时当作成功检出。工具接入统一门禁，
-当前清单 65 项（30 运行时入口 / 10 UI / 25 负例）。
+当前清单 69 项（31 运行时入口 / 10 UI / 28 负例），新增对账客户端及三个语义负例。
 
 ## 设备认证的只读回执（2026-11-06，本地实现）
 
@@ -117,15 +117,72 @@ STABLE 函数不写事实、投影、session、设备元数据或控制幂等表
 `repair_authorized=false`，不会产生 ACK、skip、重放或维修指令。
 
 现有 Note `loadEquivalentAppliedObservation` 按序号等字段补偿，不比较原 request ID
-和 occurred_at，不能代替此逐请求证据。后续还须将已认证回执绑定原文 manifest、
-记录偏移/摘要和本地 checkpoint；完整维修、交付与 HIL 仍未完成。
+和 occurred_at，不能代替此逐请求证据。回执接口兼容 PostgreSQL/固件保留的 UUID
+文本，包括 `00000000-0000-0000-0000-000000000001` 用户和历史非 RFC variant 会话。
+
+## 保全包对账与审查计划（本地实现）
+
+使用安装了 `scripts/robustness-requirements.txt` 的 Python 环境。
+`scripts/outbox_reconcile.py` 提供以下入口，所有输出目录必须新建且位于输入包之外：
+
+```sh
+python scripts/outbox_reconcile.py collect \
+  --source-bundle /tmp/wqn-word-evidence --source-manifest-sha256 <独立固定的原文摘要> \
+  --endpoint https://wqn.helema.cn/api/esp32/v3/study/observations/receipts \
+  --device-token-file /tmp/device-token.txt \
+  --expected-user-id <用户UUID> --expected-device-id <设备UUID> \
+  --output /tmp/wqn-receipt-evidence
+python scripts/outbox_reconcile.py verify \
+  --source-bundle /tmp/wqn-word-evidence --source-manifest-sha256 <原文摘要> \
+  --evidence /tmp/wqn-receipt-evidence --evidence-manifest-sha256 <collect输出摘要>
+python scripts/outbox_reconcile.py plan \
+  --source-bundle /tmp/wqn-word-evidence --source-manifest-sha256 <原文摘要> \
+  --evidence /tmp/wqn-receipt-evidence --evidence-manifest-sha256 <回执摘要> \
+  --output /tmp/wqn-repair-review
+python scripts/outbox_reconcile.py verify-plan \
+  --source-bundle /tmp/wqn-word-evidence --source-manifest-sha256 <原文摘要> \
+  --evidence /tmp/wqn-receipt-evidence --evidence-manifest-sha256 <回执摘要> \
+  --plan /tmp/wqn-repair-review --plan-sha256 <plan输出摘要>
+```
+
+设备 token 是配对所得的 64 位小写十六进制凭证。token 只经私有 stdin 管道进入
+独立网络进程，不在命令参数、输出或证据包中保存；反射原文或转义 token 的响应也拒绝。
+默认只允许固定路径的 HTTPS，不跟随跳转；HTTP 只在显式
+`--allow-insecure-loopback-test` 下接受字面 `127.0.0.1` / `::1`，其证据标记为测试用途。
+网络子进程总期限覆盖 DNS/TLS/读取，默认每批 10 秒、网络查询总预算 300 秒，无自动重试。
+本地原文验证与写同步不计入网络预算。
+401、429、数据库/传输错误和畸形回执停止后续请求，未查询项继续登记为未知。
+返回码 2 表示已保全带缺口的证据，不能当成完整对账。
+
+工具重扫全部预算内原始记录，支持完整 7014 条事实，未受 manifest 的 256 条预览
+限制。每批原请求/响应、文件/偏移/记录 SHA、本地 checkpoint 与独立固定的源
+manifest 绑定。除了原 request ID，还比较 session、sequence、item、action、mode、
+occurred_at；时区按精确微秒比较，非零超微秒精度暂列 unresolved_timestamp。
+`next_sequence` 不用于补猜事实，ACK/suspend 不靠表面 ID 反推损坏角色。
+
+原文 actor 归属目前仍是操作方声明，不等于已验证的设备导出身份。各批回执来自各自
+快照，不构成全局原子快照；安装前必须维护态重新核验。离线验证重算原文索引、查询
+覆盖与全部判断，拒绝自行改写的 assessment；独立固定的摘要保护保留字节，不是
+可离线重新证明 TLS 来源的服务器签名。
+
+计划列出原生候选顺序和具体 `acknowledge_after_checkpoint` 提案，仅用于已匹配、
+未挂起且无本地字节版本冲突的 pending。已挂起/已 ACK 的事实保持原处置；未知坏块、
+原文预算不足、部分尾部与冲突继续保全。有效空 primary 不被旧备份覆盖，tmp 不晋升。
+每个提案绑定原记录 SHA/偏移和本地 checkpoint。计划始终
+`installation_ready=false`、`repair_authorized=false`，明确列出尚未完成的设备身份、
+原生 checkpoint、受控发布和显式维修授权前置条件。`verify-plan` 不能认可篡改的授权标记。
+
+27 个专项场景使用真实原生记录/枚举和本地 HTTP 故障服务器，取消会回收使用凭证的
+网络子进程；三个语义负例保护
+完整 payload 比较、suspend 意图和派生报告重算。真实设备导出、线上认证对账、
+受控发布与 HIL 仍未完成。
 
 接下来按以下顺序推进完整维修流程：
 
-1. 将新增的设备认证只读回执入口接入独立的保全包对账工具；核对 actor/domain/session
-   和原 request 字段，不通过推进序号、skip observation 或创建新会话来伪装修复。
-2. 将 manifest 摘要、原始记录身份、已核对的回执和可恢复字节绑定到显式维修计划；
-   对未知 observation/ACK/suspend、缺失 cursor 与冲突证据明确保留未解决状态。
+1. 用已核验的设备导出身份和真实凭证联调现有对账工具；补齐设备来源证明及时间精度
+   未解决项，不通过推进序号、skip observation 或创建新会话来伪装修复。
+2. 在审查计划基础上实现原生 session/cursor/descriptor 检查与受控候选；对未知
+   observation/ACK/suspend、缺失 cursor 与冲突证据保留未解决状态。
 3. 提供设备维护态的可靠导出/交付入口和 StorageService 事务，保留原始 bytes，
    先验证暂存候选，再按可重入的 intent 发布；重启、中断与失败均有明确回滚路径。
 4. 在可恢复测试介质上执行设备、SPIFFS/NVS、断电和序号对账验收，最后关闭 R-08。
