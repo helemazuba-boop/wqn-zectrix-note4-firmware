@@ -59,6 +59,8 @@ struct PersistedWordSession {
 template <typename T> using WordStorePsramAllocator = std::allocator<T>;
 uint32_t scope_generation = 7;
 uint32_t GetDeckScopeGeneration() { return scope_generation; }
+bool scope_ready=true;
+bool IsWordDeckScopeReady() { return scope_ready; }
 constexpr size_t kWordObservationOutboxCapacity = 1000;
 @@MAINTENANCE_GATE@@
 enum class OutboxSuspendReason : uint8_t { kProtocol = 1 };
@@ -97,6 +99,7 @@ Session disk[7];
 bool present[7] = {};
 OutboxScan journal, cache;
 bool cache_loaded = false, cursor_found = false, cursor_paused = false;
+esp_err_t cursor_read_error = ESP_OK;
 esp_err_t read_error = ESP_OK, scan_error = ESP_OK;
 esp_err_t save_error = ESP_OK, compact_error = ESP_OK;
 int reads = 0, scans = 0, saves = 0, compactions = 0, cursor_reads = 0;
@@ -219,8 +222,10 @@ esp_err_t CompactCachedOutbox(OutboxScan* scan) {
     journal = *scan;
     return ESP_OK;
 }
-bool ReadSessionCursorPaused(Mode, const std::string& session_id, bool* out) {
+bool ReadSessionCursorPaused(Mode, const std::string& session_id, bool* out, esp_err_t* error = nullptr) {
     ++cursor_reads;
+    if (error) *error = cursor_read_error;
+    if (cursor_read_error != ESP_OK) return false;
     if (!cursor_found || session_id != sid) return false;
     *out = cursor_paused;
     return true;
@@ -297,6 +302,7 @@ void Check(bool condition, const char* name) {
     condition ? ++passes : ++failures;
 }
 void Reset() {
+    wqn::scope_ready = true;
     for (auto& session : disk) session = {};
     std::fill(std::begin(present), std::end(present), false);
     present[0] = present[1] = true;
@@ -310,6 +316,7 @@ void Reset() {
     journal = {}; cache = {}; cache_loaded = false;
     g_session_mutation_generation = 0; wqn::scope_generation = 7; fixture_now = 0;
     cursor_found = false; cursor_paused = false;
+    cursor_read_error = ESP_OK;
     read_error = scan_error = save_error = compact_error = ESP_OK;
     reads = scans = saves = compactions = cursor_reads = 0;
     fail_save_call = 0;
@@ -1219,8 +1226,40 @@ int main() {
     TestMaintenanceDriver();
     TestOutboxQuota();
 #endif
+    for (esp_err_t error : {ESP_FAIL, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE}) {
+        Reset(); cursor_read_error = error;
+        Check(Load(&out) == error && cursor_reads == 1 && saves == 0 && compactions == 0,
+              "cursor read failure prevents successfully restoring an unpaused snapshot");
+    }
     TestObservationBatch();
     TestAckBatch();
+    Reset(); wqn::scope_ready=false;
+    Check(Load(&out)==ESP_ERR_INVALID_STATE && reads==0 && scans==0 && saves==0,
+          "unready scope refuses session load before replay or repair");
+    Reset(); captured=disk[0]; wqn::scope_ready=false;
+    Check(SaveSessionTransaction(&captured)==ESP_ERR_INVALID_STATE && reads==0 && scans==0 &&
+          saves==0 && cursor_writes==0,"unready scope refuses stale snapshot save despite matching generation");
+    Reset(); captured=disk[0]; captured.position=1; captured.remote.next_sequence=1;
+    captured.phase=wqn::WordPresentationPhase::kBack;
+    observation=ObservationFromRecord(Record()); retry={&observation,&captured}; wqn::scope_ready=false;
+    Check(CommitObservationTransaction(&retry)==ESP_ERR_INVALID_STATE && appends==0 && scans==0 && saves==0,
+          "unready scope refuses observation append despite matching generation");
+    Reset(); wqn::scope_ready=false;
+    const std::vector<wqn::DurableWordObservation> blocked_batch={observation};
+    CommitBatchContext blocked{&blocked_batch,&captured};
+    Check(CommitObservationBatchTransaction(&blocked)==ESP_ERR_INVALID_STATE && appends==0 && scans==0,
+          "unready scope refuses observation batch before journal side effects");
+#if FIXTURE_STEPPED_MAINTENANCE
+    Reset(); wqn::scope_ready=false;
+    OutboxMaintenanceContext blocked_maintenance;
+    Check(OutboxMaintenanceStepTransaction(&blocked_maintenance)==ESP_OK && blocked_maintenance.done &&
+          blocked_maintenance.deferred && scans==0 && saves==0 && compactions==0,
+          "unready scope defers GC without discarding durable ACK facts");
+    Reset();cache_loaded=true;cache.pending.push_back(Record());cache.total_records=1;wqn::scope_ready=false;
+    Check(wqn::AcknowledgeWordObservations({"request-0"},{})==ESP_OK && appends==1 &&
+          cache.pending.empty() && cache.acknowledged.size()==1 && saves==0 && compactions==0,
+          "unready scope still persists an independent known ACK without session GC");
+#endif
     std::printf("%d PASS / %d FAIL (host storage mocks; NOT power-loss or concurrency HIL)\n",
                 passes, failures);
     return failures ? 1 : 0;

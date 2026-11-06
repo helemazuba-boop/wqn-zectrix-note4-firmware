@@ -187,6 +187,7 @@ namespace wqn {
 template<class T> using WordStorePsramAllocator=std::allocator<T>;
 struct WordOutboxMaintenanceGate { bool (*should_defer)(void*)=nullptr; void* context=nullptr; };
 uint32_t GetDeckScopeGeneration() { return 1; }
+bool IsWordDeckScopeReady() { return true; }
 }
 // Journal/cache contents and VFS calls are ports; the mutation/proof/step and
 // request lifetime code around those calls is the unmodified production code.

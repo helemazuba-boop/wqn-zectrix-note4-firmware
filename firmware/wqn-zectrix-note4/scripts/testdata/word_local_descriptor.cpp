@@ -26,6 +26,7 @@
 // ---- stubbed external services (declared in generated stub headers) -------
 namespace {
 uint32_t g_scope_generation = 7;
+bool g_scope_ready = true;
 std::string g_storage_root;
 bool g_fail_fopen = false;
 bool g_fail_opendir = false;
@@ -33,6 +34,8 @@ std::map<std::string, std::vector<uint8_t>> g_cursor_nvs;
 }
 
 uint32_t wqn::GetDeckScopeGeneration() { return g_scope_generation; }
+bool wqn::IsWordDeckScopeReady() { return g_scope_ready; }
+bool wqn::IsDeckScopeCleanupOnStorageOwner() { return false; }
 esp_err_t wqn::SaveWordSessionCursorNvs(const char* key, const void* bytes, size_t size)
 {
     const auto* data=static_cast<const uint8_t*>(bytes);
@@ -286,6 +289,7 @@ static void WriteOutboxRecord(const std::string& session_id, bool suspended)
 
 static void CleanStorage()
 {
+    g_scope_ready = true;
     WqnHostResetWordOutboxCache();
     g_cursor_nvs.clear();
     DIR* dir = opendir(g_storage_root.c_str());
@@ -296,6 +300,19 @@ static void CleanStorage()
         std::remove((g_storage_root + "/" + e->d_name).c_str());
     }
     closedir(dir);
+}
+
+static std::map<std::string,std::vector<uint8_t>> SnapshotStorage()
+{
+    std::map<std::string,std::vector<uint8_t>> result;
+    DIR* dir=opendir(g_storage_root.c_str());
+    if(!dir) std::abort();
+    while(auto* entry=readdir(dir)) {
+        if(entry->d_name[0]=='.') continue;
+        const std::string path="/"+std::string(entry->d_name);
+        result[path]=ReadFile(path);
+    }
+    closedir(dir);return result;
 }
 
 int main(int argc, char** argv)
@@ -612,6 +629,54 @@ int main(int argc, char** argv)
               "unreadable descriptor prevents unsafe pinned-pack pruning");
     }
 
+    {
+        CleanStorage();
+        auto d=MakeDescriptor(401,0,3507,4,1,'a',7);
+        wqn::PersistedWordSession slot;
+        Check(wqn::SaveLocalWordSessionDescriptor(d)==ESP_OK &&
+              wqn::BuildLocalWordInitialSession(d,32,&slot)==ESP_OK &&
+              wqn::SavePersistedWordSession(slot)==ESP_OK,"prepare actual files for unready-scope checks");
+        wqn::LocalWordEligibility eligibility;
+        eligibility.deck_scope_generation=7;
+        eligibility.progress_revision=1;
+        eligibility.actor_binding=std::string(64,'a');
+        eligibility.item_ids_sha256=std::string(64,'b');
+        eligibility.mastered_bitmap="01";
+        eligibility.snapshot=d.session.remote.snapshot;
+        Check(wqn::SaveLocalWordEligibility(eligibility)==ESP_OK,
+              "prepare actual personal cache for unready-scope checks");
+        const auto files=SnapshotStorage();const auto cursors=g_cursor_nvs;
+        g_scope_ready=false;
+        auto changed_eligibility=eligibility;
+        changed_eligibility.progress_revision=2;
+        changed_eligibility.mastered_bitmap="10";
+        Check(wqn::SaveLocalWordEligibility(changed_eligibility)==ESP_ERR_INVALID_STATE,
+              "unready scope refuses same-generation personal cache replacement");
+        wqn::LocalWordEligibility restored_eligibility;
+        Check(wqn::LoadLocalWordEligibility("",&restored_eligibility)==ESP_ERR_INVALID_STATE,
+              "unready scope refuses personal cache reads rather than authorizing a new round");
+        Check(wqn::SaveLocalWordSessionDescriptor(d)==ESP_ERR_INVALID_STATE,
+              "unready scope refuses actual descriptor publication");
+        Check(wqn::SavePersistedWordSession(slot)==ESP_ERR_INVALID_STATE &&
+              wqn::SaveWordSessionCursor(slot)==ESP_ERR_INVALID_STATE,
+              "unready scope refuses actual session and cursor writes");
+        wqn::PersistedWordSession restored;
+        Check(wqn::LoadPersistedWordSession(slot.remote.mode,&restored)==ESP_ERR_INVALID_STATE,
+              "unready scope is not absent session or permission to repair a file");
+        Check(wqn::ClearPersistedWordSession(slot.remote.mode)==ESP_ERR_INVALID_STATE &&
+              wqn::ClearPersistedWordSessionIfMatches(slot.remote.mode,slot.remote.session_id,7)==ESP_ERR_INVALID_STATE,
+              "unready scope refuses both actual session clear paths");
+        wqn::LocalDescriptorRetention pins;
+        Check(wqn::PruneLocalWordSessionDescriptors("")==ESP_ERR_INVALID_STATE &&
+              wqn::CollectRetainedLocalSnapshots(&pins)==ESP_ERR_INVALID_STATE,
+              "unready scope cannot manufacture descriptor GC or pack pin proof");
+        Check(SnapshotStorage()==files && g_cursor_nvs==cursors,
+              "all actual session descriptor and cursor bytes survive refused operations");
+        g_scope_ready=true;
+        Check(wqn::LoadPersistedWordSession(slot.remote.mode,&restored)==ESP_OK &&
+              restored.remote.session_id==slot.remote.session_id,
+              "original session remains usable after storage scope is confirmed");
+    }
     std::printf("%d PASS / %d FAIL (real descriptor codec/files/seam; NOT HIL)\n",
                 passes, failures);
     return failures ? 1 : 0;

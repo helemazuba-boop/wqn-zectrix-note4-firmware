@@ -23,6 +23,7 @@
 #include "power/wake_controller.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
+#include "runtime/storage_evidence.h"
 #include "runtime/memory_diagnostics.h"
 #include "runtime/fault_diagnostics.h"
 #include "runtime/wake_context.h"
@@ -80,6 +81,7 @@ void ConfirmRunningApp()
     esp_err_t error,
     uint32_t observed_generation)
 {
+    (void)wqn::runtime::EnterStorageEvidenceBootRecovery(error, observed_generation);
     wqn::runtime::RecordFault(wqn::runtime::FaultDomain::kStorage,
         wqn::runtime::FaultPhase::kBootInit, error, 0, observed_generation);
     ESP_LOGE(

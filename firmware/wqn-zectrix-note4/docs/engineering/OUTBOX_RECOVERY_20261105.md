@@ -1,5 +1,7 @@
 # R-08：原始记录保全与维修流程（进行中）
 
+2026-11-07 综合验证线：Word 与 R-08 改动整合到 `validation/note4`。开发/验证 checkpoint 可提交待 HIL；本文历史批次的“未提交”描述保留其当时身份，当前流程以 [验证工作流](NOTE4_VALIDATION_WORKFLOW.md) 为准。设备导出入口和安装/回滚仍未完成。
+
 R-08 尚未关闭。本地已增加离线原始保全、Word/Note 解码、设备认证回执对账与
 审查计划与原生候选工具；后续还要完成真实介质身份核验、设备候选复验/交付、失败回滚和 HIL。
 保全工具只复制原文；候选工具额外生成供离线审查的 journal/checkpoint 文件。
@@ -99,8 +101,8 @@ identity、未来版本、源文件变化、读取/写入/fsync 失败、不完�
 四个语义负例分别改用错误 CRC 参数、信任未重算的报告、将新 Word 容量降回 1000、
 忽略动态描述文件；要求完成测试且只有行为
 断言失败，不能把编译错误、异常、sanitizer 或超时当作成功检出。工具接入统一门禁，
-当前清单 75 项（33 运行时入口 / 10 UI / 32 负例），包含对账客户端、本地 checkpoint
-材料校验、原生合并候选及七个相关语义负例。
+当前清单 83 项（37 运行时入口 / 10 UI / 36 负例），包含对账客户端、本地 checkpoint
+材料校验、原生合并候选、维护 NVS/游标/pin 保护及十一个相关语义负例。
 
 ## 设备认证的只读回执（2026-11-06，本地实现）
 
@@ -267,13 +269,155 @@ manifest 继续声明 `installation_ready=false`、`repair_authorized=false`，�
 维护态重核验、NVS/scope/pack、受控发布和显式维修授权条件，并增加目标原生固件未
 核验条件。它不是可直接交给设备执行的维修包。
 
+### 只读 NVS 上下文与暂停读取保护（2026-11-06）
+
+`InspectWordRecoveryNvsOnStorageOwner` 提供真实设备代码侧的有界只读采集原语。
+调用者必须已在 StorageService 内部栈 owner 的事务中；不在 owner 时拒绝且不访问 NVS。
+它只以 `NVS_READONLY` 打开 `wqn`，观测 7 个当前模式的游标原文、已提交的完整 u64
+scope-generation、RAM generation 前后值，以及 scope-change marker 的存在性/长度。
+不初始化 NVS、读凭证、迁移/清理字段，也不建立维护态冻结或跨文件快照。
+
+每个游标分别保留 error、found、stored-bytes、copied-bytes 和最多 64 B 原文。53/64 B
+等未知小布局原样保留，不当作有效暂停值；超过 64 B 明确失败且 copied-bytes=0，
+不能把截断前缀冒充完整原文。类型/I/O/长度变化错误继续记录，并采集其余独立字段。
+只有 error=ESP_OK 时 found=false 才证明缺失；read-complete 只证明这些已知字段读取
+完成，不证明 CRC、运行时兼容、来源身份或维修许可。u64 generation 不截断为 u32，
+也不把 RAM 缓存当成缺失 NVS 值的替代。API 未采集完整 NVS 分区或 pack pins。
+
+NVS 输出先进入 owner 内部栈 scratch，再复制到调用者的 POD，即使输出位于 PSRAM
+也不让 flash-backed NVS API 直接写它。49 项实际函数/主机端口检查覆盖缺失、未知
+布局、超限、类型/读取错误、cache 漂移、只读/无凭证访问与原文保留；SDK 编译对象
+的该函数入口帧为 720 B。此静态帧不证明完整调用栈或设备 HWM。
+
+同时修复暂停读取：存在但长度不符的 NVS 值不再伪装成“没有值”而回退旧 `.cur`；
+测量与数据读取后的长度都检查。读取错误、CRC/布局错误、legacy 短记录/尾随字节
+和文件 I/O 错误通过独立 error 输出传给 `LoadSessionTransaction`，不再沿用旧快照
+暂停值并返回恢复成功。真实缺失和上一 SID 的有效旧游标仍保持原有正常路径；有效
+legacy 迁移写失败时继续使用已核对的 legacy 内存值，源文件保留。
+
+现有 load 仍可能先执行原来的备份提升、checkpoint 或尾部修复，它不是取证导出 API。
+新的只读 NVS 入口避免调用这些 load/migration 路径。pack prune 对任一 session
+读取错误（除 NOT_FOUND）停止删除，不能把“pin 未知”当成“没有 pin”。故障注入已
+复现旧实现误报恢复成功、以及错误下删除原词包；修复后分别通过 198 项回放、40 项
+游标保护和 32518 项 publication/prune 检查（含 740 个单次 encoder 分配故障）。
+
+四个新负例分别重新吞掉游标错误、把异常长度当缺失、截断原长度信息、使用 NVS
+读写模式。这个入口尚未接到设备维护态导出通道；导出身份、冻结/传输、scope/pack
+一致性及真机验收仍需实现或验证，既有候选的 NVS/身份安装前提保持未满足。
+
+### Deck scope 恢复证据保全补丁（2026-11-06，待审查与 HIL）
+
+原来的 `RecoverDeckScopeTransaction` 把 NVS u64 generation 直接转成 u32；
+marker 只用 C-string/宽松数字解析和 UUID 长度检查，异常 marker 会被删除并返回
+成功。源码级故障端口复现了截断、异常字段清理/重放、提前发布缓存，以及同
+generation 下 marker 与已提交 deck 冲突仍被覆盖的情况。最终保全专项在旧源码上
+为 167 项、32 个行为失败；不是 32 个独立设备故障。
+
+补丁拒绝超过 u32 的 committed generation，区分缺失与存在但为空的 marker；
+NVS 字符串只读到内部栈上的最多 48 B 缓冲，检查两次长度、末尾 NUL 和嵌入 NUL，
+不按外部长度分配。数字按逐位 u32 边界解析，deck 检查完整 UUID 形状；请求入口
+使用同一 UUID 规则。无效、未知、类型/I/O 错误均保留原值并返回错误，缓存只在
+无 marker 或合法恢复完成后发布。同 generation 意味着 deck 已先保存，故恢复前
+还要核对已提交 deck，冲突不能作为新切换重放。
+
+合法的 marker-first 写入顺序、四种 session 清理、deck/generation 保存、顺序游标
+归零、marker 最后清除仍沿用原协议。生产函数加 NVS 端口的 171 项检查涵盖其
+14 个 session/staging/commit 边界的前后故障与重启回放；最大 48 B marker、
+u32 上界、回绕、all-decks 及大小写 UUID 均有正例。session 删除仍为端口，不能
+据此证明真实 SPIFFS/NVS、逐文件删除、任务竞争或物理断电安全。
+
+`InitStorage` 已将恢复错误向上传出，`app_main` 的现有分支进入存储恢复模式；
+这是源码调用路径证据，未在设备上验证。此补丁改变存储恢复决策，按 `AGENTS.md`
+§7 要求，提交前仍需审查和设备 HIL，当前保留为独立工作树的未提交补丁。它不提供
+维护态导出、设备身份、候选安装或自动处置未知元数据的权限。
+
+### 运行时 scope 就绪与尾部重试（2026-11-06，待审查与 HIL）
+
+启动保全之外，手动 default-deck 切换失败 ACK 原先会清 worker op-id，但没有自动
+修复的 `must_complete` 阻塞义务；磁盘 generation 可能已改变，缓存却仍是旧值。
+单靠 generation 相等不能授权旧 session 的写入。新的切换也原先直接写 marker，
+可能覆盖尚未恢复的原标记。生产函数加主机端口已复现这些控制路径。
+
+新增原子 `IsWordDeckScopeReady()`，默认关闭，启动核验成功才开启。新切换先关闭
+并验证 NVS generation、marker 和完整 default-deck 字符串；先完成已有合法尾部，
+同一目标的重试复用原意图，不重写 marker。不同目标等旧尾部完成后再写新 marker，
+两段之间不对业务重新放行。失败一直保持关闭，即使已完成持久化但返回错误，
+直到显式重试或启动重新核验；该布尔值不是持久化事务标识，不能据此宣称一般的
+exactly-once。无 marker 时也不把非法 default-deck 原文降级成 all-decks。
+
+session load/save、游标、单条/批量 observation、descriptor 发布/回收与 pin 证明
+在 storage owner 上检查就绪。未知 scope 返回错误而不是 NOT_FOUND；outbox GC
+明确延期，已知独立 ACK 仍可持久化。合法尾部清理通过 owner 专属、RAII 有界的
+清理例外执行，不临时把业务就绪设为 true。临时 scope reset 和顺序游标写入也不能
+跨过一个未完成的 default-deck 切换。此处未重新设计临时 reset 自身的断电协议。
+
+UI 另保留 `default_deck_manual_pending`：提交前布置，已接受的失败和重试间隙不
+清除，只有匹配的成功 ACK 完成词库/session/界面状态安装后释放。已在 flight 的
+Confirm 不替换 op-id；重试提交被拒绝时仍保留原来的恢复义务。新作用域的业务
+即使观察到 storage 就绪，也要等 UI 安装完成，不依赖 worker busy 的瞬时状态。
+失败提示明确为切换未完成，通知用户在设置中重试，不宣称失败意味着没有写入。
+
+当前主机专项为 NVS/tail 245、session 回放 204、游标保护 43、auto/manual 状态机
+102 项；完整生产 Word store 与 local-session C++ 加 libc 文件测试 96 项，实际
+session/descriptor 文件和 NVS 游标端口在拒绝操作后逐字节不变。补充三类语义
+负例；完整门禁为 93 项。原生候选的主机就绪函数只是编解码 oracle 的端口，不能
+作为目标设备就绪证明；候选仍缺 NVS/身份/维护态安装前提，始终不授权写回。
+
+SDK 构建和上述主机检查不能证明任务竞争、真实 NVS/SPIFFS、断电或设备 HWM。
+恢复函数入口帧为 224 B，切换事务 176 B，专用读取 helper 112 B，均为静态入口帧。
+本批与启动保全补丁一起保留在独立工作树，按 `AGENTS.md` §7 等待审查与 HIL 后提交。
+
+### SPIFFS/NVS 逻辑证据采集（2026-11-06，核心实现待设备接入与 HIL）
+
+新增的固件采集核心只在 StorageService owner 内运行：调用方必须先进入本次启动的
+恢复维护态，SPIFFS 已挂载，且没有活动的临时文件或 pack 流 lease。它不负责挂载、
+修复或清理存储。维护模式发布本身没有文件 I/O；当前启动恢复入口尚未连接物理导出
+命令，因此代码编译不代表设备已能导出。
+
+采集器读取固定的 59 个 Word/Note outbox 原始文件名，以及受限的 `wl`、`we`（含 `welig`）、`wp_`、`np_`
+动态文件名；另读取配置 NVS namespace 中 11 个明确列出的游标、scope 和 deck 键。
+NVS 只读打开，不枚举 namespace 或读取凭证；标量按原始小端字节保存，string/blob
+不解码、不规范化。单文件上限 16 MiB、总原文上限 32 MiB、单个 NVS 值上限 64 KiB，
+超限或读取错误会留下显式错误实体，不会伪装成缺失。
+
+一次 owner 事务先枚举并流式散列原件，随后重新枚举、重读并复核文件/NVS 的存在性、
+类型、长度及 SHA-256；期间 scope 缓存变化会令结果失败。每个数据帧带顺序号、对象
+偏移和实体散列，结束帧覆盖整段原始 transcript。期限和取消在读、写帧及让出 CPU
+之间协作检查；它们不能打断一个已经阻塞的 VFS/NVS/sink 调用，未来传输层仍须提供
+自己的有界写入与交付确认。
+
+主机接收器要求操作者分别 pin capture ID、MAC 和 ELF SHA-256，校验完整 transcript
+后以私有目录保存 wire 与逐对象原始字节，并由独立 verifier 重放 wire、重建清单和
+逐字节对照输出文件。当前示例包是合成输入，不来自设备；pin 是操作者提供的上下文，
+不构成设备认证或硬件证明。清单仍固定为
+`complete_device_backup=false`、`identity_authenticated=false`、
+`installation_ready=false`、`repair_authorized=false`。它是逻辑文件/NVS 证据，不是
+Flash 分区镜像或完整备份；SPIFFS 未挂载时会拒绝采集，原始物理介质镜像仍需另行设计。
+
+本批主机专项记录 49 个通过情景，完整鲁棒性门禁 98/98 通过；ESP-IDF v5.5.6
+ai-local profile 构建、M8 和 UI 静态帧门禁完成且构建日志无 warning。以上不覆盖真实
+NVS/SPIFFS、任务竞争、串口/USB 交付、物理身份、断电、运行时栈水位或 HIL。高风险
+存储改动仍未提交，需先由独立审查与设备 HIL 验收。
+
 接下来按以下顺序推进完整维修流程：
 
 1. 用已核验的设备导出身份和真实凭证联调现有对账工具；补齐设备来源证明及时间精度
    未解决项，不通过推进序号、skip observation 或创建新会话来伪装修复。
-2. 已增加原生对照的 session/cursor/descriptor 结构检查及合并原生候选生成/复验；
-   继续补齐可信 NVS/scope/pack 导出及设备维护态复验。未知 observation/ACK/suspend、
-   缺失 cursor 与冲突证据保持未解决，不由主机候选验证授权写回。
-3. 提供设备维护态的可靠导出/交付入口和 StorageService 事务，保留原始 bytes，
-   先验证暂存候选，再按可重入的 intent 发布；重启、中断与失败均有明确回滚路径。
+2. 已增加原生对照的 session/cursor/descriptor 结构检查、候选生成/复验，以及
+   SPIFFS/NVS 逻辑原文采集核心；尚缺可信设备身份、用户确认的实体传输入口和真实设备
+   复验。未知 observation/ACK/suspend、缺失 cursor 与冲突证据保持未解决，不由主机
+   候选验证授权写回。
+3. 将采集核心接入有明确用户确认、背压/取消/交付 ACK 的设备维护传输；补足 SPIFFS
+   未挂载时的原始介质证据方案。之后再实现候选安装与回滚 intent，保持原始 bytes，
+   让重启、中断与失败都有可验证的回退路径。
 4. 在可恢复测试介质上执行设备、SPIFFS/NVS、断电和序号对账验收，最后关闭 R-08。
+
+### 2026-11-07 整合补证
+
+组合 Word eligibility 与 R-08 后，首轮测试确认新个人缓存 API 未使用 scope 就绪屏障，
+同 generation 下未完成切换仍可覆盖 welig 文件并加载旧缓存。真实生产 store + libc
+端口得到 96 PASS / 3 FAIL；补齐 owner 内的读写准入后为 99 PASS / 0 FAIL。
+
+固件和接收器同步保全 we/welig 原始文件族。带新缓存样本的旧采集器为 49 情景、1 个
+行为失败、0 infrastructure errors；修正后 49/49 通过，并增加移除 we 准入的语义负例。
+以上是组合后的主机证据，不是文件系统冻结、物理身份、断电或 HIL 的证明。

@@ -14,6 +14,7 @@ const char* esp_err_to_name(int result) {return result==ESP_OK?"ESP_OK":"ESP_FAI
 #define ESP_ERROR_CHECK_WITHOUT_ABORT(value) do {(void)(value);} while(false)
 @@POLICY@@
 namespace wqn {
+bool IsWordDeckScopeReady() { return true; }
 template<typename T> using WordStorePsramAllocator=std::allocator<T>;
 enum class WordPresentationPhase : uint8_t {kFront,kBack};
 @@ENUMS@@
@@ -34,6 +35,7 @@ struct DefaultDeckRepairState {
     bool must_complete = false;
 };
 struct WordAppState {
+    bool default_deck_manual_pending=false;
     WordAppMode mode=WordAppMode::kSessionStarting;
     WordSessionState session;
     WordSessionChain chain;
@@ -87,7 +89,8 @@ protocol::v3::RequestMetadata MakeDeviceRequestMetadata(){
 }
 }
 }
-namespace wqn { uint32_t GetDeckScopeGeneration() { return 7; } }
+namespace wqn { uint32_t GetDeckScopeGeneration() { return 7; }
+ }
 namespace device_ui_internal {
 @@CLOUD_REQUEST@@
 enum class PersistDomain {kWord};

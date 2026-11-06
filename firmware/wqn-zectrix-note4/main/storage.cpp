@@ -1131,7 +1131,7 @@ esp_err_t ClearWordSessionCursorNvs(const char* key)
 
 esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found)
 {
-    if (found == nullptr || record == nullptr) {
+    if (found == nullptr || record == nullptr || key == nullptr || size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
     *found = false;
@@ -1150,15 +1150,15 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
     }
     ESP_RETURN_ON_ERROR(result, kTag, "measure word session cursor");
     if (stored_size != size) {
-        // A size change means a different schema generation of the cursor
-        // record. Treat it as absent rather than as corrupt: the legacy
-        // .cur file below is a better source than a half-shaped NVS value.
-        ESP_LOGW(kTag, "word session cursor size %u != %u, ignoring", (unsigned)stored_size,
+        // Present unknown bytes are not absence. A stale legacy cursor cannot
+        // establish the disposition of a newer/corrupt NVS value.
+        ESP_LOGW(kTag, "word session cursor size %u != %u, preserving", (unsigned)stored_size,
                  (unsigned)size);
-        return ESP_OK;
+        return ESP_ERR_INVALID_SIZE;
     }
     ESP_RETURN_ON_ERROR(
         nvs_get_blob(nvs.handle, key, record, &stored_size), kTag, "read word session cursor");
+    if (stored_size != size) return ESP_ERR_INVALID_SIZE;
     *found = true;
     return ESP_OK;
 }
@@ -1588,23 +1588,6 @@ esp_err_t SaveAgentDetailLevelForeground(uint8_t level)
         SaveU64Transaction, &context, "save-agent-detail");
 }
 
-esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
-{
-    if (deck_id == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    deck_id->clear();
-    // LoadStringFromNvs maps a missing key to ESP_OK + empty (unset = all
-    // decks).
-    const esp_err_t result = LoadStringFromNvs(kDefaultWordDeckKey, deck_id);
-    if (result == ESP_OK && !deck_id->empty() && deck_id->size() != 36) {
-        // Anything but a UUID is treated as unset rather than poisoning the
-        // word scope forever.
-        deck_id->clear();
-    }
-    return result;
-}
-
 esp_err_t LoadWordSequentialCursor(uint32_t* cursor)
 {
     if (cursor == nullptr) {
@@ -1641,8 +1624,12 @@ esp_err_t SaveWordSequentialCursor(uint32_t cursor)
         return ESP_ERR_INVALID_STATE;
     }
     U64WriteContext context = {kWordSequentialCursorKey, cursor};
+    const auto save = [](void* opaque) -> esp_err_t {
+        if (!IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
+        return SaveU64Transaction(opaque);
+    };
     return services::ExecuteForegroundStorageTransaction(
-        SaveU64Transaction, &context, "word-sequential-cursor");
+        save, &context, "word-sequential-cursor");
 }
 
 namespace {
@@ -1657,12 +1644,76 @@ namespace {
 constexpr const char* kDeckScopeMarkerKey = "word_deck_chg";
 constexpr const char* kDeckScopeGenKey = "word_deck_gen";
 std::atomic<uint32_t> g_deck_scope_generation{0};
+std::atomic<bool> g_deck_scope_ready{false};
+bool g_deck_scope_tail_active = false;  // Storage owner only; never read off-owner.
+
+struct DeckScopeTailGuard {
+    bool previous = g_deck_scope_tail_active;
+    DeckScopeTailGuard() { g_deck_scope_tail_active = true; }
+    ~DeckScopeTailGuard() { g_deck_scope_tail_active = previous; }
+};
+
+struct DeckScopeRecoveryContext {
+    bool hold_unready = false;
+    bool replayed = false;
+    std::array<char, 37> deck{};
+    size_t deck_size = 0;
+};
+
+bool IsDeckScopeId(const char* value, size_t size)
+{
+    if (size == 0) return true;  // All decks.
+    if (value == nullptr || size != 36) return false;
+    for (size_t i = 0; i < size; ++i) {
+        const char c = value[i];
+        const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+        const bool hyphen = separator && c == '-';
+        const bool hex = !separator && ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+        if (!hyphen && !hex) return false;
+    }
+    return true;
+}
+
+struct DeckScopeText {
+    // 10 decimal u32 digits + separator + 36 UUID characters + NUL.
+    std::array<char, 48> bytes{};
+    size_t size = 0;
+    bool found = false;
+};
+
+// Storage owner only. Keep present-empty, malformed and missing distinguishable;
+// never allocate from an untrusted NVS length or accept only its C-string prefix.
+esp_err_t LoadDeckScopeTextLocked(const char* key, DeckScopeText* value)
+{
+    *value = {};
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READONLY, &nvs.handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    ESP_RETURN_ON_ERROR(result, kTag, "deck scope: open metadata");
+    size_t measured = 0;
+    result = nvs_get_str(nvs.handle, key, nullptr, &measured);
+    if (result == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    ESP_RETURN_ON_ERROR(result, kTag, "deck scope: measure metadata");
+    value->found = true;
+    if (measured == 0 || measured > value->bytes.size()) return ESP_ERR_INVALID_SIZE;
+    std::array<char, 48> raw{};  // NVS output stays on the owner's internal stack.
+    size_t actual = measured;
+    ESP_RETURN_ON_ERROR(nvs_get_str(nvs.handle, key, raw.data(), &actual),
+                        kTag, "deck scope: read metadata");
+    if (actual != measured || raw[measured - 1] != '\0' ||
+        std::memchr(raw.data(), '\0', measured - 1) != nullptr) return ESP_ERR_INVALID_SIZE;
+    value->bytes = raw;
+    value->size = measured - 1;
+    return ESP_OK;
+}
 
 // Replays the tail of the change protocol. Idempotent: session-file removal
 // tolerates ENOENT, NVS writes overwrite. STORAGE TASK ONLY (the direct
 // ClearPersistedWordSession calls rely on the service-task passthrough).
 esp_err_t ApplyDeckScopeChangeLocked(uint32_t target_generation, const std::string& deck_id)
 {
+    DeckScopeTailGuard cleanup;
     // [word-modes-v2] Every resumable word session mode must be dropped here:
     // a session pinned to the old deck scope can never be resumed, and leaving
     // the file behind only confuses boot recovery.
@@ -1709,11 +1760,101 @@ struct DeckScopeChangeContext {
     const std::string* deck_id;
 };
 
+esp_err_t RecoverDeckScopeTransaction(void* opaque)
+{
+    g_deck_scope_ready.store(false, std::memory_order_release);
+    auto* recovery = static_cast<DeckScopeRecoveryContext*>(opaque);
+    // Unknown/future scope bytes must survive for maintenance, not be narrowed
+    // into a known generation. Publish the cache only after evidence is valid.
+    uint64_t committed = 0;
+    bool found = false;
+    ESP_RETURN_ON_ERROR(LoadU64FromNvs(kDeckScopeGenKey, &committed, &found),
+                        kTag, "deck recover: load generation");
+    if (found && committed > UINT32_MAX) {
+        ESP_LOGW(kTag, "deck recover: unsupported committed generation preserved");
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint32_t committed_generation = found ? static_cast<uint32_t>(committed) : 0;
+    DeckScopeText marker;
+    ESP_RETURN_ON_ERROR(LoadDeckScopeTextLocked(kDeckScopeMarkerKey, &marker),
+                        kTag, "deck recover: load marker");
+    DeckScopeText saved_deck;
+    ESP_RETURN_ON_ERROR(LoadDeckScopeTextLocked(kDefaultWordDeckKey, &saved_deck),
+                        kTag, "deck recover: load committed deck");
+    if (!IsDeckScopeId(saved_deck.bytes.data(), saved_deck.size)) return ESP_ERR_INVALID_STATE;
+    if (!marker.found) {
+        g_deck_scope_generation.store(committed_generation, std::memory_order_release);
+        if (recovery == nullptr || !recovery->hold_unready)
+            g_deck_scope_ready.store(true, std::memory_order_release);
+        return ESP_OK;  // no interrupted change
+    }
+    size_t split = 0;
+    while (split < marker.size && marker.bytes[split] != '|') ++split;
+    uint32_t target_generation = 0;
+    bool parsed_ok = split > 0 && split <= 10 && split < marker.size;
+    for (size_t i = 0; parsed_ok && i < split; ++i) {
+        const char c = marker.bytes[i];
+        if (c < '0' || c > '9' ||
+            target_generation > (UINT32_MAX - static_cast<uint32_t>(c - '0')) / 10) {
+            parsed_ok = false;
+        } else {
+            target_generation = target_generation * 10 + static_cast<uint32_t>(c - '0');
+        }
+    }
+    const size_t deck_size = split < marker.size ? marker.size - split - 1 : 0;
+    const char* deck = marker.bytes.data() + std::min(split + 1, marker.size);
+    uint32_t successor = committed_generation + 1;
+    if (successor == 0) successor = 1;
+    const bool deck_ok = IsDeckScopeId(deck, deck_size);
+    const bool generation_ok = parsed_ok && target_generation != 0 &&
+        (target_generation == committed_generation || target_generation == successor);
+    if (!deck_ok || !generation_ok) {
+        ESP_LOGW(kTag, "deck recover: malformed marker preserved");
+        return ESP_ERR_INVALID_STATE;  // Preserve unknown marker bytes.
+    }
+    if (target_generation == committed_generation) {
+        // The tail saves the deck BEFORE the generation. A same-generation
+        // marker with a different deck cannot come from a legal interrupted tail.
+        if (!IsDeckScopeId(saved_deck.bytes.data(), saved_deck.size) ||
+            saved_deck.size != deck_size ||
+            std::memcmp(saved_deck.bytes.data(), deck, deck_size) != 0) {
+            ESP_LOGW(kTag, "deck recover: conflicting committed deck preserved");
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+    const std::string deck_id(deck, deck_size);
+    ESP_LOGW(kTag,
+             "deck recover: replaying interrupted change: gen=%u deck=%s",
+             static_cast<unsigned>(target_generation),
+             deck_id.empty() ? "all" : deck_id.c_str());
+    const esp_err_t result = ApplyDeckScopeChangeLocked(target_generation, deck_id);
+    if (result != ESP_OK) return result;
+    if (recovery != nullptr) {
+        recovery->replayed = true;
+        recovery->deck_size = deck_size;
+        std::memcpy(recovery->deck.data(), deck, deck_size);
+    }
+    if (recovery == nullptr || !recovery->hold_unready)
+        g_deck_scope_ready.store(true, std::memory_order_release);
+    return ESP_OK;
+}
+
 esp_err_t DeckScopeChangeTransaction(void* opaque)
 {
     auto* context = static_cast<DeckScopeChangeContext*>(opaque);
     if (context == nullptr || context->deck_id == nullptr) {
         return ESP_ERR_INVALID_ARG;
+    }
+    // Never overwrite an unresolved marker. Finish its validated tail first,
+    // keeping business work fenced through a possible second, new switch.
+    g_deck_scope_ready.store(false, std::memory_order_release);
+    DeckScopeRecoveryContext recovery;
+    recovery.hold_unready = true;
+    ESP_RETURN_ON_ERROR(RecoverDeckScopeTransaction(&recovery), kTag, "deck change: recover prior tail");
+    if (recovery.replayed && recovery.deck_size == context->deck_id->size() &&
+        std::memcmp(recovery.deck.data(), context->deck_id->data(), recovery.deck_size) == 0) {
+        g_deck_scope_ready.store(true, std::memory_order_release);
+        return ESP_OK;  // This retry has completed its original durable intent.
     }
     const uint32_t committed_generation =
         g_deck_scope_generation.load(std::memory_order_acquire);
@@ -1729,68 +1870,9 @@ esp_err_t DeckScopeChangeTransaction(void* opaque)
             kDeckScopeMarkerKey,
             std::to_string(target_generation) + "|" + *context->deck_id),
         kTag, "deck change: write marker");
-    return ApplyDeckScopeChangeLocked(target_generation, *context->deck_id);
-}
-
-esp_err_t RecoverDeckScopeTransaction(void*)
-{
-    // Seed the generation cache from the committed value first.
-    uint64_t committed = 0;
-    bool found = false;
-    ESP_RETURN_ON_ERROR(LoadU64FromNvs(kDeckScopeGenKey, &committed, &found),
-                        kTag, "deck recover: load generation");
-    g_deck_scope_generation.store(
-        found ? static_cast<uint32_t>(committed) : 0, std::memory_order_release);
-
-    std::string marker;
-    ESP_RETURN_ON_ERROR(LoadStringFromNvs(kDeckScopeMarkerKey, &marker),
-                        kTag, "deck recover: load marker");
-    if (marker.empty()) {
-        return ESP_OK;  // no interrupted change
-    }
-    const size_t split = marker.find('|');
-    uint32_t target_generation = 0;
-    bool parsed_ok = false;
-    if (split != std::string::npos && split > 0) {
-        const std::string generation_text = marker.substr(0, split);
-        errno = 0;
-        char* end = nullptr;
-        const unsigned long parsed =
-            std::strtoul(generation_text.c_str(), &end, 10);
-        // Full consumption and no overflow (ERANGE surfaces via errno; on this
-        // 32-bit target unsigned long IS uint32). 0 stays the sentinel.
-        if (errno == 0 && end != nullptr && *end == '\0' &&
-            end != generation_text.c_str() && parsed != 0) {
-            target_generation = static_cast<uint32_t>(parsed);
-            parsed_ok = true;
-        }
-    }
-    const std::string deck_id =
-        split == std::string::npos ? std::string() : marker.substr(split + 1);
-    // The deck must be empty (all decks) or a UUID, and the target generation
-    // must be the committed one (crash after the generation save) or its
-    // successor (crash before it, accounting for the wrap-skip over 0).
-    uint32_t successor =
-        g_deck_scope_generation.load(std::memory_order_acquire) + 1;
-    if (successor == 0) {
-        successor = 1;
-    }
-    const bool deck_ok = deck_id.empty() || deck_id.size() == 36;
-    const bool generation_ok = parsed_ok &&
-        (target_generation == g_deck_scope_generation.load(std::memory_order_acquire) ||
-         target_generation == successor);
-    if (!deck_ok || !generation_ok) {
-        // Corrupt marker: drop it rather than replaying garbage as a switch.
-        // The committed deck/generation stay as-is; sessions may already be
-        // cleared, which is safe (they are only browse cursors).
-        ESP_LOGW(kTag, "deck recover: malformed marker '%s' dropped", marker.c_str());
-        return ClearNvsKeyRaw(kDeckScopeMarkerKey);
-    }
-    ESP_LOGW(kTag,
-             "deck recover: replaying interrupted change: gen=%u deck=%s",
-             static_cast<unsigned>(target_generation),
-             deck_id.empty() ? "all" : deck_id.c_str());
-    return ApplyDeckScopeChangeLocked(target_generation, deck_id);
+    const esp_err_t result = ApplyDeckScopeChangeLocked(target_generation, *context->deck_id);
+    if (result == ESP_OK) g_deck_scope_ready.store(true, std::memory_order_release);
+    return result;
 }
 
 }  // namespace
@@ -1801,7 +1883,7 @@ esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id)
     if (!write) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!deck_id.empty() && deck_id.size() != 36) {
+    if (!IsDeckScopeId(deck_id.data(), deck_id.size())) {
         return ESP_ERR_INVALID_ARG;
     }
     DeckScopeChangeContext context{&deck_id};
@@ -1824,6 +1906,7 @@ esp_err_t ChangeDefaultWordDeckForeground(const std::string& deck_id)
 
 esp_err_t WordSessionScopeResetTransaction(void*)
 {
+    if (!IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     const uint32_t committed = g_deck_scope_generation.load(std::memory_order_acquire);
     uint32_t target_generation = committed + 1;
     if (target_generation == 0) {
@@ -1882,6 +1965,112 @@ esp_err_t ResetWordSessionScope()
 uint32_t GetDeckScopeGeneration()
 {
     return g_deck_scope_generation.load(std::memory_order_acquire);
+}
+
+bool IsWordDeckScopeReady()
+{
+    return g_deck_scope_ready.load(std::memory_order_acquire);
+}
+
+bool IsDeckScopeCleanupOnStorageOwner()
+{
+    return services::IsStorageServiceTask() && g_deck_scope_tail_active;
+}
+
+esp_err_t LoadDefaultWordDeckId(std::string* deck_id)
+{
+    if (deck_id == nullptr) return ESP_ERR_INVALID_ARG;
+    deck_id->clear();
+    const auto load = [](void* opaque) -> esp_err_t {
+        if (!IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
+        auto* out = static_cast<std::string*>(opaque);
+        DeckScopeText deck;
+        esp_err_t result = LoadDeckScopeTextLocked(kDefaultWordDeckKey, &deck);
+        if (result == ESP_OK && !IsDeckScopeId(deck.bytes.data(), deck.size)) result = ESP_ERR_INVALID_STATE;
+        if (result != ESP_OK) {
+            g_deck_scope_ready.store(false, std::memory_order_release);
+            return result;
+        }
+        out->assign(deck.bytes.data(), deck.size);
+        return ESP_OK;
+    };
+    return services::ExecuteStorageTransactionNamed(load, deck_id, "load-default-word-deck");
+}
+
+esp_err_t InspectWordRecoveryNvsOnStorageOwner(WordRecoveryNvsSnapshot* snapshot)
+{
+    if (snapshot == nullptr) return ESP_ERR_INVALID_ARG;
+    *snapshot = {};
+    if (!services::IsStorageServiceTask()) {
+        snapshot->error = ESP_ERR_INVALID_STATE;
+        return snapshot->error;
+    }
+    snapshot->cached_scope_generation_before = GetDeckScopeGeneration();
+    NvsHandle nvs;
+    esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READONLY, &nvs.handle);
+    snapshot->namespace_error = result;
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        snapshot->namespace_error = snapshot->scope_error = snapshot->pending_marker_error = ESP_OK;
+        for (auto& cursor : snapshot->cursors) cursor.error = ESP_OK;
+        result = ESP_OK;
+    } else if (result == ESP_OK) {
+        snapshot->namespace_found = true;
+        // Flash-backed NVS writes into internal-stack scratch only, even when
+        // the caller's POD output lives in PSRAM.
+        uint64_t scope = 0;
+        snapshot->scope_error = nvs_get_u64(nvs.handle, kDeckScopeGenKey, &scope);
+        if (snapshot->scope_error == ESP_OK) {
+            snapshot->scope_found = true;
+            snapshot->committed_scope_generation = scope;  // Preserve all 64 bits.
+        } else if (snapshot->scope_error == ESP_ERR_NVS_NOT_FOUND) {
+            snapshot->scope_error = ESP_OK;
+        }
+        if (snapshot->scope_error != ESP_OK) result = snapshot->scope_error;
+        size_t pending_size = 0;
+        snapshot->pending_marker_error = nvs_get_str(nvs.handle, kDeckScopeMarkerKey, nullptr, &pending_size);
+        if (snapshot->pending_marker_error == ESP_OK) {
+            snapshot->pending_marker_found = true;
+            snapshot->pending_marker_bytes = pending_size;
+        } else if (snapshot->pending_marker_error == ESP_ERR_NVS_NOT_FOUND) {
+            snapshot->pending_marker_error = ESP_OK;
+        }
+        if (result == ESP_OK && snapshot->pending_marker_error != ESP_OK) result = snapshot->pending_marker_error;
+        constexpr const char* keys[] = {"cur_seq", "cur_rnd", "cur_dic", "cur_rev", "cur_int", "cur_shf", "cur_mis"};
+        static_assert(sizeof(keys) / sizeof(keys[0]) == 7);
+        for (size_t i = 0; i < snapshot->cursors.size(); ++i) {
+            auto& cursor = snapshot->cursors[i];
+            size_t measured = 0;
+            cursor.error = nvs_get_blob(nvs.handle, keys[i], nullptr, &measured);
+            if (cursor.error == ESP_ERR_NVS_NOT_FOUND) {
+                cursor.error = ESP_OK;
+                continue;
+            }
+            if (cursor.error == ESP_OK) {
+                cursor.found = true;
+                cursor.stored_bytes = measured;
+                if (measured > cursor.bytes.size()) {
+                    cursor.error = ESP_ERR_INVALID_SIZE;
+                } else {
+                    std::array<uint8_t, 64> raw{};
+                    size_t copied = measured;
+                    cursor.error = nvs_get_blob(nvs.handle, keys[i], raw.data(), &copied);
+                    if (cursor.error == ESP_OK && copied != measured) cursor.error = ESP_ERR_INVALID_SIZE;
+                    if (cursor.error == ESP_OK) {
+                        std::memcpy(cursor.bytes.data(), raw.data(), copied);
+                        cursor.copied_bytes = copied;
+                    }
+                }
+            }
+            if (result == ESP_OK && cursor.error != ESP_OK) result = cursor.error;
+        }
+    }
+    snapshot->cached_scope_generation_after = GetDeckScopeGeneration();
+    if (result == ESP_OK && snapshot->cached_scope_generation_before != snapshot->cached_scope_generation_after) {
+        result = ESP_ERR_INVALID_STATE;
+    }
+    snapshot->error = result;
+    snapshot->read_complete = result == ESP_OK;
+    return result;
 }
 
 std::string AutoSyncIntervalLabel(uint32_t minutes)

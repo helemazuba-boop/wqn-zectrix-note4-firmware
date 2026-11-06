@@ -458,6 +458,7 @@ esp_err_t SaveSessionRaw(
     const wqn::PersistedWordSession& session,
     bool preserve_backup = false)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     SessionPaths paths = {};
     if (!GetSessionPaths(session.remote.mode, &paths)) {
         return ESP_ERR_INVALID_ARG;
@@ -569,6 +570,7 @@ bool GetSessionCursorPaths(
 
 esp_err_t WriteSessionCursor(const wqn::PersistedWordSession& session)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     // [word-session-cursor-nvs] The .cur/.ctp/.cbk paths are no longer written;
     // they are only read, and only as the one-time migration fallback below.
     // GetSessionCursorNvsKey covers the same seven modes, so it is also the
@@ -606,12 +608,18 @@ esp_err_t WriteSessionCursor(const wqn::PersistedWordSession& session)
 bool ReadSessionCursorPaused(
     wqn::protocol::word_study_v1::Mode mode,
     const std::string& session_id,
-    bool* paused)
+    bool* paused,
+    esp_err_t* error = nullptr)
 {
+    if (error != nullptr) *error = ESP_OK;
+    const auto reject = [error](esp_err_t code) {
+        if (error != nullptr) *error = code;
+        return false;
+    };
     SessionPaths paths = {};
-    if (paused == nullptr || !GetSessionCursorPaths(mode, &paths)) return false;
+    if (paused == nullptr || !GetSessionCursorPaths(mode, &paths)) return reject(ESP_ERR_INVALID_ARG);
     const char* nvs_key = GetSessionCursorNvsKey(mode);
-    if (nvs_key == nullptr) return false;
+    if (nvs_key == nullptr) return reject(ESP_ERR_INVALID_ARG);
 
     // [word-session-cursor-nvs] NVS first. The legacy .cur file is still read
     // because devices that ran the SPIFFS cursor have one on disk and nothing
@@ -621,26 +629,26 @@ bool ReadSessionCursorPaused(
     // after the first successful read NVS is the only copy.
     SessionCursorRecord record = {};
     bool have_nvs_cursor = false;
-    if (wqn::LoadWordSessionCursorNvs(nvs_key, &record, sizeof(record), &have_nvs_cursor) !=
-        ESP_OK) {
-        return false;
-    }
+    const esp_err_t loaded = wqn::LoadWordSessionCursorNvs(
+        nvs_key, &record, sizeof(record), &have_nvs_cursor);
+    if (loaded != ESP_OK) return reject(loaded);
     if (!have_nvs_cursor) {
         FILE* file = std::fopen(paths.primary, "rb");
-        if (file == nullptr) return false;
+        if (file == nullptr) return errno == ENOENT ? false : reject(ESP_FAIL);
         const bool read_ok =
             std::fread(&record, 1, sizeof(record), file) == sizeof(record);
         const int trailing = std::fgetc(file);
-        const bool file_ok = read_ok && trailing == EOF && !std::ferror(file);
-        std::fclose(file);
-        if (!file_ok) return false;
+        const bool io_error = std::ferror(file) != 0;
+        const bool closed = std::fclose(file) == 0;
+        if (io_error || !closed) return reject(ESP_FAIL);
+        if (!read_ok || trailing != EOF) return reject(ESP_ERR_INVALID_SIZE);
     }
     if (record.magic != kSessionCursorMagic ||
         record.version != kSessionCursorVersion ||
         record.paused > 1 ||
         record.session_id[sizeof(record.session_id) - 1] != '\0' ||
         Crc32(&record, sizeof(record) - sizeof(record.crc)) != record.crc) {
-        return false;
+        return reject(ESP_ERR_INVALID_CRC);
     }
     // Reject a leftover cursor from a previous session in the same mode slot.
     if (session_id != record.session_id) return false;
@@ -660,6 +668,7 @@ bool ReadSessionCursorPaused(
 esp_err_t LoadSessionFile(const char* path, wqn::PersistedWordSession* session,
     bool check_scope = true)
 {
+    if (check_scope && !wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     if (session == nullptr) return ESP_ERR_INVALID_ARG;
     FILE* file = std::fopen(path, "rb");
     if (file == nullptr) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
@@ -705,6 +714,7 @@ esp_err_t LoadSessionSlotRaw(
     wqn::protocol::word_study_v1::Mode mode,
     wqn::PersistedWordSession* session)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     SessionPaths paths = {};
     if (session == nullptr || !GetSessionPaths(mode, &paths)) {
         return ESP_ERR_INVALID_ARG;
@@ -1488,6 +1498,10 @@ esp_err_t OutboxMaintenanceStepTransaction(void* opaque)
 {
     auto* context = static_cast<OutboxMaintenanceContext*>(opaque);
     if (context == nullptr) return ESP_ERR_INVALID_ARG;
+    if (!wqn::IsWordDeckScopeReady()) {
+        context->done = context->deferred = true;
+        return ESP_OK;  // ACK facts stay durable; unknown scope cannot authorize GC.
+    }
     if (context->done) return ESP_OK;
     const auto deadline_reached = [context]() {
         if (context->deadline_us <= 0 || esp_timer_get_time() < context->deadline_us) return false;
@@ -1584,6 +1598,7 @@ struct LoadSessionContext {
 // checkpoint their progress, then compact, within the same owner transaction.
 esp_err_t LoadSessionTransaction(void* opaque)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     auto* context = static_cast<LoadSessionContext*>(opaque);
     if (context == nullptr || context->session == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -1640,8 +1655,11 @@ esp_err_t LoadSessionTransaction(void* opaque)
     // snapshot on disk may still read unpaused; position/phase/sequence were
     // already reconciled from the outbox above.
     bool cursor_paused = false;
-    if (ReadSessionCursorPaused(
-            context->mode, session->remote.session_id, &cursor_paused)) {
+    esp_err_t cursor_error = ESP_OK;
+    const bool cursor_found = ReadSessionCursorPaused(
+        context->mode, session->remote.session_id, &cursor_paused, &cursor_error);
+    ESP_RETURN_ON_ERROR(cursor_error, kTag, "read authoritative word pause cursor");
+    if (cursor_found) {
         session->paused = cursor_paused;
     }
     ESP_LOGI(
@@ -1670,6 +1688,7 @@ esp_err_t SaveSessionProgressProtected(
     const wqn::PersistedWordSession& incoming,
     bool refresh_cursor)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     // The runner may have captured this candidate-page snapshot before newer
     // observations were committed and checkpointed. A late save or old retry
     // must not overwrite their only durable progress after ACK reclamation.
@@ -1742,6 +1761,8 @@ struct ClearSessionContext {
 
 esp_err_t ClearSessionTransaction(void* opaque)
 {
+    if (!wqn::IsWordDeckScopeReady() && !wqn::IsDeckScopeCleanupOnStorageOwner())
+        return ESP_ERR_INVALID_STATE;
     auto* context = static_cast<ClearSessionContext*>(opaque);
     SessionPaths paths = {};
     if (context == nullptr || !GetSessionPaths(context->mode, &paths)) {
@@ -1785,6 +1806,7 @@ struct CommitContext {
 
 esp_err_t CommitObservationTransaction(void* opaque)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     auto* context = static_cast<CommitContext*>(opaque);
     if (context == nullptr || context->observation == nullptr ||
         context->advanced_session == nullptr) {
@@ -1879,6 +1901,7 @@ struct CommitBatchContext {
 
 esp_err_t CommitObservationBatchTransaction(void* opaque)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     auto* context = static_cast<CommitBatchContext*>(opaque);
     if (context == nullptr || context->observations == nullptr ||
         context->advanced_session == nullptr || context->observations->empty() ||
@@ -2488,7 +2511,8 @@ esp_err_t ReadEligibilityRaw(const std::string& id, wqn::LocalWordEligibility* o
 
 esp_err_t WriteEligibilityRaw(const wqn::LocalWordEligibility& e)
 {
-    if (e.deck_scope_generation != wqn::GetDeckScopeGeneration())
+    if (!wqn::IsWordDeckScopeReady() ||
+        e.deck_scope_generation != wqn::GetDeckScopeGeneration())
         return ESP_ERR_INVALID_STATE;
     std::vector<uint8_t> bytes;
     if (!EncodeEligibility(e, &bytes))
@@ -2952,6 +2976,7 @@ struct SaveLocalDescriptorContext {
 
 esp_err_t SaveLocalDescriptorTransaction(void* opaque)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     auto* context = static_cast<SaveLocalDescriptorContext*>(opaque);
     if (context == nullptr || context->descriptor == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -3016,6 +3041,7 @@ esp_err_t LoadLocalDescriptorTransaction(void* opaque)
 
 esp_err_t PruneLocalDescriptorsImpl(const std::string& active_session_id)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     std::vector<std::string, wqn::WordStorePsramAllocator<std::string>> primaries;
     ESP_RETURN_ON_ERROR(ListLocalDescriptorPrimaries(&primaries), kTag, "list descriptor GC");
     OutboxScan fresh_scan;
@@ -3050,6 +3076,7 @@ struct CollectRetainedContext {
 
 esp_err_t CollectRetainedLocalSnapshotsTransaction(void* opaque)
 {
+    if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
     auto* context = static_cast<CollectRetainedContext*>(opaque);
     if (context == nullptr || context->out == nullptr) return ESP_ERR_INVALID_ARG;
     context->out->pinned_sha256.clear();
@@ -3476,6 +3503,7 @@ esp_err_t LoadLocalWordEligibility(const std::string& round_id, LocalWordEligibi
     } context{&round_id, out};
     auto transaction = [](void* opaque) -> esp_err_t
     {
+        if (!wqn::IsWordDeckScopeReady()) return ESP_ERR_INVALID_STATE;
         auto* c = static_cast<Context*>(opaque);
         return ReadEligibilityRaw(*c->id, c->out);
     };

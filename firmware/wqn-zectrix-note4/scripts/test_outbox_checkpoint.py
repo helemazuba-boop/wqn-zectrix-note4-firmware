@@ -42,7 +42,7 @@ def build_oracle(domain, directory, crc_object):
     if word:
         local = (ROOT/'main/word_local_session.cpp').read_text()
         header = (ROOT/'main/word_local_session.h').read_text()
-        declarations = 'namespace wqn { uint32_t GetDeckScopeGeneration(){return 0;}\n'
+        declarations = 'namespace wqn { uint32_t GetDeckScopeGeneration(){return 0;} bool IsWordDeckScopeReady(){return true;}\n'
         declarations += native.function(local, 'bool IsValidLocalSessionUuid(') + '\n'
         declarations += native.function(header, 'struct LocalWordSessionDescriptor {') + ';\n}\n'
         extra += native.section(source, 'constexpr uint32_t kSessionCursorMagic =', '// [word-session-cursor-nvs] NVS keys')

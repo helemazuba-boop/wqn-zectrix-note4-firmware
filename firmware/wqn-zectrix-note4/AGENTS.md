@@ -31,9 +31,9 @@ map), `docs/development/BUILD_HERE.md` (flash playbook),
 6. **Every change must build with 0 warnings, pass the M8 gate, and leave
    `git -c core.whitespace=cr-at-eol diff --check` clean** before you present or
    commit it. (§6)
-7. **High-risk changes (sleep, power, EPD hardware, storage protocol) require
-   on-device HIL verification before commit**, and commits land only after
-   review approval. (§7)
+7. **Development/validation checkpoint commits may retain explicit pending HIL.**
+   High-risk changes (sleep, power, EPD hardware, storage protocol) require
+   on-device HIL and independent review before acceptance or release. (§7)
 8. **Never push or open a PR unless explicitly asked.** (§7)
 
 ---
@@ -395,14 +395,18 @@ git -c core.whitespace=cr-at-eol diff --check   # clean (CRLF-aware; see §7)
   `git -c core.whitespace=cr-at-eol diff --check`. If you must normalize line
   endings, do it as a **separate `chore` commit**, never mixed into a feature
   diff.
-- **High-risk changes require HIL before commit.** Anything touching deep
-  sleep, power, EPD hardware timing, or a storage protocol has no host test —
-  build-green is necessary but not sufficient. State the HIL matrix and get it
-  run (e.g. for sleep-prep: pending timeout, claimed near deadline,
-  stale-completion interleave, maintenance+sleep-prep coincident, EPD-raised
-  emergency, EPD-busy / normal idle sleep / wake restore).
-- **Commit only after review approval**; when a reviewer is in the loop, present
-  the change and wait. Do not self-approve high-risk work.
+- **Development and validation checkpoints may be committed with HIL pending.**
+  Require local review, the zero-warning build/M8 gate and relevant automated
+  checks. Record every unrun physical check and do not call the candidate
+  device-accepted. A checkpoint or merge is not release approval.
+- **High-risk acceptance requires on-device HIL and independent review.**
+  Sleep, power, EPD timing and storage protocols must pass their physical
+  fault matrix before the affected change is accepted or promoted to release.
+  Host mocks/builds do not prove physical behavior. Do not self-approve HIL.
+- **Use the persistent validation lane.** Feature/development work merges in
+  complete batches into `validation/note4`. Freeze each HIL image by commit,
+  configuration and BIN/ELF hashes even while the branch advances. Follow
+  [NOTE4_VALIDATION_WORKFLOW.md](docs/engineering/NOTE4_VALIDATION_WORKFLOW.md).
 - **Never push or open a PR unless explicitly asked.** Never force-push, never
   push to `main`, never skip hooks, never touch git config.
 - **Commit messages**: imperative subject scoped by area (`refactor(display):`,

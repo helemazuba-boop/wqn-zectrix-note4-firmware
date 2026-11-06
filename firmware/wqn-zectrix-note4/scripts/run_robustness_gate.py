@@ -48,6 +48,14 @@ def cases():
         ('outbox_reconcile', 'R-08 ongoing: pinned raw evidence, authenticated receipts and non-authorizing review plans', ()),
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
+        ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
+        ('storage_evidence_capture', 'R-08 ongoing: frozen owner raw files/NVS, pinned stream receive and independent replay', ()),
+        ('word_cursor_guards', 'R-08 ongoing: pause source validation, migration and explicit read errors', ()),
+        ('word_deck_scope_tail', 'R-08/R-18: preserve unknown scope metadata and replay only valid interrupted changes', ()),
+        ('word_scope_autorepair', 'R-08: storage readiness and accepted manual/auto scope obligations', ()),
+        ('word_local_descriptor', 'R-08: full native session/descriptor file preservation when scope is unresolved', ()),
+        ('word_session_replay', 'R-08 ongoing: checkpoint replay and terminal cursor read failures', ()),
+        ('pack_prune', 'R-08: unknown session pins preserve current and rollback packs', ()),
         ('sync_journal', 'N-06: opaque checkpoints and decode allocation faults', ()),
         ('sync_control', 'R-21: raw SEQUENCE_GAP, retry checkpoint and restart escalation', ()),
         ('sync_retry', 'R-21: bounded retries and independent outbox identities', ()),
@@ -102,6 +110,25 @@ def cases():
     result.append(Case('word_offline_dispatch-force-network', 'Offline words: reject network demand for cached controls', 'controls',
                        ('test_word_offline_dispatch.py', '--mutation', 'force-network'), r'^FAIL:',
                        r'Offline word dispatch: \d+ checks, [1-9]\d* failures \(NOT HIL\)'))
+    for mutation in ('ignore-nvs-size', 'truncate-size', 'write-open'):
+        result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
+                           ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',
+                           r'Storage maintenance NVS: \d+ checks, [1-9]\d* failures \(host ports; NOT HIL\)'))
+    for mutation in ('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility'):
+        result.append(Case(f'evidence-capture-{mutation}', 'R-08: maintenance admission, raw source recheck, read-only NVS and transcript integrity', 'controls',
+                           ('test_storage_evidence_capture.py', '--mutation', mutation), r'^FAIL evidence:',
+                           r'Storage evidence: \d+ scenarios, [1-9]\d* failures, 0 errors \(host ports; NOT HIL\)'))
+    result.append(Case('word-cursor-swallow-error', 'R-08: failed cursor cannot restore an unpaused session', 'controls',
+                       ('test_word_session_replay.py', '--mutation', 'swallow-cursor-error'), r'^FAIL: cursor read failure',
+                       r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))
+    for mutation in ('truncate-generation', 'erase-invalid-marker', 'accept-invalid-uuid', 'publish-unverified-cache',
+                     'skip-prior-tail', 'reopen-after-failure'):
+        result.append(Case(f'deck-scope-{mutation}', 'R-08/R-18: unknown scope evidence cannot authorize destructive replay', 'controls',
+                           ('test_word_deck_scope_tail.py', '--mutation', mutation), r'^FAIL scope-recovery:',
+                           r'Deck scope recovery: \d+ checks, [1-9]\d* failures \(host NVS ports; NOT HIL\)'))
+    result.append(Case('word-ignore-scope-fence', 'R-08: unresolved scope cannot authorize journal/session/GC changes', 'controls',
+                       ('test_word_session_replay.py', '--mutation', 'ignore-scope-fence'), r'^FAIL: unready scope',
+                       r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

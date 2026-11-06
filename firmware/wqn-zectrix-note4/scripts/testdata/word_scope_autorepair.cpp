@@ -19,6 +19,8 @@ void FixtureLog(const char*, const char*, ...) {}
 #define ESP_LOGI(...) FixtureLog(__VA_ARGS__)
 
 namespace wqn {
+bool scope_ready=true;
+bool IsWordDeckScopeReady() { return scope_ready; }
 
 // ---- Minimal mocks of the PODs the extracted functions touch -------------
 struct WordDeckInfo {
@@ -66,6 +68,7 @@ struct WordAppState {
     std::string default_deck_title;
     std::string scoped_deck_id;
     std::vector<WordDeckInfo> deck_catalog;
+    bool default_deck_manual_pending=false;
     bool default_deck_missing = false;
     DefaultDeckRepairState default_deck_repair;
 
@@ -509,6 +512,17 @@ int main()
               "I5 manual cannot cancel an accepted_once recovery obligation");
     }
 
+    {
+        wqn::WordAppState s;
+        wqn::scope_ready=false;
+        Check(wqn::DefaultDeckRepairBlocking(s), "unknown storage scope blocks study even without auto-repair intent");
+        wqn::scope_ready=true;
+        Check(!wqn::DefaultDeckRepairBlocking(s), "validated storage scope releases the independent barrier");
+        s.default_deck_manual_pending=true;
+        Check(wqn::DefaultDeckRepairBlocking(s), "accepted manual switch blocks through worker result installation");
+        s.default_deck_manual_pending=false;
+        Check(!wqn::DefaultDeckRepairBlocking(s), "installed manual result releases study admission");
+    }
     std::printf("word_scope_autorepair: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

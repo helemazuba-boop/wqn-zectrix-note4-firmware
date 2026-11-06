@@ -1551,7 +1551,8 @@ bool DefaultDeckRepairBlocking(const WordAppState& state)
     // [deck-autorepair] must_complete keeps the card / new-session / temp-scope
     // / manual gates CLOSED between a failed ACK and the next retry: the scope
     // is still owned by a possibly half-applied durable transaction.
-    return state.default_deck_repair.pending ||
+    return !IsWordDeckScopeReady() || state.default_deck_manual_pending ||
+           state.default_deck_repair.pending ||
            state.default_deck_repair.op_id != 0 ||
            state.default_deck_repair.must_complete;
 }
