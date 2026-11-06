@@ -20,6 +20,7 @@ def main():
         '@@DECK@@': section(app, 'struct WordDeckInfo {', '\nstruct WordCardPrefetchState'),
         '@@WIRE@@': section(header, 'enum class WordCloudOp {', '\nenum class NoteCloudOp'),
         '@@QUEUE@@': section(cloud, 'std::string MakeStableLocalUuid(', '\nvoid PumpWordSessionStart('),
+        '@@REFRESH@@': section(cloud, 'esp_err_t RefreshLocalWordEligibility(', '\nvoid ExecuteLocalWordStart('),
         '@@WORKER@@': section(cloud, 'void ExecuteLocalWordStart(', '\n}  // namespace\n\nvoid ExecuteWordCloudRequest'),
     }
     for marker, body in pieces.items():

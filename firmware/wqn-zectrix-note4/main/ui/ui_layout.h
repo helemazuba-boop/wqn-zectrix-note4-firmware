@@ -60,8 +60,8 @@ constexpr int kWordHeadlineY = 62;
 constexpr int kWordHomeTitleY = 36;
 constexpr int kWordHomeSummaryY = 70;
 constexpr int kWordHomeNoticeY = 91;
-constexpr int kWordMenuTop = 108;
-constexpr int kWordMenuPitch = 45;
+constexpr int kWordMenuTop = 116;
+constexpr int kWordMenuPitch = 56;
 constexpr int kWordChoiceTop = 178;
 constexpr int kWordChoicePitch = 50;
 

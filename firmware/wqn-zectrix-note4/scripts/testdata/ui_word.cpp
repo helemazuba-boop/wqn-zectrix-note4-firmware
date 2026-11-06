@@ -46,8 +46,9 @@ struct WordAppState {
     uint16_t reviewed_today=20,correct_today=15;
     struct {WordObservationCommitState commit_state=WordObservationCommitState::kIdle; int batch_error=ESP_OK; bool batch_flush_requested=false,buffered=false; protocol::word_study_v1::Mode requested_mode=protocol::word_study_v1::Mode::kReview; PersistedWordSession persisted;} session;
     struct {bool mounted=true,truncated=false;std::vector<WordPackIndexEntry> entries;size_t pack_count=1,pack_bytes=100;std::string status_message;} pack_index;
-    struct {int cards_seen=0,reviewed=0,unknown=0,replayed=0;WordCompleteSelection complete_selection=WordCompleteSelection::kSequential;} review;
-    struct {uint32_t sequential_cursor=128,sequential_total=3200;} chain;
+    struct {bool queue_unavailable=false;int cards_seen=0,reviewed=0,unknown=0,replayed=0;WordCompleteSelection complete_selection=WordCompleteSelection::kSequential;} review;
+    struct Chain {bool active=false;uint32_t sequential_cursor=128,sequential_total=3200;};
+    Chain chain,shuffle_chain;
     struct {size_t pending_count=0,blocked_count=0,suspended_count=0;} outbox;
     WqnWordEntry current_word;
     std::string message,scoped_deck_title,default_deck_title,scoped_deck_id,default_deck_id;
@@ -169,9 +170,9 @@ int main(int argc,char** argv){
     SetWordReviewDueCount(24);SetWordMistakeCount(18);
     UiFrame frame;frame.word_app=BuildWordAppSnapshot(state);Render(frame,output,"home");
     CHECK(Seen("今日学习")&&Seen("已复习 20")&&Seen("答对 15")&&Seen("24 到期")&&Seen("18 词"));
-    CHECK(Seen("智能复习")&&Seen("顺序学习")&&Seen("随机浏览")&&Seen("遗忘的单词"));
-    CHECK(Seen("#128/3200"));
-    for(int i=0;i<4;++i){frame.word_app.home_selection=static_cast<WordHomeSelection>(i);Render(frame,output,"focus-"+std::to_string(i));CHECK(pixels[(kWordMenuTop+i*kWordMenuPitch+10)*400+7]);}
+    CHECK(Seen("智能复习")&&!Seen("顺序学习")&&Seen("随机浏览")&&Seen("遗忘的单词"));
+    CHECK(!Seen("离线走完当前词库"));CHECK(kWordMenuTop==116&&kWordMenuPitch==56);
+    for(int i=0;i<3;++i){frame.word_app.home_selection=static_cast<WordHomeSelection>(i);Render(frame,output,"focus-"+std::to_string(i));CHECK(pixels[(kWordMenuTop+i*kWordMenuPitch+10)*400+7]);}
     frame.word_app.review_due_known=false;frame.word_app.mistake_count=-1;Render(frame,output,"unknown");CHECK(Seen("-- 到期")&&Seen("-- 词"));
     frame.word_app.review_due_known=true;frame.word_app.review_due_count=0;frame.word_app.mistake_count=0;Render(frame,output,"zero");CHECK(Seen("0 到期")&&Seen("0 词"));
     frame.word_app.pack_ready=false;Render(frame,output,"unsynced");CHECK(Seen("未同步")&&Seen("需同步词库"));
@@ -221,6 +222,9 @@ int main(int argc,char** argv){
     frame.word_app.mode=WordAppMode::kSessionStarting;frame.word_app.hint="正在加载后续单词";Render(frame,output,"loading");CHECK(Seen("正在准备本轮单词")&&Seen(frame.word_app.hint)&&!Seen("abandon"));
     frame.word_app.mode=WordAppMode::kReviewComplete;frame.word_app.review_complete_empty=false;frame.word_app.review_complete_reviewed=30;frame.word_app.review_complete_unknown=6;frame.word_app.review_complete_replayed=4;frame.word_app.sequential_total=3200;frame.word_app.sequential_cursor=128;Render(frame,output,"complete");CHECK(Seen("本轮复习完成")&&Seen("没答对 6 张")&&Seen("重学 4 张"));
     frame.word_app.review_complete_empty=true;Render(frame,output,"no-due");CHECK(Seen("今天没有到期单词")&&Seen("到期 0 词"));
+    frame.word_app.review_queue_unavailable=true;Render(frame,output,"offline-review");
+    CHECK(Seen("到期队列暂不可用")&&!Seen("本轮复习完成")&&!Seen("到期 0 词")&&Seen("顺序过词库"));
+    frame.word_app.review_queue_unavailable=false;
     auto wrap=WordWrap("one internationalization two three",16,WordMeasure(16,"one internationalization"),3);CHECK(wrap.lines.size()>=2&&wrap.lines[0]=="one internationalization");
     wrap=WordWrap("first\nsecond\nthird",16,kWordWidth,2);CHECK(wrap.truncated&&wrap.lines.size()==2);
     CHECK(WordClip("x\ny\rz",12,368)=="x y z");CHECK(WordClip("abc",16,0).empty());

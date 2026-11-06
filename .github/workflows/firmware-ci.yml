@@ -215,6 +215,12 @@ jobs:
           python3 scripts/test_word_session_replay.py
           python3 scripts/test_pack_prune.py
 
+      - name: Prepare host SHA-256 fixture dependency
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libssl-dev
+
       - name: Offline word segments, descriptors, paging and scope host regressions (not HIL)
         working-directory: firmware/wqn-zectrix-note4
         shell: bash
@@ -223,6 +229,7 @@ jobs:
           python3 scripts/test_word_local_sequence.py
           python3 scripts/test_word_local_descriptor.py
           python3 scripts/test_word_local_flow.py
+          python3 scripts/test_word_offline_dispatch.py
           python3 scripts/test_word_longseq_api.py
           python3 scripts/test_word_longseq_codec.py
           python3 scripts/test_word_scope_autorepair.py

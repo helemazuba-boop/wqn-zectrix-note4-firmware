@@ -279,6 +279,10 @@ esp_err_t SkipWordStudyObservationV1(
 // non-200 HTTP status, or a malformed receipt. Both outputs are initialized at
 // entry. Keep baseline unrelated callers unchanged: these two wrappers never
 // call ValidateTokenOrClear.
+esp_err_t FetchWordEligibilityV1(const std::string& token,
+    const protocol::word_study_v1::EligibilityRequest& request,
+    protocol::word_study_v1::EligibilityData* data, protocol::v3::Error* error,
+    int* http_status = nullptr);
 esp_err_t RegisterLocalWordStudySessionV1(
     const std::string& token,
     const protocol::word_study_v1::LocalSessionRegistrationRequest& request,

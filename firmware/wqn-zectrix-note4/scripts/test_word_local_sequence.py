@@ -14,6 +14,10 @@ import tempfile
 from pathlib import Path
 
 STUBS = {
+    'mbedtls/sha256.h': '''#pragma once
+#include <openssl/sha.h>
+inline int mbedtls_sha256(const unsigned char* b,size_t n,unsigned char* out,int){return SHA256(b,n,out)?0:-1;}
+''',
     'esp_err.h': '''#pragma once
 using esp_err_t = int;
 #define ESP_OK 0
@@ -27,6 +31,7 @@ using esp_err_t = int;
 #define ESP_ERR_INVALID_RESPONSE 0x107
 #define ESP_ERR_INVALID_CRC 0x109
 #define ESP_ERR_INVALID_VERSION 0x10A
+#define ESP_ERR_NOT_SUPPORTED 0x10B
 ''',
     'esp_heap_caps.h': '''#pragma once
 #include <cstdlib>
@@ -132,6 +137,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wqn-local-seq-') as tmp:
         d = Path(tmp)
         (d / 'device_protocol').mkdir()
+        (d / 'mbedtls').mkdir()
         for name, body in STUBS.items():
             (d / name).write_text(body, encoding='utf-8')
         shutil.copy(root / 'components/device_protocol/include/device_protocol/word_study.h',
@@ -158,7 +164,7 @@ def main():
             '-DWQN_WORD_STUDY_SCHEMA_SHA256="host-fixture"',
             str(d / 'word_local_session.cpp'),
             str(d / 'policy.cpp'), str(d / 'extend.cpp'),
-            str(d / 'fixture.cpp'), '-Wl,--wrap=strcmp', '-o', str(d / 'test'),
+            str(d / 'fixture.cpp'), '-Wl,--wrap=strcmp', '-lcrypto', '-o', str(d / 'test'),
         ]
         subprocess.run(cmd, check=True, timeout=60)
         return subprocess.run([str(d / 'test')], timeout=30).returncode

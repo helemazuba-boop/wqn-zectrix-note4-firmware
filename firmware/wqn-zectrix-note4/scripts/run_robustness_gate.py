@@ -28,6 +28,7 @@ class Case:
 def cases():
     result = []
     for name, model, args in (
+        ('word_offline_dispatch', 'Offline words: cached controls do not acquire radio demand', ()),
         ('protocol_request_oom', 'R-28/N-03/N-05: allocation failure and pinned wire contracts', ('--validate-schema',)),
         ('note_install_serialization', 'R-01: full/targeted installation interleavings', ()),
         ('manifest_load_preservation', 'R-06: I/O or memory failure preserves caches', ()),
@@ -98,6 +99,9 @@ def cases():
         result.append(Case(f'native-candidate-{mutation}', 'R-08 ongoing: independent native recomputation and exact retained bytes', 'controls',
                            ('test_outbox_candidate.py', '--mutation', mutation), r'^FAIL native-candidate:',
                            r'Native outbox candidate: \d+ scenarios, [1-9]\d* failures, 0 errors \(NOT HIL\)'))
+    result.append(Case('word_offline_dispatch-force-network', 'Offline words: reject network demand for cached controls', 'controls',
+                       ('test_word_offline_dispatch.py', '--mutation', 'force-network'), r'^FAIL:',
+                       r'Offline word dispatch: \d+ checks, [1-9]\d* failures \(NOT HIL\)'))
     for name, mutation, summary in (
         ('display_recovery', 'no-limit', 'Display recovery'),
         ('storage_prepare_deadline', 'double-budget', 'Storage preparation deadline'),

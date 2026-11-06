@@ -184,6 +184,7 @@ enum class WordCloudOp {
 
 struct WordCloudRequest {
     bool resume_existing = false;
+    bool local_walk = false;
     WordCloudOp op = WordCloudOp::kPackSync;
     char request_id[65] = {};
     char session_id[37] = {};
@@ -230,6 +231,8 @@ struct WordCloudResult {
     WordCloudOp op = WordCloudOp::kPackSync;
     esp_err_t result = ESP_FAIL;
     bool auth_required = false;
+    bool review_queue_unavailable = false;
+    bool legacy_online_fallback = false;
     bool pack_index_ready = false;
     wqn::WordPackIndex pack_index;
     wqn::protocol::word_study_v1::SessionData session;
@@ -244,8 +247,8 @@ struct WordCloudResult {
     esp_err_t session_persist_result = ESP_OK;
     // Local sequential descriptor identity for the UI's whole-round cursor.
     // total_count is the selected scope total, not one <=500 segment.
-    bool local_sequence = false;
-    uint32_t local_sequence_total = 0;
+    bool local_walk = false;
+    uint32_t local_round_total = 0;
     std::string local_scope_deck_id;
     bool local_round_complete = false;
     // Exact segment base and pinned snapshot identity for coherent UI install.

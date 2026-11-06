@@ -47,7 +47,6 @@ enum class WordObservationTarget : uint8_t {
 
 enum class WordHomeSelection : uint8_t {
     kReview,
-    kSequential,
     kShuffle,
     kMistakes,
 };
@@ -84,6 +83,7 @@ struct WordReplayEntry {
 // never the schedule.
 struct WordReviewRuntime {
     std::vector<WordReplayEntry> pool;
+    bool queue_unavailable = false;
     uint32_t seed = 0;
     uint32_t cards_seen = 0;
     // The card on screen is a replay of a word seen earlier: answering it
@@ -265,6 +265,7 @@ struct WordAppState {
     WordOutboxState outbox;
     WordReviewRuntime review;
     WordSessionChain chain;
+    WordSessionChain shuffle_chain;
 
     WordPackIndex pack_index;
     // A cloud refresh never mutates the content snapshot used by an active
@@ -356,6 +357,7 @@ struct WordAppSnapshot {
     // True only when the queue arrived empty ("今天没有到期的单词"); a queue the
     // user skipped through is finished, not empty.
     bool review_complete_empty = false;
+    bool review_queue_unavailable = false;
     uint16_t review_complete_reviewed = 0;
     uint16_t review_complete_unknown = 0;
     uint16_t review_complete_replayed = 0;

@@ -38,7 +38,7 @@ std::string MakeLocalStartIdentity(const std::string& request_id)
 }
 
 constexpr char kTag[] = "wqn_word";
-constexpr size_t kWordHomeSelectionCount = 4;
+constexpr size_t kWordHomeSelectionCount = 3;
 // Written by the sync service, read by the UI task when it builds a snapshot.
 std::atomic<int32_t> g_word_review_due_count{-1};
 // Mistakes-pool hint written by the sync service; -1 = unknown (no sync yet).
@@ -115,8 +115,6 @@ wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
         case 0:
             return wqn::WordHomeSelection::kReview;
         case 1:
-            return wqn::WordHomeSelection::kSequential;
-        case 2:
             return wqn::WordHomeSelection::kShuffle;
         default:
             return wqn::WordHomeSelection::kMistakes;
@@ -128,8 +126,6 @@ wqn::WordHomeSelection HomeSelectionFromIndex(size_t index)
     switch (selection) {
         case wqn::WordHomeSelection::kReview:
             return "智能复习";
-        case wqn::WordHomeSelection::kSequential:
-            return "顺序学习";
         case wqn::WordHomeSelection::kShuffle:
             return "随机浏览";
         case wqn::WordHomeSelection::kMistakes:
@@ -176,6 +172,18 @@ bool IsIntakeSession(const wqn::PersistedWordSession& session)
 bool IsSequentialSession(const wqn::PersistedWordSession& session)
 {
     return session.remote.mode == wqn::protocol::word_study_v1::Mode::kSequential;
+}
+
+bool IsLocalWalkSession(const wqn::PersistedWordSession& session)
+{
+    return IsSequentialSession(session) ||
+           (session.remote.mode == wqn::protocol::word_study_v1::Mode::kShuffle &&
+            wqn::IsValidLocalSessionUuid(session.remote.seed));
+}
+wqn::WordSessionChain& WalkChain(wqn::WordAppState* state, wqn::protocol::word_study_v1::Mode mode)
+{
+    return mode == wqn::protocol::word_study_v1::Mode::kShuffle ? state->shuffle_chain
+                                                                : state->chain;
 }
 
 void ShowStudyCard(wqn::WordAppState* state)
@@ -233,6 +241,7 @@ void SeedReviewRuntime(
 {
     if (review == nullptr) return;
     review->pool.clear();
+    review->queue_unavailable = false;
     review->seed = 0;
     review->cards_seen = 0;
     review->replay_in_flight = false;
@@ -696,7 +705,7 @@ void ActivatePendingWordPackIndex(wqn::WordAppState* state)
 // sequential session; every other mode has no library cursor.
 void SaveSequentialCursor(wqn::WordAppState* state)
 {
-    if (state == nullptr || !IsSequentialSession(state->session.persisted)) {
+    if (state == nullptr || !IsLocalWalkSession(state->session.persisted)) {
         return;
     }
     uint64_t absolute = 0;
@@ -708,20 +717,23 @@ void SaveSequentialCursor(wqn::WordAppState* state)
         ? UINT32_MAX : static_cast<uint32_t>(absolute);
     // RAM only: the durable authority is the replayed slot/journal and the
     // immutable local descriptor. Legacy NVS has no pack/scope identity.
-    state->chain.sequential_cursor = cursor;
+    WalkChain(state,state->session.persisted.remote.mode).sequential_cursor = cursor;
 }
 
 // Arm the library walk (mode=sequential from the durable cursor). Used both by
 // the completion page and after the intake head of the chain.
-void StartSequentialWalk(wqn::WordAppState* state, bool from_chain)
+void StartSequentialWalk(
+    wqn::WordAppState* state, bool from_chain,
+    wqn::protocol::word_study_v1::Mode mode = wqn::protocol::word_study_v1::Mode::kSequential)
 {
-    if (state == nullptr) return;
-    if (state->session.requested_mode !=
-        wqn::protocol::word_study_v1::Mode::kSequential) {
+    if (state == nullptr)
+        return;
+    if (state->session.requested_mode != mode)
+    {
         state->session.create_request_id.clear();
     }
-    state->session.requested_mode = wqn::protocol::word_study_v1::Mode::kSequential;
-    state->session.requested_start_index = state->chain.sequential_cursor;
+    state->session.requested_mode = mode;
+    state->session.requested_start_index = WalkChain(state, mode).sequential_cursor;
     state->session.requested_new_word_limit = 0;
     state->session.start_requested = true;
     state->mode = wqn::WordAppMode::kSessionStarting;
@@ -729,7 +741,7 @@ void StartSequentialWalk(wqn::WordAppState* state, bool from_chain)
 }
 
 // Arm today's new words (mode=intake), the head of 顺序过词库.
-void StartIntakeHead(wqn::WordAppState* state)
+[[maybe_unused]] void StartIntakeHead(wqn::WordAppState* state)
 {
     if (state == nullptr) return;
     state->session.requested_mode = wqn::protocol::word_study_v1::Mode::kIntake;
@@ -808,7 +820,7 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
     // The observation effect may already have cleared `active` (the queue ran
     // out), so the mode -- not the flag -- decides where this lands.
     const bool completed_review = IsReviewSession(session);
-    const bool completed_sequential = IsSequentialSession(session);
+    const bool completed_sequential = IsLocalWalkSession(session);
     session.active = false;
     session.paused = false;
     SetStudySessionResumable(state, session.remote.mode, false);
@@ -818,14 +830,15 @@ void FinishOrLoadAdvancedReview(wqn::WordAppState* state)
         // 顺序过词库 starts over instead of asking for an empty slice.
         // Only the descriptor's whole-scope total decides a real round end.
         // A 500-item segment completion must continue, not wrap to zero.
-        if (state->chain.sequential_total > 0 &&
-            state->chain.sequential_cursor < state->chain.sequential_total) {
-            state->chain.segment_finished = true;
+        if (WalkChain(state,session.remote.mode).sequential_total > 0 &&
+            WalkChain(state,session.remote.mode).sequential_cursor < WalkChain(state,session.remote.mode).sequential_total) {
+            WalkChain(state,session.remote.mode).segment_finished = true;
         } else {
-            state->chain.sequential_cursor = 0;
-            state->chain.segment_finished = false;
-            state->chain.next_segment_armed = false;
-            state->message = "本轮完成，下次从第一词开始";
+            WalkChain(state,session.remote.mode).sequential_cursor = 0;
+            WalkChain(state,session.remote.mode).segment_finished = false;
+            WalkChain(state,session.remote.mode).next_segment_armed = false;
+            state->message = session.remote.mode == wqn::protocol::word_study_v1::Mode::kShuffle
+                ? "本轮浏览完成" : "本轮完成，下次从第一词开始";
         }
     }
     if (state->pending_pack_index_ready) {
@@ -980,9 +993,10 @@ esp_err_t InitWordApp(WordAppState* state)
     // Boot may perform synchronous storage reads. Prefer a replayed local
     // descriptor for the walk cursor: numeric NVS has no pack/scope identity.
     {
+        for (const auto walk_mode : {protocol::word_study_v1::Mode::kSequential, protocol::word_study_v1::Mode::kShuffle}) {
         PersistedWordSession sequential_slot;
         if (LoadPersistedWordSession(
-                protocol::word_study_v1::Mode::kSequential,
+                walk_mode,
                 &sequential_slot) == ESP_OK) {
             LocalWordSessionDescriptor descriptor;
             const bool have_descriptor =
@@ -997,18 +1011,19 @@ esp_err_t InitWordApp(WordAppState* state)
                 uint64_t absolute = 0;
                 if (WordSequenceAbsoluteCursor(sequential_slot, &absolute) == ESP_OK &&
                     absolute <= descriptor.total_count) {
-                    state->chain.sequential_cursor =
+                    WalkChain(state,walk_mode).sequential_cursor =
                         static_cast<uint32_t>(absolute);
-                    state->chain.sequential_total = descriptor.total_count;
-                    state->chain.pinned_session_id =
+                    WalkChain(state,walk_mode).sequential_total = descriptor.total_count;
+                    WalkChain(state,walk_mode).pinned_session_id =
                         sequential_slot.remote.session_id;
-                    state->chain.pinned_scope_generation =
+                    WalkChain(state,walk_mode).pinned_scope_generation =
                         sequential_slot.deck_scope_generation;
-                    state->chain.active = true;
+                    WalkChain(state,walk_mode).active = true;
                 }
             }
         }
     }
+        }
 
     bool found_paused_session = false;
     bool restored_active_session = false;
@@ -1219,14 +1234,11 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 return ESP_OK;
             }
             const auto requested_mode =
-                state->home_selection == WordHomeSelection::kSequential
-                    ? protocol::word_study_v1::Mode::kSequential
-                    : (state->home_selection == WordHomeSelection::kShuffle
-                           ? protocol::word_study_v1::Mode::kShuffle
-                           : (state->home_selection ==
-                                  WordHomeSelection::kMistakes
-                                  ? protocol::word_study_v1::Mode::kMistakes
-                                  : protocol::word_study_v1::Mode::kReview));
+                state->home_selection == WordHomeSelection::kShuffle
+                    ? protocol::word_study_v1::Mode::kShuffle
+                    : (state->home_selection == WordHomeSelection::kMistakes
+                           ? protocol::word_study_v1::Mode::kMistakes
+                           : protocol::word_study_v1::Mode::kReview);
             if (TryResumePausedSession(state, requested_mode)) {
                 return ESP_OK;
             }
@@ -1234,17 +1246,12 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
                 state->session.create_request_id.clear();
             }
             state->session.requested_mode = requested_mode;
-            state->session.requested_start_index =
-                requested_mode == protocol::word_study_v1::Mode::kSequential
-                    ? state->chain.sequential_cursor : 0;
+            state->session.requested_start_index = 0;
             state->session.requested_new_word_limit = 0;
             state->session.start_requested = true;
-            state->chain.active =
-                requested_mode == protocol::word_study_v1::Mode::kSequential;
+            state->chain.active = false;
             state->mode = WordAppMode::kSessionStarting;
-            state->message = requested_mode ==
-                    protocol::word_study_v1::Mode::kSequential
-                ? "正在准备本地顺序学习" : "正在准备本轮单词";
+            state->message = "正在准备本轮单词";
             return ESP_OK;
         }
 
@@ -1383,7 +1390,7 @@ esp_err_t HandleWordAppInput(WordAppState* state, WordInput input)
             }
             state->chain.exclude_ids.clear();
             state->chain.skip_ordinals.clear();
-            StartIntakeHead(state);
+            StartSequentialWalk(state, true);
             return ESP_OK;
     }
 
@@ -1688,6 +1695,7 @@ void ResetWordSessionsInMemory(WordAppState* state)
     state->card_prefetch = {};
     state->review = WordReviewRuntime{};
     state->chain = WordSessionChain{};
+    state->shuffle_chain = WordSessionChain{};
     state->review_session_resumable = false;
     state->shuffle_session_resumable = false;
     state->mistakes_session_resumable = false;
@@ -1717,54 +1725,64 @@ void ApplyWordPackIndex(WordAppState* state, WordPackIndex index, const std::str
     InstallWordPackIndex(state, std::move(index), message);
 }
 
-bool TakeWordSessionStartRequest(
-    WordAppState* state,
-    protocol::word_study_v1::CreateSessionRequest* request)
+bool TakeWordSessionStartRequest(WordAppState* state,
+                                 protocol::word_study_v1::CreateSessionRequest* request)
 {
-    if (state != nullptr && state->chain.segment_finished &&
-        state->chain.active && !HasBufferedWordObservations(*state) &&
-        state->session.commit_state != WordObservationCommitState::kPersisting &&
-        !state->session.cursor_intent_armed) {
-        state->chain.segment_finished = false;
-        state->chain.next_segment_armed = true;
-        state->session.local_session_id.clear();
-        state->session.create_request_id.clear();
-        StartSequentialWalk(state, true);
+    if (state != nullptr && !state->session.start_requested)
+    {
+        const auto mode = state->session.persisted.remote.mode;
+        auto& walk = WalkChain(state, mode);
+        if (walk.segment_finished && walk.active && !HasBufferedWordObservations(*state) &&
+            state->session.commit_state != WordObservationCommitState::kPersisting &&
+            !state->session.cursor_intent_armed)
+        {
+            walk.segment_finished = false;
+            walk.next_segment_armed = true;
+            state->session.local_session_id.clear();
+            state->session.create_request_id.clear();
+            StartSequentialWalk(state, true, mode);
+        }
     }
-    if (state == nullptr || request == nullptr || !state->session.start_requested) {
+    if (state == nullptr || request == nullptr || !state->session.start_requested)
+    {
         return false;
     }
-    if (state->session.create_request_id.empty()) {
+    if (state->session.create_request_id.empty())
+    {
         state->session.create_request_id = request->metadata.request_id;
-    } else {
+    }
+    else
+    {
         request->metadata.request_id = state->session.create_request_id;
     }
     request->mode = state->session.requested_mode;
     request->scope = {};
     // Study sessions honour the deck scope ([词] row override first, then the
     // NVS default).
-    const std::string& scope_deck_id = !state->scoped_deck_id.empty()
-        ? state->scoped_deck_id
-        : state->default_deck_id;
-    if (scope_deck_id.size() == 36) {
+    const std::string& scope_deck_id =
+        !state->scoped_deck_id.empty() ? state->scoped_deck_id : state->default_deck_id;
+    if (scope_deck_id.size() == 36)
+    {
         request->scope.deck_ids.push_back(scope_deck_id);
     }
     request->optional_count = 500;
     request->seed.clear();
-    if (request->mode == protocol::word_study_v1::Mode::kSequential) {
-        if (state->session.local_session_id.empty()) {
-            state->session.local_session_id =
-                MakeLocalStartIdentity(request->metadata.request_id);
-            state->session.local_seed = "local-sequential-v1";
-        }
+    if (request->mode == protocol::word_study_v1::Mode::kSequential ||
+        request->mode == protocol::word_study_v1::Mode::kShuffle)
+    {
+        if (state->session.local_session_id.empty())
+            state->session.local_session_id = MakeLocalStartIdentity(request->metadata.request_id);
         request->seed = state->session.local_session_id;
     }
     request->start_index = -1;
     request->new_word_limit = 0;
-    if (request->mode == protocol::word_study_v1::Mode::kSequential) {
-        request->start_index =
-            static_cast<int>(state->session.requested_start_index);
-    } else if (request->mode == protocol::word_study_v1::Mode::kIntake) {
+    if (request->mode == protocol::word_study_v1::Mode::kSequential ||
+        request->mode == protocol::word_study_v1::Mode::kShuffle)
+    {
+        request->start_index = static_cast<int>(state->session.requested_start_index);
+    }
+    else if (request->mode == protocol::word_study_v1::Mode::kIntake)
+    {
         request->new_word_limit = state->session.requested_new_word_limit;
     }
     state->session.start_requested = false;
@@ -1790,9 +1808,9 @@ bool ApplyWordSessionStartResult(
         state->message = result == ESP_ERR_INVALID_STATE
             ? "请先完成配对"
             : "本轮准备失败，可重试";
-        state->chain.active = false;
-        state->chain.exclude_ids.clear();
-        state->chain.skip_ordinals.clear();
+        WalkChain(state,requested_mode).active = false;
+        WalkChain(state,requested_mode).exclude_ids.clear();
+        WalkChain(state,requested_mode).skip_ordinals.clear();
         return true;
     }
     // The runner thread already compacted and (for active sessions) persisted
@@ -1800,9 +1818,9 @@ bool ApplyWordSessionStartResult(
     if (compact_result != ESP_OK) {
         state->mode = WordAppMode::kHome;
         state->message = "会话数据过大";
-        state->chain.active = false;
-        state->chain.exclude_ids.clear();
-        state->chain.skip_ordinals.clear();
+        WalkChain(state,requested_mode).active = false;
+        WalkChain(state,requested_mode).exclude_ids.clear();
+        WalkChain(state,requested_mode).skip_ordinals.clear();
         return true;
     }
     if (!persisted.active) {
@@ -1821,7 +1839,7 @@ bool ApplyWordSessionStartResult(
         }
         if (requested_mode == protocol::word_study_v1::Mode::kIntake &&
             state->chain.active) {
-            state->chain.exclude_ids.clear();
+            WalkChain(state,requested_mode).exclude_ids.clear();
             StartSequentialWalk(state, true);
             return true;
         }
@@ -1832,9 +1850,9 @@ bool ApplyWordSessionStartResult(
     if (persist_result != ESP_OK) {
         state->mode = WordAppMode::kHome;
         state->message = "会话未保存，请重试";
-        state->chain.active = false;
-        state->chain.exclude_ids.clear();
-        state->chain.skip_ordinals.clear();
+        WalkChain(state,requested_mode).active = false;
+        WalkChain(state,requested_mode).exclude_ids.clear();
+        WalkChain(state,requested_mode).skip_ordinals.clear();
         return true;
     }
     state->session.persisted = std::move(persisted);
@@ -1854,7 +1872,7 @@ bool ApplyWordSessionStartResult(
     }
     if (IsSequentialSession(state->session.persisted) && state->chain.active) {
         // The walk must not repeat the words the intake head just introduced.
-        state->chain.skip_ordinals.clear();
+        WalkChain(state,requested_mode).skip_ordinals.clear();
         for (const StoredWordSessionItem& item :
              state->session.persisted.remote.items) {
             const auto match = std::find(
@@ -1865,7 +1883,7 @@ bool ApplyWordSessionStartResult(
                 state->chain.skip_ordinals.push_back(item.ordinal);
             }
         }
-        state->chain.exclude_ids.clear();
+        WalkChain(state,requested_mode).exclude_ids.clear();
         const size_t first =
             NextQueuePosition(*state, state->session.persisted.position);
         state->session.persisted.position = static_cast<uint32_t>(first);
@@ -1883,9 +1901,9 @@ bool ApplyWordSessionStartResult(
             state, state->session.persisted.remote.mode, false);
         state->mode = WordAppMode::kHome;
         state->message = "会话词包尚未就绪";
-        state->chain.active = false;
-        state->chain.exclude_ids.clear();
-        state->chain.skip_ordinals.clear();
+        WalkChain(state,requested_mode).active = false;
+        WalkChain(state,requested_mode).exclude_ids.clear();
+        WalkChain(state,requested_mode).skip_ordinals.clear();
         return true;
     }
     ShowStudyCard(state);
@@ -1912,8 +1930,8 @@ void CancelWordSessionStartResult(WordAppState* state)
     state->session.start_result_expected = false;
     state->session.cancel_start_requested = false;
     state->session.session_load_armed = false;
-    state->chain.segment_finished = false;
-    state->chain.next_segment_armed = false;
+    WalkChain(state,state->session.requested_mode).segment_finished = false;
+    WalkChain(state,state->session.requested_mode).next_segment_armed = false;
     state->session.create_request_id.clear();
 }
 
@@ -2483,6 +2501,7 @@ WordAppSnapshot BuildWordAppSnapshot(const WordAppState& state)
     snapshot.finished_today = !state.session.persisted.active &&
         !state.session.persisted.remote.session_id.empty();
     snapshot.review_complete_empty = state.review.cards_seen == 0;
+    snapshot.review_queue_unavailable = state.review.queue_unavailable;
     snapshot.review_complete_reviewed = state.review.reviewed;
     snapshot.review_complete_unknown = state.review.unknown;
     snapshot.review_complete_replayed = state.review.replayed;
@@ -2550,15 +2569,18 @@ std::string WordAppProgressLabel(const WordAppState& state)
     const size_t visible_position = std::min(
         static_cast<size_t>(state.session.persisted.position) + 1,
         state.session.persisted.remote.items.size());
-    if (IsSequentialSession(state.session.persisted)) {
+    const auto& walk=state.session.persisted.remote.mode == protocol::word_study_v1::Mode::kShuffle
+        ? state.shuffle_chain : state.chain;
+    if (IsSequentialSession(state.session.persisted) ||
+        (state.session.persisted.remote.mode == protocol::word_study_v1::Mode::kShuffle && walk.active)) {
         uint64_t absolute = 0;
         if (WordSequenceAbsoluteCursor(
                 state.session.persisted, &absolute) != ESP_OK) {
             return "";
         }
         const uint64_t display_index = absolute == 0 ? 1 : absolute;
-        const uint64_t scoped_total = state.chain.sequential_total > 0
-            ? state.chain.sequential_total : GetScopedCount(state);
+        const uint64_t scoped_total = walk.sequential_total > 0
+            ? walk.sequential_total : GetScopedCount(state);
         const std::string total = scoped_total == 0
             ? std::string("--")
             : std::to_string(scoped_total);
@@ -2652,6 +2674,8 @@ std::string WordAppSignature(const WordAppState& state)
     signature.append(std::to_string(state.review.unknown));
     signature.push_back('/');
     signature.append(std::to_string(state.review.replayed));
+    signature.push_back('/');
+    signature.append(state.review.queue_unavailable ? "1" : "0");
     signature.push_back('/');
     signature.append(std::to_string(state.chain.sequential_cursor));
     signature.push_back('/');

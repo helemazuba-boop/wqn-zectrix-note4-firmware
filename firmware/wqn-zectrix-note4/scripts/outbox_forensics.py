@@ -34,7 +34,7 @@ MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 CHUNK_BYTES = 65536
 REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{16,64}\Z', re.ASCII)
 UUID = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z', re.ASCII)
-DESCRIPTOR_NAME = re.compile(r'wl([0-9a-fA-F]{24})\.(v1|tmp|bak)\Z', re.ASCII)
+DESCRIPTOR_NAME = re.compile(r'(wl|we)([0-9a-fA-F]{24})\.(v1|tmp|bak)\Z', re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -83,11 +83,12 @@ def source_names(domain, observed_names=()):
     # Preserve forensic reject records too; they are never upload candidates.
     for suffix in ('v1', 'tmp', 'bak'):
         names[f'{"wrej" if domain == "word" else "nrej"}.{suffix}'] = 'rejected-journal'
-    # Discover only flat word descriptor names. Preserve malformed/future wl*
-    # names too, as opaque evidence; neither spelling nor CRC authorizes replay.
+    # Discover flat descriptors and personal cache families. Cache discovery is
+    # conditional on observed files so older v1/v2 manifest pins stay valid.
+    # Preserve malformed/future names as opaque evidence, never replay proof.
     discovered = set()
     for name in observed_names:
-        if domain != 'word' or not isinstance(name, str) or not name.startswith('wl'):
+        if domain != 'word' or not isinstance(name, str) or not name.startswith(('wl', 'we')):
             continue
         if '/' in name or '\\' in name or '\0' in name:
             raise ValueError('unsafe word descriptor path')
@@ -96,11 +97,15 @@ def source_names(domain, observed_names=()):
             raise ValueError('descriptor inventory exceeds capture bound; preserve the raw image')
     for name in sorted(discovered):
         match = DESCRIPTOR_NAME.fullmatch(name)
-        if match:
+        if name in ('welig.v1', 'welig.tmp', 'welig.bak'):
             for suffix in ('v1', 'tmp', 'bak'):
-                names[f'wl{match[1]}.{suffix}'] = 'local-session-descriptor'
+                names[f'welig.{suffix}'] = 'personal-eligibility-cache'
+        elif match:
+            for suffix in ('v1', 'tmp', 'bak'):
+                names[f'{match[1]}{match[2]}.{suffix}'] = (
+                    'local-session-descriptor' if match[1] == 'wl' else 'personal-eligibility-cache')
         else:
-            names[name] = 'opaque-word-descriptor'
+            names[name] = 'opaque-word-descriptor' if name.startswith('wl') else 'opaque-word-cache'
     return names
 
 

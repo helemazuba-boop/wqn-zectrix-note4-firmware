@@ -1381,7 +1381,8 @@ void ReconcileSession(
         // The final journal fact advances the cursor without rewriting the
         // session file. Restore segment completion as well as its position,
         // otherwise a reset at 500 resumes an active but exhausted window.
-        if (session->remote.mode == wqn::protocol::word_study_v1::Mode::kSequential &&
+        if ((session->remote.mode == wqn::protocol::word_study_v1::Mode::kSequential ||
+             session->remote.mode == wqn::protocol::word_study_v1::Mode::kShuffle) &&
             session->position == session->remote.items.size() &&
             !session->remote.has_more) {
             session->active = false;
@@ -2343,6 +2344,246 @@ bool DeriveLocalDescriptorPaths(
         std::strlen(backup) <= 9 + 31;
 }
 
+// Separate, bounded cache. It never contains or replaces learning facts.
+constexpr uint32_t kEligibilityMagic = UINT32_C(0x4c455157); // WQEL
+constexpr size_t kEligibilityMaxBytes = 20U * 1024U;
+
+bool EligibilityPaths(const std::string& id, char p[40], char t[40], char b[40])
+{
+    if (id.empty())
+    {
+        std::snprintf(p, 40, "/storage/welig.v1");
+        std::snprintf(t, 40, "/storage/welig.tmp");
+        std::snprintf(b, 40, "/storage/welig.bak");
+        return true;
+    }
+    if (!DeriveLocalDescriptorPaths(id, p, t, b))
+        return false;
+    p[10] = 'e';
+    t[10] = 'e';
+    b[10] = 'e'; // wl -> we; full UUID is inside the CRC payload
+    return true;
+}
+
+bool EncodeEligibility(const wqn::LocalWordEligibility& e, std::vector<uint8_t>* bytes)
+{
+    if ((!e.round_id.empty() && !wqn::IsValidLocalSessionUuid(e.round_id)) ||
+        (!e.scope_deck_id.empty() && !wqn::IsValidLocalSessionUuid(e.scope_deck_id)) ||
+        e.actor_binding.size() != 64 || e.item_ids_sha256.size() != 64 ||
+        e.progress_revision > wqn::protocol::v3::kMaxSafeJsonInteger || e.mastered_bitmap.empty() ||
+        e.mastered_bitmap.size() > 10000 || e.snapshot.empty() || e.snapshot.size() > 32)
+        return false;
+    const auto hex = [](const std::string& v)
+    {
+        return std::all_of(v.begin(), v.end(),
+                           [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    };
+    if (!hex(e.actor_binding) || !hex(e.item_ids_sha256) ||
+        !std::all_of(e.mastered_bitmap.begin(), e.mastered_bitmap.end(),
+                     [](char c) { return c == '0' || c == '1'; }))
+        return false;
+    std::vector<uint8_t> payload;
+    AppendScalar<uint32_t>(&payload, e.deck_scope_generation);
+    AppendScalar<uint64_t>(&payload, e.progress_revision);
+    if (!AppendString(&payload, e.round_id, 36) || !AppendString(&payload, e.scope_deck_id, 36) ||
+        !AppendString(&payload, e.actor_binding, 64) ||
+        !AppendString(&payload, e.item_ids_sha256, 64) ||
+        !AppendString(&payload, e.mastered_bitmap, 10000))
+        return false;
+    AppendScalar<uint16_t>(&payload, static_cast<uint16_t>(e.snapshot.size()));
+    for (size_t i = 0; i < e.snapshot.size(); ++i)
+    {
+        const auto& pin = e.snapshot[i];
+        if (std::memchr(pin.deck_id, 0, sizeof(pin.deck_id)) != pin.deck_id + 36 ||
+            std::memchr(pin.sha256, 0, sizeof(pin.sha256)) != pin.sha256 + 64 ||
+            !wqn::IsValidLocalSessionUuid(pin.deck_id) || !hex(pin.sha256) ||
+            pin.pack_revision == 0 || pin.pack_revision > wqn::protocol::v3::kMaxSafeJsonInteger ||
+            pin.content_revision > wqn::protocol::v3::kMaxSafeJsonInteger)
+            return false;
+        for (size_t j = 0; j < i; ++j)
+            if (std::strcmp(pin.deck_id, e.snapshot[j].deck_id) == 0)
+                return false;
+        if (!AppendString(&payload, pin.deck_id, 36) || !AppendString(&payload, pin.sha256, 64))
+            return false;
+        AppendScalar<uint64_t>(&payload, pin.content_revision);
+        AppendScalar<uint64_t>(&payload, pin.pack_revision);
+    }
+    bytes->clear();
+    AppendScalar<uint32_t>(bytes, kEligibilityMagic);
+    AppendScalar<uint16_t>(bytes, 1);
+    AppendScalar<uint16_t>(bytes, 0);
+    AppendScalar<uint32_t>(bytes, static_cast<uint32_t>(payload.size()));
+    AppendScalar<uint32_t>(bytes, Crc32(payload.data(), payload.size()));
+    bytes->insert(bytes->end(), payload.begin(), payload.end());
+    return bytes->size() <= kEligibilityMaxBytes;
+}
+
+esp_err_t ReadEligibilityFile(const char* path, const std::string& id,
+                              wqn::LocalWordEligibility* out)
+{
+    FILE* f = std::fopen(path, "rb");
+    if (!f)
+        return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    std::vector<uint8_t> bytes;
+    uint8_t buf[512];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+        if (bytes.size() + n > kEligibilityMaxBytes)
+        {
+            std::fclose(f);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        bytes.insert(bytes.end(), buf, buf + n);
+    }
+    const bool failed = std::ferror(f) != 0;
+    const bool closed = std::fclose(f) == 0;
+    if (failed || !closed)
+        return ESP_FAIL;
+    if (bytes.size() < 16 || ReadLe(bytes.data(), 4) != kEligibilityMagic ||
+        ReadLe(bytes.data() + 4, 2) != 1 || ReadLe(bytes.data() + 6, 2) != 0 ||
+        ReadLe(bytes.data() + 8, 4) != bytes.size() - 16 ||
+        ReadLe(bytes.data() + 12, 4) != Crc32(bytes.data() + 16, bytes.size() - 16))
+        return ESP_ERR_INVALID_CRC;
+    PayloadReader reader(bytes.data() + 16, bytes.size() - 16);
+    wqn::LocalWordEligibility e;
+    uint16_t count = 0;
+    if (!reader.Scalar(&e.deck_scope_generation) || !reader.Scalar(&e.progress_revision) ||
+        !reader.String(&e.round_id, 36) || e.round_id != id ||
+        !reader.String(&e.scope_deck_id, 36) || !reader.String(&e.actor_binding, 64) ||
+        !reader.String(&e.item_ids_sha256, 64) || !reader.String(&e.mastered_bitmap, 10000) ||
+        !reader.Scalar(&count) || count > 32)
+        return ESP_ERR_INVALID_RESPONSE;
+    for (size_t i = 0; i < count; ++i)
+    {
+        wqn::StoredWordPackSnapshot pin;
+        std::string deck, sha;
+        if (!reader.String(&deck, 36) || !reader.String(&sha, 64) ||
+            !CopyFixedText(pin.deck_id, sizeof(pin.deck_id), deck) ||
+            !CopyFixedText(pin.sha256, sizeof(pin.sha256), sha) ||
+            !reader.Scalar(&pin.content_revision) || !reader.Scalar(&pin.pack_revision))
+            return ESP_ERR_INVALID_RESPONSE;
+        e.snapshot.push_back(pin);
+    }
+    std::vector<uint8_t> canonical;
+    if (!reader.finished() || !EncodeEligibility(e, &canonical) || canonical != bytes)
+        return ESP_ERR_INVALID_RESPONSE;
+    *out = std::move(e);
+    return ESP_OK;
+}
+
+esp_err_t ReadEligibilityRaw(const std::string& id, wqn::LocalWordEligibility* out)
+{
+    char p[40], t[40], b[40];
+    if (!EligibilityPaths(id, p, t, b))
+        return ESP_ERR_INVALID_ARG;
+    const auto primary = ReadEligibilityFile(p, id, out);
+    if (primary == ESP_OK || primary == ESP_FAIL)
+        return primary;
+    const auto backup = ReadEligibilityFile(b, id, out);
+    if (backup == ESP_OK || backup == ESP_FAIL)
+        return backup;
+    return primary == ESP_ERR_NOT_FOUND ? backup : primary;
+}
+
+esp_err_t WriteEligibilityRaw(const wqn::LocalWordEligibility& e)
+{
+    if (e.deck_scope_generation != wqn::GetDeckScopeGeneration())
+        return ESP_ERR_INVALID_STATE;
+    std::vector<uint8_t> bytes;
+    if (!EncodeEligibility(e, &bytes))
+        return ESP_ERR_INVALID_ARG;
+    char p[40], t[40], b[40];
+    if (!EligibilityPaths(e.round_id, p, t, b))
+        return ESP_ERR_INVALID_ARG;
+    if (!e.round_id.empty())
+    {
+        wqn::LocalWordEligibility existing;
+        auto old = ReadEligibilityRaw(e.round_id, &existing);
+        if (old == ESP_OK)
+        {
+            std::vector<uint8_t> prior;
+            return EncodeEligibility(existing, &prior) && prior == bytes ? ESP_OK
+                                                                         : ESP_ERR_INVALID_STATE;
+        }
+        if (old != ESP_ERR_NOT_FOUND)
+            return old;
+        // Only the current shuffle slot can need a round bitmap. Descriptors
+        // already preserve every upload candidate; pending facts need no cache.
+        wqn::PersistedWordSession active;
+        auto loaded = LoadSessionSlotRaw(wqn::protocol::word_study_v1::Mode::kShuffle, &active);
+        if (loaded != ESP_OK && loaded != ESP_ERR_NOT_FOUND)
+            return loaded;
+        char keep[40] = {}, kt[40], kb[40], keep_backup[40] = {};
+        if (loaded == ESP_OK && wqn::IsValidLocalSessionUuid(active.remote.seed))
+            EligibilityPaths(active.remote.seed, keep, kt, kb);
+        SessionPaths paths;
+        if (!GetSessionPaths(wqn::protocol::word_study_v1::Mode::kShuffle, &paths))
+            return ESP_ERR_INVALID_ARG;
+        wqn::PersistedWordSession backup_session;
+        if (LoadSessionFile(paths.backup, &backup_session, false) == ESP_OK &&
+            wqn::IsValidLocalSessionUuid(backup_session.remote.seed))
+            EligibilityPaths(backup_session.remote.seed, keep_backup, kt, kb);
+        DIR* dir = opendir("/storage");
+        if (!dir)
+            return ESP_FAIL;
+        std::vector<std::string> stems;
+        bool failed = false;
+        for (;;)
+        {
+            errno = 0;
+            auto* entry = readdir(dir);
+            if (!entry)
+            {
+                failed = errno != 0;
+                break;
+            }
+            std::string name(entry->d_name);
+            if (name.size() != 29 || name.compare(0, 2, "we") != 0 || name.substr(26) != ".v1")
+                continue;
+            std::string path = "/storage/" + name;
+            if (!std::all_of(name.begin() + 2, name.begin() + 26,
+                             [](char c) {
+                                 return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                                        (c >= 'A' && c <= 'F');
+                             }))
+                continue;
+            if (path != keep && path != keep_backup && path != p)
+                stems.push_back(path.substr(0, path.size() - 3));
+            if (stems.size() > 32)
+            {
+                failed = true;
+                break;
+            }
+        }
+        if (closedir(dir) != 0 || failed)
+            return ESP_FAIL;
+        for (const auto& stem : stems)
+        {
+            // Unknown/corrupt cache families are evidence, not deletion proof.
+            FILE* f = std::fopen((stem + ".v1").c_str(), "rb");
+            if (!f)
+                return ESP_FAIL;
+            uint8_t prefix[66];
+            const bool read = std::fread(prefix, 1, sizeof(prefix), f) == sizeof(prefix);
+            const bool closed = std::fclose(f) == 0;
+            if (!read || !closed || ReadLe(prefix + 28, 2) != 36)
+                return ESP_FAIL;
+            const std::string id(reinterpret_cast<const char*>(prefix + 30), 36);
+            wqn::LocalWordEligibility proof;
+            char canonical[40], unused_t[40], unused_b[40];
+            if (!EligibilityPaths(id, canonical, unused_t, unused_b) ||
+                std::string(canonical) != stem + ".v1" ||
+                ReadEligibilityFile(canonical, id, &proof) != ESP_OK)
+                return ESP_FAIL;
+            for (const char* ext : {".v1", ".bak", ".tmp"})
+                if (std::remove((stem + ext).c_str()) != 0 && errno != ENOENT)
+                    return ESP_FAIL;
+        }
+    }
+    return AtomicWrite(p, t, b, bytes.data(), bytes.size());
+}
+
 // Full descriptor validation shared by save and load.  Independent of I/O so a
 // corrupt/oversized/duplicate descriptor can never be published or recovered.
 bool LocalDescriptorSemanticsValid(
@@ -2357,9 +2598,9 @@ bool LocalDescriptorSemanticsValid(
     };
     if (!s.active || s.paused || s.position != 0 ||
         s.phase != wqn::WordPresentationPhase::kFront ||
-        r.mode != Mode::kSequential || r.purpose != Purpose::kStudy ||
-        r.ordering != Ordering::kSequential || !r.include_mastered ||
-        r.next_sequence != 0 || r.progress_revision != 0 || r.has_more ||
+        !((r.mode == Mode::kSequential && r.ordering == Ordering::kSequential && r.include_mastered) ||
+          (r.mode == Mode::kShuffle && r.ordering == Ordering::kPureRandomV1 && !r.include_mastered)) || r.purpose != Purpose::kStudy ||
+        r.next_sequence != 0 || r.progress_revision > wqn::protocol::v3::kMaxSafeJsonInteger || r.has_more ||
         !r.cursor.empty() || r.optional_count < 1 || r.optional_count > 500 ||
         r.seed.empty() || r.seed.size() > 64 ||
         !std::all_of(r.seed.begin(), r.seed.end(), [](unsigned char c) {
@@ -3215,6 +3456,32 @@ esp_err_t ReadWordOutboxSnapshot(WordOutboxSnapshot* snapshot)
 // (+ SleepLease). UI reaches these through the persist worker, never directly.
 // Kept BEFORE PrepareWordObservationOutboxForSleep so the existing host replay
 // fixture's section() boundaries stay unchanged.
+
+esp_err_t SaveLocalWordEligibility(const LocalWordEligibility& eligibility)
+{
+    auto transaction = [](void* opaque) -> esp_err_t
+    { return WriteEligibilityRaw(*static_cast<const LocalWordEligibility*>(opaque)); };
+    return ExecuteWithStorageLease("word-eligibility-save", transaction,
+                                   const_cast<LocalWordEligibility*>(&eligibility));
+}
+
+esp_err_t LoadLocalWordEligibility(const std::string& round_id, LocalWordEligibility* out)
+{
+    if (out == nullptr)
+        return ESP_ERR_INVALID_ARG;
+    struct Context
+    {
+        const std::string* id;
+        LocalWordEligibility* out;
+    } context{&round_id, out};
+    auto transaction = [](void* opaque) -> esp_err_t
+    {
+        auto* c = static_cast<Context*>(opaque);
+        return ReadEligibilityRaw(*c->id, c->out);
+    };
+    *out = {};
+    return ExecuteWithStorageLease("word-eligibility-load", transaction, &context);
+}
 
 esp_err_t SaveLocalWordSessionDescriptor(
     const LocalWordSessionDescriptor& descriptor)

@@ -7,6 +7,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "mbedtls/sha256.h"
 
 namespace wqn {
 namespace {
@@ -257,10 +258,10 @@ bool DescriptorSemanticsValid(const LocalWordSessionDescriptor& descriptor)
     const StoredWordSessionData& r = s.remote;
     if (!s.active || s.paused || s.position != 0 ||
         s.phase != WordPresentationPhase::kFront ||
-        r.mode != Mode::kSequential || r.purpose != Purpose::kStudy ||
-        r.ordering != Ordering::kSequential || !r.include_mastered ||
+        !((r.mode == Mode::kSequential && r.ordering == Ordering::kSequential && r.include_mastered) ||
+          (r.mode == Mode::kShuffle && r.ordering == Ordering::kPureRandomV1 && !r.include_mastered)) || r.purpose != Purpose::kStudy ||
         !IsUrlSafeSeed(r.seed) || r.next_sequence != 0 ||
-        r.progress_revision != 0 || r.has_more || !r.cursor.empty() ||
+        r.progress_revision > kMaxSafeRevision || r.has_more || !r.cursor.empty() ||
         r.items.empty() ||
         r.items.size() > kMaxSessionItems) {
         return false;
@@ -315,6 +316,89 @@ bool DescriptorSemanticsValid(const LocalWordSessionDescriptor& descriptor)
 
 }  // namespace
 
+
+std::string WordLocalSha256(const std::string& bytes)
+{
+    unsigned char digest[32] = {};
+    if (mbedtls_sha256(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size(), digest,
+                       0) != 0)
+        return {};
+    char hex[65] = {};
+    for (size_t i = 0; i < 32; ++i)
+        std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    return hex;
+}
+
+bool LocalWordEligibilityMatches(const WordPackIndex& index,
+                                 const LocalWordEligibility& eligibility, const std::string& scope)
+{
+    if (!index.mounted || !index.has_manifest || index.truncated || index.pack_error ||
+        !IsLowerHex(eligibility.actor_binding.c_str(), eligibility.actor_binding.size() + 1, 64) ||
+        !IsLowerHex(eligibility.item_ids_sha256.c_str(), eligibility.item_ids_sha256.size() + 1,
+                    64) ||
+        eligibility.progress_revision > kMaxSafeRevision ||
+        (!eligibility.scope_deck_id.empty() && eligibility.scope_deck_id != scope) ||
+        eligibility.snapshot.empty() || eligibility.snapshot.size() > kMaxDecks)
+        return false;
+    for (size_t i = 0; i < eligibility.snapshot.size(); ++i)
+    {
+        const auto& saved = eligibility.snapshot[i];
+        if (!FixedTextLength(saved.deck_id, sizeof(saved.deck_id), 36) ||
+            !IsLowerHex(saved.sha256, sizeof(saved.sha256), 64) ||
+            !IsValidLocalSessionUuid(saved.deck_id))
+            return false;
+        for (size_t j = 0; j < i; ++j)
+            if (std::strcmp(saved.deck_id, eligibility.snapshot[j].deck_id) == 0)
+                return false;
+        auto at = std::find_if(index.pack_identities.begin(), index.pack_identities.end(),
+                               [&](const auto& pin)
+                               {
+                                   return ValidPin(pin) &&
+                                          std::strcmp(saved.deck_id, pin.deck_id) == 0 &&
+                                          std::strcmp(saved.sha256, pin.sha256) == 0 &&
+                                          saved.pack_revision == pin.pack_revision &&
+                                          saved.content_revision == pin.content_revision;
+                               });
+        if (at == index.pack_identities.end())
+            return false;
+    }
+    ScratchVector<const WordPackIndexEntry*> ids;
+    for (const auto& e : index.entries)
+    {
+        if (!FixedTextLength(e.word_id, sizeof(e.word_id), 36) ||
+            !FixedTextLength(e.deck_id, sizeof(e.deck_id), 36) ||
+            !IsValidLocalSessionUuid(e.word_id) || !IsValidLocalSessionUuid(e.deck_id))
+            return false;
+        if (eligibility.scope_deck_id.empty() || eligibility.scope_deck_id == e.deck_id)
+        {
+            if (std::none_of(eligibility.snapshot.begin(), eligibility.snapshot.end(),
+                             [&](const auto& pin)
+                             { return std::strcmp(pin.deck_id, e.deck_id) == 0; }))
+                return false;
+            ids.push_back(&e);
+        }
+    }
+    if (ids.empty() || ids.size() > 10000 || ids.size() != eligibility.mastered_bitmap.size())
+        return false;
+    std::sort(ids.begin(), ids.end(),
+              [](const auto* a, const auto* b) { return std::strcmp(a->word_id, b->word_id) < 0; });
+    std::string canonical;
+    canonical.reserve(ids.size() * 37);
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        if (i > 0)
+        {
+            if (std::strcmp(ids[i - 1]->word_id, ids[i]->word_id) == 0)
+                return false;
+            canonical += '\n';
+        }
+        canonical += ids[i]->word_id;
+        if (eligibility.mastered_bitmap[i] != '0' && eligibility.mastered_bitmap[i] != '1')
+            return false;
+    }
+    return WordLocalSha256(canonical) == eligibility.item_ids_sha256;
+}
+
 bool IsValidLocalSessionUuid(const std::string& value)
 {
     if (value.size() != 36) return false;
@@ -331,33 +415,41 @@ bool IsValidLocalSessionUuid(const std::string& value)
     return true;
 }
 
-esp_err_t PrepareLocalWordSequence(
-    const WordPackIndex& index,
-    const std::string& deck_id,
-    uint32_t start_index,
-    const std::string& session_uuid,
-    const std::string& seed,
-    uint32_t generation,
-    LocalWordSessionDescriptor* out)
+esp_err_t PrepareLocalWordSequence(const WordPackIndex& index, const std::string& deck_id,
+                                   uint32_t start_index, const std::string& session_uuid,
+                                   const std::string& seed, uint32_t generation,
+                                   LocalWordSessionDescriptor* out, Mode mode,
+                                   const LocalWordEligibility* eligibility)
 {
-    if (out == nullptr) return ESP_ERR_INVALID_ARG;
+    if (mode != Mode::kSequential && mode != Mode::kShuffle)
+        return ESP_ERR_INVALID_ARG;
+    if (mode == Mode::kShuffle &&
+        (eligibility == nullptr || !LocalWordEligibilityMatches(index, *eligibility, deck_id)))
+        return ESP_ERR_INVALID_STATE;
+    if (out == nullptr)
+        return ESP_ERR_INVALID_ARG;
     *out = {};
-    if (!index.mounted || !index.has_manifest || index.truncated ||
-        index.pack_error || index.entries.empty() ||
-        index.pack_identities.empty()) {
+    if (!index.mounted || !index.has_manifest || index.truncated || index.pack_error ||
+        index.entries.empty() || index.pack_identities.empty())
+    {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!IsValidLocalSessionUuid(session_uuid)) return ESP_ERR_INVALID_ARG;
-    if (!IsUrlSafeSeed(seed)) return ESP_ERR_INVALID_ARG;  // empty seed rejected
-    if (!deck_id.empty() && !IsValidLocalSessionUuid(deck_id)) {
+    if (!IsValidLocalSessionUuid(session_uuid))
+        return ESP_ERR_INVALID_ARG;
+    if (!IsUrlSafeSeed(seed))
+        return ESP_ERR_INVALID_ARG; // empty seed rejected
+    if (!deck_id.empty() && !IsValidLocalSessionUuid(deck_id))
+    {
         return ESP_ERR_INVALID_ARG;
     }
     // Every entry id must be a well-formed UUID (bounded, no strlen overflow).
-    for (const WordPackIndexEntry& entry : index.entries) {
+    for (const WordPackIndexEntry& entry : index.entries)
+    {
         if (!FixedTextLength(entry.word_id, sizeof(entry.word_id), 36) ||
             !FixedTextLength(entry.deck_id, sizeof(entry.deck_id), 36) ||
             !IsValidLocalSessionUuid(std::string(entry.word_id)) ||
-            !IsValidLocalSessionUuid(std::string(entry.deck_id))) {
+            !IsValidLocalSessionUuid(std::string(entry.deck_id)))
+        {
             return ESP_ERR_INVALID_ARG;
         }
     }
@@ -367,39 +459,70 @@ esp_err_t PrepareLocalWordSequence(
     // PSRAM scratch, POD pointers, no per-word std::string.
     ScratchVector<OrderedWord> ordered;
     ordered.reserve(index.entries.size());
-    for (const WordPackIndexEntry& entry : index.entries) {
-        if (!deck_id.empty() &&
-            !FixedTextEquals(entry.deck_id, sizeof(entry.deck_id), deck_id)) {
+    for (const WordPackIndexEntry& entry : index.entries)
+    {
+        if (!deck_id.empty() && !FixedTextEquals(entry.deck_id, sizeof(entry.deck_id), deck_id))
+        {
             continue;
         }
         ordered.push_back({&entry});
     }
     std::sort(ordered.begin(), ordered.end(), LocalCandidateLess);
-    if (ordered.size() > std::numeric_limits<uint32_t>::max()) {
+    if (ordered.size() > std::numeric_limits<uint32_t>::max())
+    {
         return ESP_ERR_INVALID_SIZE;
     }
 
     // Canonical cross-deck traversal order derived from the SAME comparator.
     ScratchVector<TraversalDeck> traversal;
-    esp_err_t order_result =
-        DeriveTraversalOrder(ordered, 0, ordered.size(), &traversal);
-    if (order_result != ESP_OK) return order_result;
+    esp_err_t order_result = DeriveTraversalOrder(ordered, 0, ordered.size(), &traversal);
+    if (order_result != ESP_OK)
+        return order_result;
 
     StoredSnapshotVector snapshot;
-    std::vector<StoredWordDeckId, WordStorePsramAllocator<StoredWordDeckId>>
-        deck_ids;
-    esp_err_t scope_result =
-        ResolveScope(index, deck_id, traversal, &snapshot, &deck_ids);
-    if (scope_result != ESP_OK) return scope_result;
+    std::vector<StoredWordDeckId, WordStorePsramAllocator<StoredWordDeckId>> deck_ids;
+    esp_err_t scope_result = ResolveScope(index, deck_id, traversal, &snapshot, &deck_ids);
+    if (scope_result != ESP_OK)
+        return scope_result;
 
     // Restrict the ordered list to the selected scope and re-sort (the
     // comparator is deterministic, so this equals the original relative order).
     ScratchVector<OrderedWord> scoped;
     scoped.reserve(ordered.size());
-    for (const OrderedWord& ow : ordered) {
-        if (ScopeContains(deck_ids, ow.entry->deck_id)) scoped.push_back(ow);
+    for (const OrderedWord& ow : ordered)
+    {
+        if (ScopeContains(deck_ids, ow.entry->deck_id))
+            scoped.push_back(ow);
     }
-    if (scoped.empty()) return ESP_ERR_INVALID_SIZE;
+    if (mode == Mode::kShuffle)
+    {
+        ScratchVector<const WordPackIndexEntry*> by_id;
+        for (const auto& e : index.entries)
+        {
+            if (eligibility->scope_deck_id.empty() || eligibility->scope_deck_id == e.deck_id)
+                by_id.push_back(&e);
+        }
+        std::sort(by_id.begin(), by_id.end(), [](const auto* a, const auto* b)
+                  { return std::strcmp(a->word_id, b->word_id) < 0; });
+        scoped.erase(
+            std::remove_if(
+                scoped.begin(), scoped.end(),
+                [&](const OrderedWord& word)
+                {
+                    auto at = std::lower_bound(by_id.begin(), by_id.end(), word.entry,
+                                               [](const auto* a, const auto* b)
+                                               { return std::strcmp(a->word_id, b->word_id) < 0; });
+                    return at == by_id.end() ||
+                           std::strcmp((*at)->word_id, word.entry->word_id) != 0 ||
+                           eligibility->mastered_bitmap[static_cast<size_t>(at - by_id.begin())] ==
+                               '1';
+                }),
+            scoped.end());
+        if (scoped.empty())
+            return ESP_ERR_NOT_FOUND;
+    }
+    if (scoped.empty())
+        return ESP_ERR_INVALID_SIZE;
     std::sort(scoped.begin(), scoped.end(), LocalCandidateLess);
 
     // Duplicate item ids anywhere in the scope must fail, not silently shift
@@ -408,20 +531,50 @@ esp_err_t PrepareLocalWordSequence(
     // Keep scoped in traversal order; 10k words must not require 50M strcmp
     // calls just to prove uniqueness before preparing the first segment.
     ordered.assign(scoped.begin(), scoped.end());
-    std::sort(ordered.begin(), ordered.end(), [](const OrderedWord& left, const OrderedWord& right) {
-        return std::strcmp(left.entry->word_id, right.entry->word_id) < 0;
-    });
-    for (size_t i = 1; i < ordered.size(); ++i) {
-        if (std::strcmp(ordered[i - 1].entry->word_id, ordered[i].entry->word_id) == 0) {
+    std::sort(ordered.begin(), ordered.end(), [](const OrderedWord& left, const OrderedWord& right)
+              { return std::strcmp(left.entry->word_id, right.entry->word_id) < 0; });
+    for (size_t i = 1; i < ordered.size(); ++i)
+    {
+        if (std::strcmp(ordered[i - 1].entry->word_id, ordered[i].entry->word_id) == 0)
+        {
             return ESP_ERR_INVALID_RESPONSE;
         }
     }
 
+    if (mode == Mode::kShuffle)
+    {
+        const auto rank = [&](const char* id)
+        {
+            uint64_t hash = UINT64_C(0xcbf29ce484222325);
+            for (unsigned char c : seed)
+            {
+                hash ^= c;
+                hash *= UINT64_C(0x100000001b3);
+            }
+            hash ^= 0;
+            hash *= UINT64_C(0x100000001b3);
+            for (const unsigned char* c = reinterpret_cast<const unsigned char*>(id); *c; ++c)
+            {
+                hash ^= *c;
+                hash *= UINT64_C(0x100000001b3);
+            }
+            return hash;
+        };
+        std::sort(scoped.begin(), scoped.end(),
+                  [&](const OrderedWord& a, const OrderedWord& b)
+                  {
+                      const auto ah = rank(a.entry->word_id), bh = rank(b.entry->word_id);
+                      return ah != bh ? ah < bh
+                                      : std::strcmp(a.entry->word_id, b.entry->word_id) < 0;
+                  });
+    }
     const uint32_t total = static_cast<uint32_t>(scoped.size());
-    if (start_index > total) return ESP_ERR_INVALID_RESPONSE;
-    if (start_index == total) return ESP_ERR_NOT_FOUND;  // full complete, no wrap
-    const uint32_t segment_count = static_cast<uint32_t>(
-        std::min<size_t>(kMaxSessionItems, total - start_index));
+    if (start_index > total)
+        return ESP_ERR_INVALID_RESPONSE;
+    if (start_index == total)
+        return ESP_ERR_NOT_FOUND; // full complete, no wrap
+    const uint32_t segment_count =
+        static_cast<uint32_t>(std::min<size_t>(kMaxSessionItems, total - start_index));
 
     LocalWordSessionDescriptor descriptor;
     descriptor.total_count = total;
@@ -435,22 +588,23 @@ esp_err_t PrepareLocalWordSequence(
 
     StoredWordSessionData& remote = session.remote;
     remote.session_id = session_uuid;
-    remote.mode = Mode::kSequential;
+    remote.mode = mode;
     remote.purpose = Purpose::kStudy;
-    remote.ordering = Ordering::kSequential;
+    remote.ordering = mode == Mode::kShuffle ? Ordering::kPureRandomV1 : Ordering::kSequential;
     remote.seed = seed;
-    remote.include_mastered = true;
+    remote.include_mastered = mode == Mode::kSequential;
     remote.optional_count = static_cast<int>(kMaxSessionItems);
     remote.next_sequence = 0;
-    remote.progress_revision = 0;
+    remote.progress_revision = eligibility == nullptr ? 0 : eligibility->progress_revision;
     remote.has_more = false;
     remote.cursor.clear();
-    remote.deck_ids = std::move(deck_ids);      // traversal order
-    remote.snapshot = std::move(snapshot);      // same traversal order
+    remote.deck_ids = std::move(deck_ids); // traversal order
+    remote.snapshot = std::move(snapshot); // same traversal order
     remote.items.reserve(segment_count);
     // Segment-local DENSE ordinals 0..segment_count-1.  start_index is added
     // ONLY by WordSequenceAbsoluteCursor, never here (no double add).
-    for (uint32_t i = 0; i < segment_count; ++i) {
+    for (uint32_t i = 0; i < segment_count; ++i)
+    {
         const WordPackIndexEntry& entry = *scoped[start_index + i].entry;
         StoredWordSessionItem item;
         std::memcpy(item.item_id, entry.word_id, sizeof(item.item_id));
@@ -458,7 +612,8 @@ esp_err_t PrepareLocalWordSequence(
         item.ordinal = i;
         remote.items.push_back(item);
     }
-    if (!DescriptorSemanticsValid(descriptor)) return ESP_ERR_INVALID_RESPONSE;
+    if (!DescriptorSemanticsValid(descriptor))
+        return ESP_ERR_INVALID_RESPONSE;
     *out = std::move(descriptor);
     return ESP_OK;
 }
@@ -644,7 +799,9 @@ bool LocalSequenceSnapshotMatches(
     // the total scoped count to equal total_count (so a reordered/rebuilt index
     // that still has the same SHA set but a different deck order is caught).
     if (current.size() != descriptor.session.remote.deck_ids.size() ||
-        scoped.size() != descriptor.total_count) {
+        (descriptor.session.remote.mode == Mode::kShuffle
+            ? scoped.size() < descriptor.total_count
+            : scoped.size() != descriptor.total_count)) {
         return false;
     }
     for (size_t i = 0; i < current.size(); ++i) {

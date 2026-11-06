@@ -69,6 +69,26 @@ struct LocalWordSessionDescriptor {
     uint32_t total_count = 0;
 };
 
+// Personal progress is separate from shared content packs. A complete bitmap
+// follows UUID order, authenticated by the item-set digest and exact pack pins.
+// A round gets an immutable copy before its first descriptor is published.
+struct LocalWordEligibility {
+    std::string round_id;  // empty = latest reusable snapshot
+    std::string scope_deck_id;
+    std::string actor_binding;  // SHA256 of the pairing token; never the token
+    uint32_t deck_scope_generation = 0;
+    uint64_t progress_revision = 0;
+    std::string item_ids_sha256;
+    std::string mastered_bitmap;
+    std::vector<StoredWordPackSnapshot, WordStorePsramAllocator<StoredWordPackSnapshot>> snapshot;
+};
+
+std::string WordLocalSha256(const std::string& bytes);
+bool LocalWordEligibilityMatches(const WordPackIndex& index,
+    const LocalWordEligibility& eligibility, const std::string& scope);
+esp_err_t SaveLocalWordEligibility(const LocalWordEligibility& eligibility);
+esp_err_t LoadLocalWordEligibility(const std::string& round_id, LocalWordEligibility* out);
+
 // Ordinal convention (LOAD-BEARING -- do not "fix" by adding start_index twice):
 //   * descriptor.session.remote.items[i].ordinal == i, i in
 //     [0, min(500, total_count - start_index)), i.e. 0-based and DENSE within
@@ -129,7 +149,9 @@ esp_err_t PrepareLocalWordSequence(
     const std::string& session_uuid,
     const std::string& seed,
     uint32_t generation,
-    LocalWordSessionDescriptor* out);
+    LocalWordSessionDescriptor* out,
+    protocol::word_study_v1::Mode mode = protocol::word_study_v1::Mode::kSequential,
+    const LocalWordEligibility* eligibility = nullptr);
 
 // Pure: build the initial UI session from an immutable descriptor.  Keeps only
 // the first `max_initial` candidates (<=96, the UI window cap).  `max_initial`

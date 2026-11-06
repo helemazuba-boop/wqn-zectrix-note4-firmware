@@ -14,6 +14,10 @@ import tempfile
 from pathlib import Path
 
 STUBS = {
+    'mbedtls/sha256.h': '''#pragma once
+#include <openssl/sha.h>
+inline int mbedtls_sha256(const unsigned char* b,size_t n,unsigned char* out,int){return SHA256(b,n,out)?0:-1;}
+''',
     'esp_err.h': '''#pragma once
 using esp_err_t = int;
 #define ESP_OK 0
@@ -27,6 +31,7 @@ using esp_err_t = int;
 #define ESP_ERR_INVALID_RESPONSE 0x107
 #define ESP_ERR_INVALID_CRC 0x109
 #define ESP_ERR_INVALID_VERSION 0x10A
+#define ESP_ERR_NOT_SUPPORTED 0x10B
 inline const char* esp_err_to_name(esp_err_t){return "stub";}
 ''',
     'esp_heap_caps.h': '''#pragma once
@@ -166,6 +171,7 @@ def main(fixture_source=None):
     with tempfile.TemporaryDirectory(prefix='wqn-local-desc-') as tmp:
         d = Path(tmp)
         (d / 'device_protocol').mkdir()
+        (d / 'mbedtls').mkdir()
         (d / 'runtime').mkdir()
         (d / 'services').mkdir()
         (d / 'storage').mkdir()
@@ -213,7 +219,7 @@ const char* CandidatePolicyVersionName(Ordering o){
             str(d / 'policy.cpp'),
             str(d / 'fixture.cpp'),
             '-Wl,--wrap=fopen,--wrap=rename,--wrap=remove,--wrap=stat,--wrap=opendir',
-            '-o', str(d / 'test'),
+            '-lcrypto', '-o', str(d / 'test'),
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if proc.returncode != 0:

@@ -2373,6 +2373,8 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
             registration.metadata.request_id = "local_" + pending.session_id;
             const auto& saved = descriptor.session.remote;
             registration.session_id = saved.session_id;
+            registration.mode = saved.mode;
+            registration.progress_revision = saved.progress_revision;
             registration.seed = saved.seed;
             registration.start_index = descriptor.session.start_index;
             registration.scope.include_mastered = saved.include_mastered;

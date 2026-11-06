@@ -40,8 +40,9 @@ def main():
         '@@ENUMS@@': section(header, 'enum class WordAppMode :', '\n// One word the user failed'),
         '@@STORE@@': section(store, 'struct StoredWordDeckId {', '\n// [ui-gates] Validates'),
         '@@OBSERVATION@@': section(store, 'struct DurableWordObservation {', '\nstruct WordOutboxSnapshot {'),
+        '@@SEED@@': section(source, 'void SeedReviewRuntime(', '\nbool PickReadyReplay('),
         '@@STATE@@': section(header, 'struct WordReplayEntry {', '\n// One mounted deck'),
-        '@@CHAIN@@': section(source, 'std::string MakeLocalStartIdentity(', '\nconstexpr char kTag') + section(source, 'void StartSequentialWalk(', '\n// Long-press on a card:'),
+        '@@CHAIN@@': section((root/'main/word_local_session.cpp').read_text(), 'bool IsValidLocalSessionUuid(', '\nesp_err_t PrepareLocalWordSequence(') + section(source, 'bool IsLocalWalkSession(', '\nvoid ShowStudyCard(') + section(source, 'std::string MakeLocalStartIdentity(', '\nconstexpr char kTag') + section(source, 'void StartSequentialWalk(', '\n// Long-press on a card:'),
         '@@REQUEST@@': section(source, 'bool TakeWordSessionStartRequest(', '\nvoid CancelWordSessionStartResult('),
         '@@CURSOR@@': section(source, 'bool TakeWordSessionCursorEffect(', '\nbool TakeWordCandidatePageRequest('),
         '@@MUTATION@@': section(source, 'bool WordMutationBlockedByPendingWorker(', '\nbool IsIntakeSession('),
@@ -78,14 +79,14 @@ void UiRuntime::RestoreWordSessionStartRequest() {wqn::RestoreWordSessionStartRe
     print(('PASS' if wired else 'FAIL') + ': loop pumps starts after old cloud completion and before candidate prefetch', flush=True)
     button_only_removed = 'QueueWordSessionStart(' not in inputs and 'TakeWordSessionStartRequest(' not in inputs
     print(('PASS' if button_only_removed else 'FAIL') + ': button reducer is not a second session-start dispatcher', flush=True)
-    local_branch = cloud.find('if (IsLocalSequentialOp(request))')
+    local_branch = cloud.find('if (IsLocalWordStudyOp(request))')
     token_load = cloud.find('LoadValidTokenForTodo(&token)')
     create_http = cloud.find('CreateWordStudySessionV1(')
     local_before_token = 0 <= local_branch < token_load
-    print(('PASS' if local_before_token else 'FAIL') + ': local sequential start/page dispatch precedes token validation', flush=True)
+    print(('PASS' if local_before_token else 'FAIL') + ': local start/page dispatch precedes token validation', flush=True)
     local_helper = section(cloud, 'void ExecuteLocalWordStart(', '\nvoid ExecuteLocalWordPage(')
     no_create = 'CreateWordStudySessionV1' not in local_helper and 'LoadValidTokenForTodo' not in local_helper
-    print(('PASS' if no_create else 'FAIL') + ': local sequential worker uses no create HTTP or token read', flush=True)
+    print(('PASS' if no_create else 'FAIL') + ': local worker uses no online create or token invalidation', flush=True)
     source_text = section(source, 'esp_err_t HandleWordAppInput(', '\nvoid ApplyWordPackIndex(') + section(source, 'bool ApplyWordSessionStartResult(', '\nstd::string WordAppSignature(')
     no_ui_flash_write = 'SaveWordSequentialCursor(' not in source_text and 'SaveWordSessionCursor(' not in source_text and 'SavePersistedWordSession(' not in source_text and 'ClearPersistedWordSession(' not in source_text and 'LoadWordPackIndex(' not in source_text
     print(('PASS' if no_ui_flash_write else 'FAIL') + ': reducer has no synchronous session/cursor storage writes', flush=True)

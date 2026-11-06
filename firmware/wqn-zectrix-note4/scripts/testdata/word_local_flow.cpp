@@ -17,7 +17,38 @@ esp_err_t LoadWordPackIndex(WordPackIndex* out) { *out=current_index; return ESP
 esp_err_t LoadWordPackIndexForSession(const PersistedWordSession&, WordPackIndex* out)
 { if(!pin_available) return ESP_ERR_NOT_FOUND; *out=pinned_index; return ESP_OK; }
 }
+namespace {
+bool network_online=false;
+bool eligibility_supported=true;
+size_t eligibility_requests=0;
+std::string actor_token(64,'a');
+std::set<std::string> mastered_ids;
+}
+namespace wqn {
+esp_err_t LoadAccessToken(std::string* out){*out=actor_token;return ESP_OK;}
+bool IsValidAccessToken(const std::string& token){return token.size()==64;}
+namespace services {
+bool IsConnectivityOnline(){return network_online;}
+protocol::v3::RequestMetadata MakeDeviceRequestMetadata(){protocol::v3::RequestMetadata m;m.request_id="eligibility-fixture-request";return m;}
+}
+esp_err_t FetchWordEligibilityV1(const std::string&,
+    const protocol::word_study_v1::EligibilityRequest& request,
+    protocol::word_study_v1::EligibilityData* out,protocol::v3::Error*, int* status){
+    if(status)*status=eligibility_supported?200:404;
+    if(!eligibility_supported)return ESP_ERR_NOT_SUPPORTED;
+    ++eligibility_requests;
+    std::vector<std::string> ids;
+    for(const auto& e:current_index.entries){
+        if(std::any_of(request.snapshot.begin(),request.snapshot.end(),[&](const auto& p){return p.deck_id==e.deck_id;}))ids.emplace_back(e.word_id);
+    }
+    std::sort(ids.begin(),ids.end());std::string canonical;
+    *out={};out->progress_revision=41;
+    for(size_t i=0;i<ids.size();++i){if(i)canonical+='\n';canonical+=ids[i];out->mastered_bitmap+=mastered_ids.count(ids[i])?'1':'0';}
+    out->item_ids_sha256=WordLocalSha256(canonical);return ESP_OK;
+}
+}
 @@QUEUE@@
+@@REFRESH@@
 @@WORKER@@
 
 static wqn::WordPackIndex Index3507()
@@ -195,6 +226,117 @@ int main(int argc,char** argv)
     Check(restart.result==ESP_OK && restart.local_segment_start==0 &&
           restart.message=="词库已更新，已从第一词开始",
           "unavailable old pin plus changed manifest restarts at zero with notice");
+    // A full second scenario uses the same real worker and native file/journal
+    // implementation. The only eligibility source is the fake authenticated
+    // HTTP seam above; the actual cache writer/loader are production code.
+    CleanStorage();WqnHostResetWordOutboxCache();
+    current_index=Index3507();pinned_index=current_index;pin_available=true;
+    for(uint32_t i=0;i<17;++i)mastered_ids.insert(Uuid(100000+i*7));
+    auto random_start=[&](uint32_t number){
+        wqn::protocol::word_study_v1::CreateSessionRequest req;
+        req.mode=wqn::protocol::word_study_v1::Mode::kShuffle;
+        req.metadata.request_id="shuffle-start-"+std::to_string(number);req.start_index=0;
+        QueueWordSessionStart(req,false);WordCloudResult result;result.scope_generation=queued.scope_generation;
+        ExecuteLocalWordStart(queued,&result);return result;
+    };
+    auto missing=random_start(0);
+    Check(missing.result!=ESP_OK,"fresh offline shuffle requires personal learning state, never assumes all words are new");
+    network_online=true;eligibility_supported=false;
+    auto legacy=random_start(9010);
+    Check(legacy.result!=ESP_OK && legacy.legacy_online_fallback,
+        "old cloud without eligibility endpoint preserves fresh online shuffle fallback");
+    network_online=false;eligibility_supported=true;
+    wqn::LocalWordEligibility latest;
+    Check(RefreshLocalWordEligibility(current_index,"",g_scope_generation,std::string(64,'a'),&latest)==ESP_OK,
+        "complete personal bitmap persists separately from shared content");
+    auto changed_ids=current_index;
+    std::snprintf(changed_ids.entries[0].word_id,sizeof(changed_ids.entries[0].word_id),"%s",Uuid(999999).c_str());
+    Check(!wqn::LocalWordEligibilityMatches(changed_ids,latest,""),
+        "same-size changed item set cannot reuse personal bitmap bits");
+    auto stale=latest;stale.deck_scope_generation=g_scope_generation-1;
+    Check(wqn::SaveLocalWordEligibility(stale)==ESP_ERR_INVALID_STATE,
+        "stale scope cannot publish a progress cache");
+    actor_token.assign(64,'b');
+    Check(random_start(9000).result!=ESP_OK,"another paired actor cannot use the previous personal progress cache");
+    actor_token.assign(64,'a');
+    const auto calls=eligibility_requests;
+    auto random=random_start(1);
+    Check(random.result==ESP_OK && random.persisted_session.remote.mode==wqn::protocol::word_study_v1::Mode::kShuffle &&
+        random.local_round_total==3490,"offline shuffle excludes all 17 mastered words");
+    if(random.result==ESP_OK){
+        session=random.persisted_session;
+        const auto round_seed=session.remote.seed;
+        wqn::LocalWordEligibility immutable;
+        Check(wqn::LoadLocalWordEligibility(round_seed,&immutable)==ESP_OK,"round bitmap reloads from its CRC-protected immutable file");
+        auto changed=immutable;changed.mastered_bitmap[0]=changed.mastered_bitmap[0]=='0'?'1':'0';
+        Check(wqn::SaveLocalWordEligibility(changed)==ESP_ERR_INVALID_STATE,
+            "the same round identity cannot be rebound to a different mastered set");
+
+        const auto first_random_word=std::string(session.remote.items[0].item_id);
+        std::set<std::string> random_seen,random_sids{session.remote.session_id};
+        bool complete=true,recovered=true,seed_stable=true,phase_stable=true;
+        for(uint32_t absolute=0;absolute<3490;++absolute){
+            if(session.position>=session.remote.items.size()){
+                if(!Prefetch(&session)){complete=false;break;}
+            }
+            auto item=session.remote.items[session.position];
+            if(mastered_ids.count(item.item_id)||!random_seen.insert(item.item_id).second){complete=false;break;}
+            for(int phase=0;phase<2;++phase){
+                wqn::DurableWordObservation fact;
+                fact.request_id="shuffle-fact-"+std::to_string(absolute*2+phase);
+                fact.session_id=session.remote.session_id;fact.item_id=item.item_id;
+                fact.mode=session.remote.mode;fact.sequence=session.remote.next_sequence++;
+                fact.action=phase==0?wqn::protocol::word_study_v1::ObservationAction::kRevealed:wqn::protocol::word_study_v1::ObservationAction::kKnown;
+                fact.occurred_at="2026-11-06T00:00:00Z";
+                session.phase=phase==0?wqn::WordPresentationPhase::kBack:wqn::WordPresentationPhase::kFront;
+                if(phase)++session.position;
+                session.active=session.position<session.remote.items.size()||session.remote.has_more;
+                fact.next_position=static_cast<uint32_t>(item.ordinal)+(phase?1:0);fact.next_phase=session.phase;
+                if(wqn::CommitWordObservation(fact,session)!=ESP_OK){complete=false;break;}
+                if(absolute==94 && phase==0){
+                    session.paused=true;
+                    phase_stable &= wqn::SaveWordSessionCursor(session)==ESP_OK;
+                    WqnHostResetWordOutboxCache();
+                    auto resumed=random_start(100);
+                    phase_stable &= resumed.result==ESP_OK && resumed.persisted_session.remote.seed==round_seed &&
+                        resumed.persisted_session.phase==wqn::WordPresentationPhase::kBack && !resumed.persisted_session.paused;
+                    if(resumed.result==ESP_OK)session=resumed.persisted_session;
+                }
+            }
+            if(!complete)break;
+            if(absolute==95||absolute==498||absolute==499||absolute==3489){
+                WqnHostResetWordOutboxCache();wqn::PersistedWordSession reboot;uint64_t cursor=0;
+                recovered &= wqn::LoadPersistedWordSession(session.remote.mode,&reboot)==ESP_OK &&
+                    wqn::WordSequenceAbsoluteCursor(reboot,&cursor)==ESP_OK && cursor==absolute+1;
+                if(recovered)session=reboot;
+            }
+            if(!session.active && absolute+1<3490){
+                // Refreshing latest state mid-round cannot modify the retained
+                // per-round bitmap or reorder later 500-item segments.
+                if(absolute==499){
+                    latest.mastered_bitmap.assign(3507,'1');latest.progress_revision=42;
+                    Check(wqn::SaveLocalWordEligibility(latest)==ESP_OK,"background progress update retains the original round bitmap");
+                }
+                auto next=random_start(200+absolute);
+                if(next.result!=ESP_OK){complete=false;break;}
+                session=next.persisted_session;random_sids.insert(session.remote.session_id);
+                seed_stable &= session.remote.seed==round_seed && session.remote.progress_revision==41;
+            }else if(session.position==session.remote.items.size()&&session.remote.has_more){
+                if(!Prefetch(&session)){complete=false;break;}
+            }
+        }
+        Check(complete && random_seen.size()==3490 && random_sids.size()==7,
+            "3490 offline random words cross seven real segments with no duplicates or omissions");
+        Check(seed_stable && recovered && phase_stable,"shuffle keeps its round seed, exact cursor and paused back phase across reboot");
+        Check(eligibility_requests==calls,"offline start, paging, pause and segment continuation make zero HTTP requests");
+        Check(first_random_word!=Uuid(100001),"random order is distinct from sequential deck order");
+        wqn::WordOutboxSnapshot outbox;
+        Check(wqn::ReadWordOutboxSnapshot(&outbox)==ESP_OK && outbox.pending_count==6980,
+            "shuffle retains all 6980 individual durable learning facts");
+        auto all_mastered=random_start(10000);
+        Check(all_mastered.result==ESP_OK && all_mastered.local_round_complete,
+            "new round uses refreshed eligibility without silently including mastered words");
+    }
     std::printf("%d PASS / %d FAIL (real local worker/store/files; host scheduling and NVS seams, NOT HIL)\n",passes,failures);
     return failures?1:0;
 }

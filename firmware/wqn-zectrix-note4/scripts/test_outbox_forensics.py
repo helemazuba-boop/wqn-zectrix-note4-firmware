@@ -196,7 +196,8 @@ class ForensicsTests(unittest.TestCase):
         for domain, name in [('word', 'word_study_store.cpp'), ('note', 'note_store.cpp')]:
             code = re.sub(r'//[^\n]*', '', (ROOT/'main'/name).read_text())
             actual = set(re.findall(r'"/storage/([^"/]+)"', code))
-            self.assertEqual(set(FORENSICS.source_names(domain)), {name for name in actual if '%' not in name})
+            concrete = {name for name in actual if '%' not in name}
+            self.assertEqual(set(FORENSICS.source_names(domain, concrete)), concrete)
             self.assertEqual({name for name in actual if '%' in name},
                 {'wl%s.v1', 'wl%s.tmp', 'wl%s.bak'} if domain == 'word' else set())
 
@@ -222,6 +223,22 @@ class ForensicsTests(unittest.TestCase):
                 self.assertEqual((output/opaque).read_bytes(), (source/opaque).read_bytes())
                 self.assertEqual(FORENSICS.verify(output, taken['manifest_sha256'])['status'], 'verified')
                 self.assertFalse(manifest['repair_authorized'])
+
+    def test_personal_bitmap_families_are_raw_evidence_without_repair_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp); source=self.new_export(directory,'word')
+            round_cache='we'+'a'*24+'.tmp'
+            for name in ('welig.v1',round_cache,'weunknown.future'):
+                (source/name).write_bytes(b'opaque-personal-cache\0\xff')
+            output=directory/'bundle';taken=FORENSICS.capture(source,output,'word',True)
+            manifest=json.loads((output/'manifest.json').read_text())
+            for name in ('welig.v1',round_cache,'weunknown.future'):
+                self.assertIn(name,manifest['files'], 'personal cache was omitted from capture')
+                self.assertEqual((output/name).read_bytes(),(source/name).read_bytes())
+                self.assertNotIn('analysis',manifest['files'][name])
+            self.assertEqual(manifest['files'][round_cache]['category'],'personal-eligibility-cache')
+            self.assertFalse(manifest['repair_authorized'])
+            self.assertEqual(FORENSICS.verify(output,taken['manifest_sha256'])['status'],'verified')
 
     def test_descriptor_inventory_limits_and_unsafe_files_fail_closed(self):
         with self.assertRaises(ValueError):

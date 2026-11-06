@@ -37,6 +37,7 @@ struct WordAppState {
     WordAppMode mode=WordAppMode::kSessionStarting;
     WordSessionState session;
     WordSessionChain chain;
+    WordSessionChain shuffle_chain;
     WordReviewRuntime review;
     WordOutboxState outbox;
     WordPackIndex pack_index;
@@ -58,7 +59,8 @@ bool PickAnyReplay(const WordReviewRuntime&,size_t*){return false;}
 size_t SessionIndexOfOrdinal(const StoredWordSessionData&,uint64_t){return 0;}
 uint64_t SessionEndOrdinal(const StoredWordSessionData&){return 0;}
 size_t NextQueuePosition(const WordAppState&,size_t p){return p;}
-void SeedReviewRuntime(WordReviewRuntime*,const std::string&){}
+int64_t esp_timer_get_time(){return 0;}
+@@SEED@@
 void SetStudySessionResumable(WordAppState*,protocol::word_study_v1::Mode,bool){}
 void RequestCandidatePageIfNeeded(WordAppState*){}
 void ActivatePendingWordPackIndex(WordAppState*){}
@@ -132,6 +134,9 @@ UiRuntime Initial(){
 void EmptyIntake(UiRuntime* r){ApplyWordSessionStartResult(&r->state_.word_app,ESP_OK,ESP_OK,ESP_OK,{});}
 void Pending(UiRuntime* r){auto& s=r->state_.word_app.session;s.start_result_expected=false;s.start_requested=true;}
 int main(){
+    WordReviewRuntime stale_review;stale_review.queue_unavailable=true;
+    SeedReviewRuntime(&stale_review,"online-review-again");
+    Check(!stale_review.queue_unavailable,"a refreshed online review clears the old offline-queue marker");
     auto runtime=Initial();auto* word=&runtime.state_.word_app;
     EmptyIntake(&runtime);
     Check(word->session.start_requested && word->session.requested_mode==Mode::kSequential &&
@@ -169,6 +174,29 @@ int main(){
     PumpWordSessionStart(&runtime);
     Check(queued.size()==1 && queued[0].mode==Mode::kSequential && saves==0 &&
         word->outbox.pending_count==2,"last intake flush proceeds without UI flash I/O or another press");
+
+    runtime=Initial();word=&runtime.state_.word_app;
+    word->session.start_requested=false;word->session.start_result_expected=false;
+    word->session.persisted.remote.mode=Mode::kShuffle;
+    word->session.persisted.remote.seed="11111111-1111-4111-8111-111111111111";
+    word->shuffle_chain.active=true;word->shuffle_chain.segment_finished=true;
+    word->shuffle_chain.sequential_cursor=500;word->shuffle_chain.sequential_total=3490;
+    word->mode=WordAppMode::kHome;
+    PumpWordSessionStart(&runtime);
+    Check(queued.size()==1 && queued[0].mode==Mode::kShuffle && queued[0].start_index==500 &&
+        word->chain.sequential_cursor==37,
+        "durable random segment completion continues with its own mode and cursor");
+    word->session.requested_mode=Mode::kShuffle;
+    word->shuffle_chain.segment_finished=true;word->chain.segment_finished=true;
+    CancelWordSessionStartResult(word);
+    Check(!word->shuffle_chain.segment_finished && word->chain.segment_finished,
+        "cancelled random start clears only its continuation and preserves the sequential round");
+    runtime=Initial();word=&runtime.state_.word_app;
+    word->session.start_requested=true;word->session.requested_mode=Mode::kShuffle;
+    word->session.persisted.remote.mode=Mode::kSequential;word->chain.segment_finished=true;word->chain.active=true;
+    PumpWordSessionStart(&runtime);
+    Check(queued.size()==1 && queued[0].mode==Mode::kShuffle,
+        "explicit random selection is not replaced by a stale sequential continuation");
 
     runtime=Initial();word=&runtime.state_.word_app;Pending(&runtime);
     word->session.create_request_id="same-start-request";

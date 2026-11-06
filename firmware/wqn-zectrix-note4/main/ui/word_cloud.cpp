@@ -17,6 +17,7 @@
 #include "esp_timer.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/sync_service.h"
+#include "services/connectivity_service.h"
 #include "storage.h"
 #include "word_local_session.h"
 #include "word_pack.h"
@@ -317,6 +318,8 @@ bool QueueWordCandidatePage(
         page.cursor.c_str());
     request.limit = static_cast<uint16_t>(page.limit);
     request.study_mode = static_cast<uint8_t>(snapshot.remote.mode);
+    request.local_walk = snapshot.remote.mode == wqn::protocol::word_study_v1::Mode::kSequential ||
+        (snapshot.remote.mode == wqn::protocol::word_study_v1::Mode::kShuffle && wqn::IsValidLocalSessionUuid(snapshot.remote.seed));
     request.page_extension_handle = ParkPageExtension(snapshot);
     return QueueWordCloudRequest(request);
 }
@@ -339,8 +342,8 @@ void PumpWordSessionStart(UiRuntime* runtime)
         return;
     }
     if (runtime->state().screen != wqn::UiScreen::kWord ||
-        (!pending.session.start_requested && !pending.chain.segment_finished)) return;
-    if (!pending.chain.segment_finished &&
+        (!pending.session.start_requested && !pending.chain.segment_finished && !pending.shuffle_chain.segment_finished)) return;
+    if (!pending.chain.segment_finished && !pending.shuffle_chain.segment_finished &&
         pending.mode != wqn::WordAppMode::kSessionStarting) return;
     if (pending.session.cursor_intent_armed || IsPersistDomainBusy(PersistDomain::kWord)) return;
     // [deck-autorepair] Defer a new session while a repair is pending/in
@@ -648,19 +651,24 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             state->word_app.message = "已取消本轮准备";
             return false;
         }
-        if (result.local_sequence && result.local_round_complete) {
+        if (result.local_walk && result.local_round_complete) {
             wqn::CancelWordSessionStartResult(&state->word_app);
             state->word_app.mode = wqn::WordAppMode::kHome;
-            state->word_app.chain.sequential_cursor = 0;
-            state->word_app.chain.segment_finished = false;
-            state->word_app.chain.next_segment_armed = false;
-            state->word_app.message = "本轮完成，下次从第一词开始";
+            auto& complete_chain=static_cast<wqn::protocol::word_study_v1::Mode>(state->word_app.session.requested_mode)==wqn::protocol::word_study_v1::Mode::kShuffle
+                ? state->word_app.shuffle_chain : state->word_app.chain;
+            complete_chain.sequential_cursor = 0;
+            complete_chain.segment_finished = false;
+            complete_chain.next_segment_armed = false;
+            state->word_app.message = state->word_app.session.requested_mode==wqn::protocol::word_study_v1::Mode::kShuffle
+                ? "当前没有可随机学习的单词" : "本轮完成，下次从第一词开始";
             return state->screen == wqn::UiScreen::kWord;
         }
         if (result.result == ESP_OK && result.pack_index_ready) {
             wqn::InstallPreparedWordPackIndex(
                 &state->word_app, std::move(result.pack_index));
         }
+        const bool offer_local_walk = result.review_queue_unavailable &&
+            !state->word_app.session.cancel_start_requested;
         const bool applied = wqn::ApplyWordSessionStartResult(
             &state->word_app,
             result.result,
@@ -668,6 +676,10 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
             result.session_persist_result,
             std::move(result.persisted_session));
         if (!applied) return false;
+        if (offer_local_walk) {
+            state->word_app.review={};state->word_app.review.queue_unavailable=true;
+            state->word_app.mode=wqn::WordAppMode::kReviewComplete;
+        }
         if (result.result != ESP_OK) {
             state->word_app.message = result.auth_required ? "请重新配对"
                 : (!result.message.empty() ? result.message : "本轮准备失败，可重试");
@@ -675,10 +687,11 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
                    result.message == "词库已更新，已从第一词开始") {
             state->word_app.message = result.message;
         }
-        if (result.local_sequence && result.result == ESP_OK) {
-            auto& chain = state->word_app.chain;
+        if (result.local_walk && result.result == ESP_OK) {
+            auto& chain = state->word_app.session.persisted.remote.mode==wqn::protocol::word_study_v1::Mode::kShuffle
+                ? state->word_app.shuffle_chain : state->word_app.chain;
             chain.active = true;
-            chain.sequential_total = result.local_sequence_total;
+            chain.sequential_total = result.local_round_total;
             chain.pinned_session_id =
                 state->word_app.session.persisted.remote.session_id;
             chain.pinned_deck_id = result.local_scope_deck_id;
@@ -735,53 +748,126 @@ bool ApplyWordCloudResult(wqn::UiState* state, WordCloudResult& result)
 
 namespace {
 
-bool IsLocalSequentialOp(const WordCloudRequest& request)
+bool IsLocalWordStudyOp(const WordCloudRequest& request)
 {
-    return request.study_mode ==
-               static_cast<uint8_t>(
-                   wqn::protocol::word_study_v1::Mode::kSequential) &&
+    using wqn::protocol::word_study_v1::Mode;
+    const auto mode = static_cast<Mode>(request.study_mode);
+    return (mode == Mode::kSequential || mode == Mode::kShuffle) &&
            (request.op == WordCloudOp::kStartSession ||
-            request.op == WordCloudOp::kFetchSessionPage);
+            (request.op == WordCloudOp::kFetchSessionPage &&
+             (mode == Mode::kSequential || request.local_walk)));
+}
+bool CanOfferLocalWalkAfterReviewFailure(const WordCloudRequest& request,
+                                       const WordCloudResult& result)
+{
+    // A connected WiFi link does not prove cloud reachability. Keep the old
+    // completion-page action available after transport/retryable failures,
+    // without turning an authentication or semantic rejection into success.
+    return request.op == WordCloudOp::kStartSession &&
+           request.study_mode == static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kReview) &&
+           result.result != ESP_OK && !result.auth_required &&
+           result.protocol_error.code != "UNAUTHORIZED" &&
+           (result.protocol_error.code.empty() || result.protocol_error.retryable);
+}
+
+esp_err_t RefreshLocalWordEligibility(const wqn::WordPackIndex& index, const std::string& scope,
+                                      uint32_t generation, const std::string& token,
+                                      wqn::LocalWordEligibility* out)
+{
+    wqn::protocol::word_study_v1::EligibilityRequest request;
+    request.metadata = wqn::services::MakeDeviceRequestMetadata();
+    wqn::LocalWordEligibility saved;
+    saved.scope_deck_id = scope;
+    saved.deck_scope_generation = generation;
+    saved.actor_binding = wqn::WordLocalSha256(token);
+    for (const auto& pin : index.pack_identities)
+    {
+        if (!scope.empty() && scope != pin.deck_id)
+            continue;
+        wqn::protocol::word_study_v1::PackSnapshot wire;
+        wire.deck_id = pin.deck_id;
+        wire.sha256 = pin.sha256;
+        wire.pack_revision = pin.pack_revision;
+        wire.content_revision = pin.content_revision;
+        request.snapshot.push_back(wire);
+        wqn::StoredWordPackSnapshot item;
+        std::snprintf(item.deck_id, sizeof(item.deck_id), "%s", pin.deck_id);
+        std::snprintf(item.sha256, sizeof(item.sha256), "%s", pin.sha256);
+        item.pack_revision = pin.pack_revision;
+        item.content_revision = pin.content_revision;
+        saved.snapshot.push_back(item);
+    }
+    wqn::protocol::word_study_v1::EligibilityData data;
+    wqn::protocol::v3::Error error;
+    int status = 0;
+    auto result = wqn::FetchWordEligibilityV1(token, request, &data, &error, &status);
+    if (status == 404 || status == 501)
+        return ESP_ERR_NOT_SUPPORTED;
+    if (result != ESP_OK)
+        return result;
+    saved.progress_revision = data.progress_revision;
+    saved.item_ids_sha256 = std::move(data.item_ids_sha256);
+    saved.mastered_bitmap = std::move(data.mastered_bitmap);
+    if (!wqn::LocalWordEligibilityMatches(index, saved, scope))
+        return ESP_ERR_INVALID_RESPONSE;
+    result = wqn::SaveLocalWordEligibility(saved);
+    if (result == ESP_OK && out != nullptr)
+        *out = std::move(saved);
+    return result;
 }
 
 void ExecuteLocalWordStart(const WordCloudRequest& request, WordCloudResult* result)
 {
     result->op = WordCloudOp::kStartSession;
-    result->local_sequence = true;
+    result->local_walk = true;
     const std::string scope = request.deck_id;
     result->local_scope_deck_id = scope;
     wqn::PersistedWordSession old;
-    const auto mode = wqn::protocol::word_study_v1::Mode::kSequential;
+    const auto mode = static_cast<wqn::protocol::word_study_v1::Mode>(request.study_mode);
+    const bool shuffle = mode == wqn::protocol::word_study_v1::Mode::kShuffle;
     const esp_err_t loaded = wqn::LoadPersistedWordSession(mode, &old);
-    if (loaded != ESP_OK && loaded != ESP_ERR_NOT_FOUND) { result->result = loaded; return; }
+    if (loaded != ESP_OK && loaded != ESP_ERR_NOT_FOUND)
+    {
+        result->result = loaded;
+        return;
+    }
     wqn::LocalWordSessionDescriptor prior;
     bool have_prior = false;
-    if (loaded == ESP_OK) {
+    if (loaded == ESP_OK)
+    {
         const esp_err_t found = wqn::LoadLocalWordSessionDescriptor(old.remote.session_id, &prior);
-        if (found != ESP_OK && found != ESP_ERR_NOT_FOUND) { result->result = found; return; }
+        if (found != ESP_OK && found != ESP_ERR_NOT_FOUND)
+        {
+            result->result = found;
+            return;
+        }
         have_prior = found == ESP_OK;
     }
     uint64_t absolute = 0;
-    if (have_prior && (prior.session.deck_scope_generation != request.scope_generation ||
-        wqn::WordSequenceAbsoluteCursor(old, &absolute) != ESP_OK || absolute > prior.total_count)) {
+    if (have_prior &&
+        (prior.session.deck_scope_generation != request.scope_generation ||
+         wqn::WordSequenceAbsoluteCursor(old, &absolute) != ESP_OK || absolute > prior.total_count))
+    {
         result->result = ESP_ERR_INVALID_STATE;
         return;
     }
     // A completed round is retained for recovery. A new home entry at zero
     // starts a new round; mid-round completion continues from its durable end.
-    const bool new_round = have_prior && !old.active && absolute == prior.total_count &&
-        request.start_index == 0;
+    const bool new_round =
+        have_prior && !old.active && absolute == prior.total_count && request.start_index == 0;
     bool resume = have_prior && old.active;
     bool pinned = have_prior && !new_round;
     uint32_t start = pinned ? static_cast<uint32_t>(absolute) : 0;
     wqn::WordPackIndex index;
     esp_err_t indexed = pinned ? wqn::LoadWordPackIndexForSession(prior.session, &index)
-                              : wqn::LoadWordPackIndex(&index);
+                               : wqn::LoadWordPackIndex(&index);
     bool restarted = false;
-    if (pinned && indexed != ESP_OK) {
+    if (pinned && indexed != ESP_OK)
+    {
         wqn::WordPackIndex current;
         const esp_err_t fresh = wqn::LoadWordPackIndex(&current);
-        if (fresh == ESP_OK && !wqn::LocalSequenceSnapshotMatches(current, prior)) {
+        if (fresh == ESP_OK && !wqn::LocalSequenceSnapshotMatches(current, prior))
+        {
             index = std::move(current);
             indexed = ESP_OK;
             pinned = false;
@@ -790,54 +876,125 @@ void ExecuteLocalWordStart(const WordCloudRequest& request, WordCloudResult* res
             restarted = true;
         }
     }
-    if (indexed != ESP_OK || !index.mounted || !index.has_manifest ||
-        index.pack_error || index.truncated || index.entries.empty()) {
+    if (indexed != ESP_OK || !index.mounted || !index.has_manifest || index.pack_error ||
+        index.truncated || index.entries.empty())
+    {
         result->result = indexed == ESP_OK ? ESP_ERR_INVALID_STATE : indexed;
         result->message = "词库未缓存或校验失败，请同步";
         return;
     }
-    if (pinned && !wqn::LocalSequenceSnapshotMatches(index, prior)) {
+    if (pinned && !wqn::LocalSequenceSnapshotMatches(index, prior))
+    {
         result->result = ESP_ERR_INVALID_RESPONSE;
         return;
     }
-    if (resume) {
+    wqn::LocalWordEligibility eligibility;
+    std::string round_seed = pinned ? prior.session.remote.seed : request.seed;
+    if (shuffle && !resume)
+    {
+        std::string token;
+        if (wqn::LoadAccessToken(&token) != ESP_OK || !wqn::IsValidAccessToken(token))
+        {
+            result->result = ESP_ERR_INVALID_STATE;
+            result->message = "请先同步学习状态";
+            return;
+        }
+        esp_err_t state = ESP_ERR_NOT_FOUND;
+        esp_err_t refresh = ESP_ERR_NOT_FOUND;
+        if (pinned)
+        {
+            state = wqn::LoadLocalWordEligibility(round_seed, &eligibility);
+        }
+        else
+        {
+            state = wqn::LoadLocalWordEligibility("", &eligibility);
+            const bool reusable = state == ESP_OK &&
+                                  eligibility.actor_binding == wqn::WordLocalSha256(token) &&
+                                  wqn::LocalWordEligibilityMatches(index, eligibility, scope);
+            if (!reusable && state != ESP_FAIL && wqn::services::IsConnectivityOnline())
+                state = refresh = RefreshLocalWordEligibility(
+                    index, scope, request.scope_generation, token, &eligibility);
+        }
+        if (state != ESP_OK || eligibility.actor_binding != wqn::WordLocalSha256(token) ||
+            (pinned && (eligibility.deck_scope_generation != request.scope_generation ||
+                        eligibility.progress_revision != prior.session.remote.progress_revision)) ||
+            !wqn::LocalWordEligibilityMatches(index, eligibility, scope))
+        {
+            result->legacy_online_fallback =
+                !pinned && refresh == ESP_ERR_NOT_SUPPORTED && state == ESP_ERR_NOT_SUPPORTED;
+            result->result = state == ESP_OK ? ESP_ERR_INVALID_STATE : state;
+            result->message = "学习状态未缓存或已失效，请同步";
+            return;
+        }
+        if (!pinned)
+        {
+            round_seed = request.session_id;
+            eligibility.round_id = round_seed;
+            eligibility.deck_scope_generation = request.scope_generation;
+            result->result = wqn::SaveLocalWordEligibility(eligibility);
+            if (result->result != ESP_OK)
+                return;
+        }
+    }
+    if (resume)
+    {
         old.paused = false;
         result->result = wqn::SaveWordSessionCursor(old);
-        if (result->result != ESP_OK) return;
+        if (result->result != ESP_OK)
+            return;
         result->persisted_session = std::move(old);
-        result->local_sequence_total = prior.total_count;
+        result->local_round_total = prior.total_count;
         result->local_segment_start = prior.session.start_index;
-    } else {
+    }
+    else
+    {
         wqn::LocalWordSessionDescriptor descriptor;
-        result->result = wqn::PrepareLocalWordSequence(index, scope, start,
-            request.session_id, request.seed[0] ? request.seed : "local-sequential-v1",
-            request.scope_generation, &descriptor);
-        if (result->result == ESP_ERR_NOT_FOUND) {
+        result->result = wqn::PrepareLocalWordSequence(
+            index, scope, start, request.session_id,
+            round_seed.empty() ? "local-sequential-v1" : round_seed, request.scope_generation,
+            &descriptor, mode, shuffle ? &eligibility : nullptr);
+        if (result->result == ESP_ERR_NOT_FOUND)
+        {
             result->result = ESP_OK;
             result->local_round_complete = true;
             return;
         }
-        if (result->result != ESP_OK) return;
+        if (result->result != ESP_OK)
+            return;
         result->session_persist_result = wqn::SaveLocalWordSessionDescriptor(descriptor);
-        if (result->session_persist_result != ESP_OK) { result->result = result->session_persist_result; return; }
-        result->session_compact_result = wqn::BuildLocalWordInitialSession(descriptor, 32, &result->persisted_session);
-        if (result->session_compact_result != ESP_OK) { result->result = result->session_compact_result; return; }
+        if (result->session_persist_result != ESP_OK)
+        {
+            result->result = result->session_persist_result;
+            return;
+        }
+        result->session_compact_result =
+            wqn::BuildLocalWordInitialSession(descriptor, 32, &result->persisted_session);
+        if (result->session_compact_result != ESP_OK)
+        {
+            result->result = result->session_compact_result;
+            return;
+        }
         result->session_persist_result = wqn::SavePersistedWordSession(result->persisted_session);
-        if (result->session_persist_result != ESP_OK) { result->result = result->session_persist_result; return; }
-        result->local_sequence_total = descriptor.total_count;
+        if (result->session_persist_result != ESP_OK)
+        {
+            result->result = result->session_persist_result;
+            return;
+        }
+        result->local_round_total = descriptor.total_count;
         result->local_segment_start = descriptor.session.start_index;
     }
     result->result = ESP_OK;
     result->pack_index = std::move(index);
     result->pack_index_ready = true;
-    result->message = restarted ? "词库已更新，已从第一词开始" : "本地顺序学习已就绪";
+    result->message =
+        restarted ? "词库已更新，已从第一词开始" : (shuffle ? "本轮随机已就绪" : "顺序学习已就绪");
 }
 
 void ExecuteLocalWordPage(const WordCloudRequest& request, WordCloudResult* result)
 {
     if (result == nullptr) return;
     result->op = WordCloudOp::kFetchSessionPage;
-    result->local_sequence = true;
+    result->local_walk = true;
     wqn::PersistedWordSession parked;
     const bool have_parked =
         TakePageExtension(request.page_extension_handle, &parked);
@@ -852,7 +1009,7 @@ void ExecuteLocalWordPage(const WordCloudRequest& request, WordCloudResult* resu
         result->message = "本地顺序会话已失效";
         return;
     }
-    result->local_sequence_total = descriptor.total_count;
+    result->local_round_total = descriptor.total_count;
     result->result = wqn::GetLocalWordCandidatePage(
         descriptor, request.cursor,
         request.limit == 0 ? 64 : request.limit,
@@ -930,6 +1087,10 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         request.study_mode != static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kSequential)) {
         result.result = wqn::LoadPersistedWordSession(
             static_cast<wqn::protocol::word_study_v1::Mode>(request.study_mode), &result.persisted_session);
+        if (result.result == ESP_OK && result.persisted_session.remote.mode == wqn::protocol::word_study_v1::Mode::kShuffle &&
+            wqn::IsValidLocalSessionUuid(result.persisted_session.remote.seed)) {
+            ExecuteLocalWordStart(request,&result);SendWordCloudResult(result_domain);return;
+        }
         if (result.result == ESP_OK && result.persisted_session.active) {
             result.result = wqn::LoadWordPackIndexForSession(result.persisted_session, &result.pack_index);
             if (result.result == ESP_OK) {
@@ -944,16 +1105,30 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
 
     // Local sequential walks must never require a valid token or an online
     // create/intake round first. Dispatch before ANY token validation.
-    if (IsLocalSequentialOp(request)) {
+    if (IsLocalWordStudyOp(request)) {
         if (request.op == WordCloudOp::kStartSession) {
             ExecuteLocalWordStart(request, &result);
         } else {
             ExecuteLocalWordPage(request, &result);
         }
-        SendWordCloudResult(result_domain);
-        return;
+        if (!result.legacy_online_fallback) {
+            SendWordCloudResult(result_domain);
+            return;
+        }
+        // An older cloud may not expose personal snapshots yet. Preserve its
+        // existing online shuffle behavior only for a new round with no cache.
+        // Never replace a pinned local round or reinterpret an I/O failure.
+        result.local_walk = false;
+        result.message.clear();
     }
 
+    if(request.op==WordCloudOp::kStartSession &&
+       request.study_mode==static_cast<uint8_t>(wqn::protocol::word_study_v1::Mode::kReview) &&
+       !wqn::services::IsConnectivityOnline()) {
+        result.result=ESP_ERR_TIMEOUT;result.review_queue_unavailable=true;
+        result.message="离线，到期队列尚未更新";
+        SendWordCloudResult(result_domain);return;
+    }
     std::string token;
     if (!LoadValidTokenForTodo(&token)) {
         result.auth_required = true;
@@ -1080,7 +1255,8 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
         session.metadata.request_id = request.request_id;
         session.mode = static_cast<wqn::protocol::word_study_v1::Mode>(
             request.study_mode);
-        session.start_index = request.start_index;
+        session.start_index = session.mode == wqn::protocol::word_study_v1::Mode::kSequential
+            ? request.start_index : -1;
         session.new_word_limit = static_cast<int>(request.new_word_limit);
         // [deck-scope] The runner rebuilds the request, so the queued deck id
         // has to be re-attached here or the server sees an empty scope and
@@ -1163,6 +1339,10 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
     if (result.result != ESP_OK) {
         std::string after_token;
         result.auth_required = !LoadValidTokenForTodo(&after_token);
+        if (CanOfferLocalWalkAfterReviewFailure(request, result)) {
+            result.review_queue_unavailable = true;
+            result.message = "到期队列暂不可用，可继续顺序过词库";
+        }
     }
     if (request.op == WordCloudOp::kPackSync) {
         wqn::services::CompleteContentRefresh(
@@ -1180,6 +1360,16 @@ void ExecuteWordCloudRequest(const WordCloudRequest& request)
                 result.catalog_authoritative = true;
             }
         }
+    }
+    if(request.op==WordCloudOp::kPackSync && result.result==ESP_OK &&
+        wqn::services::IsConnectivityOnline()) {
+        wqn::WordPackIndex cached;
+        const auto* index=&result.pack_index;
+        if(!result.pack_index_ready) {
+            if(wqn::LoadWordPackIndex(&cached)==ESP_OK)index=&cached;
+        }
+        if(index->mounted && index->has_manifest && !index->pack_error && !index->truncated)
+            (void)RefreshLocalWordEligibility(*index,request.deck_id,request.scope_generation,token,nullptr);
     }
     SendWordCloudResult(result_domain);
 }

@@ -111,6 +111,26 @@ CloudLane LaneForJob(const CloudJob& job)
     return CloudLane::kBulk;
 }
 
+// Local word work owns storage, not a radio session. In particular, paging
+// an offline round must not wake WiFi once per window. A fresh shuffle may
+// refresh its bitmap only if connectivity already exists; cache sync remains
+// an explicit bulk request.
+bool JobNeedsConnectivityDemand(const CloudJob& job, bool already_online = false)
+{
+    if (job.domain != CloudDomain::kWord && job.domain != CloudDomain::kWordBulk) return true;
+    const auto& word = job.word;
+    if (word.op == WordCloudOp::kClearSession || word.resume_existing) return false;
+    const auto mode = static_cast<wqn::protocol::word_study_v1::Mode>(word.study_mode);
+    if (word.op == WordCloudOp::kStartSession)
+    {
+        if (mode == wqn::protocol::word_study_v1::Mode::kShuffle) return already_online;
+        return mode != wqn::protocol::word_study_v1::Mode::kSequential;
+    }
+    if (word.op == WordCloudOp::kFetchSessionPage)
+        return mode != wqn::protocol::word_study_v1::Mode::kSequential && !word.local_walk;
+    return true;
+}
+
 void CloudLaneTask(void* arg)
 {
     QueueHandle_t queue = static_cast<QueueHandle_t>(arg);
@@ -127,8 +147,10 @@ void CloudLaneTask(void* arg)
             lane == CloudLane::kInteractive
                 ? wqn::runtime::MemoryStage::kCloudInteractiveEnd
                 : wqn::runtime::MemoryStage::kCloudBulkEnd);
-        wqn::services::ConnectivityDemand connectivity_demand =
-            wqn::services::AcquireConnectivityDemand(
+        const bool needs_connectivity = JobNeedsConnectivityDemand(job, wqn::services::IsConnectivityOnline());
+        wqn::services::ConnectivityDemand connectivity_demand;
+        if (needs_connectivity) {
+            connectivity_demand = wqn::services::AcquireConnectivityDemand(
                 lane == CloudLane::kInteractive
                     ? wqn::services::ConnectivityDemandReason::kCloudInteractive
                     : wqn::services::ConnectivityDemandReason::kBulkBackground,
@@ -136,7 +158,8 @@ void CloudLaneTask(void* arg)
                                                 : "cloud-bulk",
                 __FILE__,
                 __LINE__);
-        if (!connectivity_demand) {
+        }
+        if (needs_connectivity && !connectivity_demand) {
             ESP_LOGW(
                 kTag,
                 "cloud job admitted without connectivity demand: domain=%s",

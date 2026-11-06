@@ -1777,6 +1777,42 @@ esp_err_t SkipWordStudyObservationV1(
         "word-study-observation-skip");
 }
 
+esp_err_t FetchWordEligibilityV1(const std::string& token,
+                                 const protocol::word_study_v1::EligibilityRequest& request,
+                                 protocol::word_study_v1::EligibilityData* data,
+                                 protocol::v3::Error* error, int* http_status)
+{
+    if (data == nullptr || error == nullptr || !IsValidAccessToken(token))
+        return ESP_ERR_INVALID_ARG;
+    if (http_status != nullptr)
+        *http_status = 0;
+    *data = {};
+    *error = {};
+    std::string input, body;
+    auto result = protocol::word_study_v1::BuildEligibilityRequest(request, &input);
+    if (result != ESP_OK)
+        return result;
+    if (WaitForNetworkReadyForHttps() != ESP_OK)
+        return ESP_ERR_TIMEOUT;
+    int status = 0;
+    result = HttpRequest("POST", BuildUrl("/v3/words/eligibility"), &token, &input, &status, &body,
+                         protocol::v3::kProtocolHeader, &request.metadata.request_id,
+                         kWordSessionHttpTimeoutMs);
+    if (result != ESP_OK)
+        return result;
+    if (http_status != nullptr)
+        *http_status = status;
+    if (status == 401)
+    {
+        error->code = "UNAUTHORIZED";
+        return ClearTokenOnUnauthorized("word-eligibility");
+    }
+    result = protocol::word_study_v1::ParseEligibilityResponse(body, request.metadata.request_id,
+                                                               data, error);
+    NormalizeProtocolHttpError(status, error);
+    return status == 200 ? result : (result == ESP_OK ? ESP_FAIL : result);
+}
+
 esp_err_t RegisterLocalWordStudySessionV1(
     const std::string& token,
     const protocol::word_study_v1::LocalSessionRegistrationRequest& request,
