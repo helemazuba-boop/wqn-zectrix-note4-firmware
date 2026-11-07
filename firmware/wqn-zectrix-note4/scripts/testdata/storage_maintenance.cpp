@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "device_protocol/word_study.h"
 using nvs_handle_t = unsigned;
 constexpr int NVS_READONLY=0, NVS_READWRITE=1;
+enum nvs_type_t {NVS_TYPE_U32=4,NVS_TYPE_U64=8,NVS_TYPE_STR=33,NVS_TYPE_BLOB=66,NVS_TYPE_ANY=255};
 constexpr int ESP_ERR_NVS_NOT_FOUND=0x1102, ESP_ERR_NVS_TYPE_MISMATCH=0x1103;
 constexpr char WQN_NVS_NAMESPACE[]="wqn";
 constexpr char kTag[]="maintenance-port";
@@ -22,11 +24,13 @@ struct Value {
     std::vector<uint8_t> bytes;
     esp_err_t error=ESP_OK, read_error=ESP_OK;
     bool change_size=false;
+    nvs_type_t type=NVS_TYPE_BLOB;
 };
 std::map<std::string,Value> values;
 bool owner=true, namespace_present=true, scope_present=true, pending=false, cache_drift=false;
 esp_err_t open_error=ESP_OK, scope_error=ESP_OK, pending_error=ESP_OK;
 uint64_t scope=7;
+nvs_type_t scope_type=NVS_TYPE_U64,pending_type=NVS_TYPE_STR;
 uint32_t cache=7;
 unsigned opens=0, closes=0, write_opens=0, cache_reads=0, direct_output_writes=0;
 std::vector<std::string> read_keys;
@@ -44,10 +48,27 @@ esp_err_t nvs_open(const char* ns,int mode,nvs_handle_t* out) {
     *out=1;return ESP_OK;
 }
 void nvs_close(nvs_handle_t) {++closes;}
+esp_err_t nvs_find_key(nvs_handle_t,const char* key,nvs_type_t* out) {
+    read_keys.push_back(key);CheckDestination(out);
+    if(std::strcmp(key,"word_deck_gen")==0){
+        if(scope_error!=ESP_OK)return scope_error;
+        if(!scope_present)return ESP_ERR_NVS_NOT_FOUND;
+        *out=scope_type;return ESP_OK;
+    }
+    if(std::strcmp(key,"word_deck_chg")==0){
+        if(pending_error!=ESP_OK)return pending_error;
+        if(!pending)return ESP_ERR_NVS_NOT_FOUND;
+        *out=pending_type;return ESP_OK;
+    }
+    auto found=values.find(key);if(found==values.end())return ESP_ERR_NVS_NOT_FOUND;
+    if(found->second.error!=ESP_OK)return found->second.error;
+    *out=found->second.type;return ESP_OK;
+}
 esp_err_t nvs_get_u64(nvs_handle_t,const char* key,uint64_t* out) {
     read_keys.push_back(key);CheckDestination(out);
     if(std::strcmp(key,"word_deck_gen")!=0)return ESP_FAIL;
     if(scope_error!=ESP_OK)return scope_error;
+    if(scope_type!=NVS_TYPE_U64)return ESP_ERR_NVS_NOT_FOUND;
     if(!scope_present)return ESP_ERR_NVS_NOT_FOUND;
     *out=scope;return ESP_OK;
 }
@@ -55,6 +76,7 @@ esp_err_t nvs_get_str(nvs_handle_t,const char* key,char* out,size_t* size) {
     read_keys.push_back(key);CheckDestination(size);CheckDestination(out);
     if(std::strcmp(key,"word_deck_chg")!=0 || out!=nullptr)return ESP_FAIL;
     if(pending_error!=ESP_OK)return pending_error;
+    if(pending_type!=NVS_TYPE_STR)return ESP_ERR_NVS_NOT_FOUND;
     if(!pending)return ESP_ERR_NVS_NOT_FOUND;
     *size=12;return ESP_OK;
 }
@@ -62,6 +84,7 @@ esp_err_t nvs_get_blob(nvs_handle_t,const char* key,void* out,size_t* size) {
     read_keys.push_back(key);CheckDestination(out);CheckDestination(size);
     auto found=values.find(key);if(found==values.end())return ESP_ERR_NVS_NOT_FOUND;
     auto& value=found->second;
+    if(value.type!=NVS_TYPE_BLOB)return ESP_ERR_NVS_NOT_FOUND;
     if(value.error!=ESP_OK)return value.error;
     if(!out){*size=value.bytes.size();return ESP_OK;}
     if(value.read_error!=ESP_OK)return value.read_error;
@@ -70,6 +93,7 @@ esp_err_t nvs_get_blob(nvs_handle_t,const char* key,void* out,size_t* size) {
     if(actual)std::memcpy(out,value.bytes.data(),actual);
     *size=actual;return ESP_OK;
 }
+#include "runtime/nvs_typed_value.h"
 namespace wqn::services {bool IsStorageServiceTask(){return owner;}}
 @@LOOKUP@@
 namespace wqn {
@@ -88,6 +112,7 @@ void Check(bool ok,const char* name) {
 void Reset() {
     values.clear();owner=namespace_present=scope_present=true;pending=cache_drift=false;
     open_error=scope_error=pending_error=ESP_OK;scope=cache=7;
+    scope_type=NVS_TYPE_U64;pending_type=NVS_TYPE_STR;
     opens=closes=write_opens=cache_reads=direct_output_writes=0;read_keys.clear();output_begin=output_end=0;
 }
 esp_err_t Inspect(wqn::WordRecoveryNvsSnapshot* out) {
@@ -122,8 +147,9 @@ int main() {
         snapshot.cursors[i].copied_bytes==52 && snapshot.cursors[i].bytes[51]==i+1,"all seven known raw cursors are retained");
     Check(write_opens==0 && direct_output_writes==0 && closes==1,
           "NVS writes only internal scratch, then copies POD; handle closes");
-    Check(std::find(read_keys.begin(),read_keys.end(),"access_token")==read_keys.end() &&
-        read_keys.size()==16,"no credentials or unrelated keys are read");
+    Check(std::set<std::string>(read_keys.begin(),read_keys.end())==std::set<std::string>{
+        "word_deck_gen","word_deck_chg","cur_seq","cur_rnd","cur_dic","cur_rev","cur_int","cur_shf","cur_mis"},
+        "only the exact recovery allowlist is queried");
     for(const auto& item:before)Check(values[item.first].bytes==item.second.bytes,"raw stored values unchanged");
     Reset();values["cur_seq"].bytes={};
     Check(Inspect(&snapshot)==ESP_OK && snapshot.cursors[0].found && snapshot.cursors[0].stored_bytes==0 &&
@@ -136,7 +162,7 @@ int main() {
         snapshot.cursors[0].stored_bytes==65 && snapshot.cursors[0].copied_bytes==0,
           "oversize raw data is not silently truncated or declared captured");
     Check(snapshot.cursors[6].copied_bytes==3,"remaining independent evidence is still captured after one fault");
-    Reset();values["cur_seq"].error=ESP_ERR_NVS_TYPE_MISMATCH;
+    Reset();values["cur_seq"].type=NVS_TYPE_U64;
     Check(Inspect(&snapshot)==ESP_ERR_NVS_TYPE_MISMATCH && !snapshot.read_complete &&
         snapshot.cursors[0].error==ESP_ERR_NVS_TYPE_MISMATCH,"wrong NVS type is explicit unknown evidence");
     Reset();values["cur_seq"].bytes=std::vector<uint8_t>(52,1);values["cur_seq"].read_error=ESP_FAIL;
@@ -152,7 +178,7 @@ int main() {
     Reset();scope_present=false;
     Check(Inspect(&snapshot)==ESP_OK && !snapshot.scope_found && snapshot.cached_scope_generation_after==7,
           "missing committed generation is not guessed from RAM");
-    Reset();scope_error=ESP_ERR_NVS_TYPE_MISMATCH;
+    Reset();scope_type=NVS_TYPE_U32;
     Check(Inspect(&snapshot)==ESP_ERR_NVS_TYPE_MISMATCH && snapshot.scope_error!=ESP_OK,"scope type error is retained");
     Reset();pending_error=ESP_FAIL;
     Check(Inspect(&snapshot)==ESP_FAIL && snapshot.pending_marker_error==ESP_FAIL,"pending marker error is not cleared");

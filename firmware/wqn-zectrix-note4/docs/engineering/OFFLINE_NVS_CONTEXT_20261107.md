@@ -21,7 +21,7 @@
 
 实际 SDK 的 `Storage::findItem` 可把页级 TYPE_MISMATCH 折叠成 NOT_FOUND，因此
 本工具还比较该键的原始条目清单。已存在的错误类型不能当作未设置的默认值。
-这是后续固件读取入口需要单独复核的边界，不宣称本批已修复设备端所有类型处理。
+对应的 [固件修正](NVS_TYPED_PRESENCE_20261107.md) 现已单独实现并提供实际 SDK 回归；离线工具包保持其各自固定的源码身份，不因此获得维修授权或实机验收结论。
 
 `session_context()` 只把匹配当前 mode/SID 的 NVS 暂停值、相同的已提交 generation
 与一个已解码的保留会话关联。它不证明当前 pack admission、RAM scope ready 或来源

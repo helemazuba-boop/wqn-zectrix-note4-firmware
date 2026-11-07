@@ -41,6 +41,7 @@ def main():
         fixture=fixture.replace(key,value)
     with tempfile.TemporaryDirectory(prefix='wqn-maintenance-nvs-') as temp:
         path=Path(temp);(path/'esp_err.h').write_text(ERR)
+        (path/'nvs.h').write_text('#pragma once\n')  # API ports are declared in the fixture.
         (path/'fixture.cpp').write_text(fixture)
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror',
             '-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer',

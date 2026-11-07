@@ -18,6 +18,7 @@ constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_INVALID_ARG=0x102;
 constexpr int ESP_ERR_INVALID_STATE=0x103, ESP_ERR_INVALID_SIZE=0x104;
 constexpr int ESP_ERR_NVS_NOT_FOUND=0x1102, ESP_ERR_NVS_TYPE_MISMATCH=0x1103;
 constexpr int NVS_READONLY=0, NVS_READWRITE=1;
+enum nvs_type_t {NVS_TYPE_U64=8,NVS_TYPE_STR=33,NVS_TYPE_ANY=255};
 constexpr char WQN_NVS_NAMESPACE[]="wqn", kTag[]="scope-port";
 void Log(const char*, const char*, ...) {}
 #define ESP_LOGW(...) Log(__VA_ARGS__)
@@ -64,17 +65,22 @@ esp_err_t nvs_open(const char* ns,int mode,nvs_handle_t* output) {
     handles.emplace(*output,Handle{mode,{}, {}}); return ESP_OK;
 }
 void nvs_close(nvs_handle_t handle) { handles.erase(handle); }
+esp_err_t nvs_find_key(nvs_handle_t,const char* key,nvs_type_t* output) {
+    auto error=ReadFault(std::string("find_key:")+key);if(error!=ESP_OK)return error;
+    auto found=durable.find(key);if(found==durable.end())return ESP_ERR_NVS_NOT_FOUND;
+    *output=found->second.string?NVS_TYPE_STR:NVS_TYPE_U64;return ESP_OK;
+}
 esp_err_t nvs_get_u64(nvs_handle_t,const char* key,uint64_t* output) {
     auto error=ReadFault(std::string("get_u64:")+key); if(error!=ESP_OK)return error;
     auto found=durable.find(key);if(found==durable.end())return ESP_ERR_NVS_NOT_FOUND;
-    if(found->second.string)return ESP_ERR_NVS_TYPE_MISMATCH;
+    if(found->second.string)return ESP_ERR_NVS_NOT_FOUND; // Actual SDK typed lookup folds the mismatch.
     *output=found->second.number;return ESP_OK;
 }
 esp_err_t nvs_get_str(nvs_handle_t,const char* key,char* output,size_t* length) {
     auto error=ReadFault(std::string(output?"read_str:":"measure_str:")+key);
     if(error!=ESP_OK)return error;
     auto found=durable.find(key);if(found==durable.end())return ESP_ERR_NVS_NOT_FOUND;
-    if(!found->second.string)return ESP_ERR_NVS_TYPE_MISMATCH;
+    if(!found->second.string)return ESP_ERR_NVS_NOT_FOUND;
     size_t size=found->second.bytes.size();
     if(output && shorten_read && size) --size;
     if(output && *length<size){*length=size;return ESP_ERR_INVALID_SIZE;}
@@ -104,6 +110,7 @@ esp_err_t nvs_commit(nvs_handle_t handle) {
     if(!pending.erased.empty())durable.erase(pending.erased);
     return AfterMutation()?ESP_FAIL:ESP_OK;
 }
+#include "runtime/nvs_typed_value.h"
 namespace wqn::protocol::word_study_v1 {
 enum class Mode:uint8_t{kSequential,kRandom,kDictionary,kReview,kIntake,kShuffle,kMistakes};
 }

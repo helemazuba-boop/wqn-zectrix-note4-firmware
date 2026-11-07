@@ -153,6 +153,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
   read-only SDK import, forensic/receipt bridge and unresolved repair context.
 - `docs/engineering/OFFLINE_NVS_CONTEXT_20261107.md` - pinned raw NVS context,
   SDK read-only interpretation, ambiguity handling and remaining plan integration.
+- `docs/engineering/NVS_TYPED_PRESENCE_20261107.md` - actual SDK typed lookup
+  folding, runtime presence/type guards, legacy volume support and device acceptance.
 - `docs/engineering/PRESERVATION_BOOT_ENTRY_20261107.md` - pre-NVS manual boot
   preservation, raw-only policy and pending physical acceptance.
 - `docs/engineering/RECOVERY_DEVICE_EXPORT_20261107.md` - physically confirmed

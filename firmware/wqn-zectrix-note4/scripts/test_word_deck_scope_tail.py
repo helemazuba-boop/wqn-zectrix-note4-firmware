@@ -69,12 +69,14 @@ def main():
         if has_ready else '')
     with tempfile.TemporaryDirectory(prefix='wqn-scope-tail-') as directory:
         path = Path(directory)
+        (path/'nvs.h').write_text('#pragma once\n')  # API ports precede the real typed-presence header.
         (path / 'test.cpp').write_text(unit)
         subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
                         '-fno-omit-frame-pointer', '-fno-pie', '-no-pie',
                         '-DWQN_SCOPE_FULL_PORTS=' + str(int(args.suite == 'all')),
                         '-DWQN_SCOPE_HAS_READY=' + str(int(has_ready)),
+                        '-I'+str(path),'-I'+str(root/'main'),
                         str(path / 'test.cpp'), '-o', str(path / 'test')],
                        check=True, timeout=45)
         return subprocess.run([str(path / 'test')], timeout=20).returncode

@@ -105,12 +105,21 @@ int nvs_open(const char* space, int mode, nvs_handle_t* handle) {
     env.handles.emplace(*handle, Handle{space, mode, {}, {}, false}); return ESP_OK;
 }
 void nvs_close(nvs_handle_t handle) { CHECK(env.handles.erase(handle) == 1); }
+int nvs_find_key(nvs_handle_t handle,const char* key,nvs_type_t* type) {
+    CHECK(env.handles.count(handle));
+    const int result=Outcome(std::string("find:")+key);if(result!=ESP_OK)return result;
+    const auto& keys=env.data[env.handles.at(handle).space];
+    const auto found=keys.find(key);if(found==keys.end())return ESP_ERR_NVS_NOT_FOUND;
+    *type=found->second.type==NVS_TYPE_LEGACY?NVS_TYPE_BLOB:found->second.type;
+    return ESP_OK;
+}
 int nvs_get_u32(nvs_handle_t handle, const char* key, uint32_t* out) {
     CHECK(env.handles.count(handle));
     const int result = Outcome(std::string("get:") + key); if (result != ESP_OK) return result;
     auto& keys = env.data[env.handles.at(handle).space];
     auto it = keys.find(key); if (it == keys.end()) return ESP_ERR_NVS_NOT_FOUND;
-    CHECK(it->second.type == NVS_TYPE_U32 && it->second.bytes.size() == sizeof(*out));
+    if(it->second.type!=NVS_TYPE_U32)return ESP_ERR_NVS_NOT_FOUND;
+    CHECK(it->second.bytes.size() == sizeof(*out));
     std::memcpy(out, it->second.bytes.data(), sizeof(*out)); return ESP_OK;
 }
 int nvs_get_blob(nvs_handle_t handle, const char* key, void* out, size_t* size) {
@@ -119,7 +128,7 @@ int nvs_get_blob(nvs_handle_t handle, const char* key, void* out, size_t* size) 
     if (result != ESP_OK) return result;
     const auto& keys = env.data[env.handles.at(handle).space];
     const auto it = keys.find(key); if (it == keys.end()) return ESP_ERR_NVS_NOT_FOUND;
-    CHECK(it->second.type == NVS_TYPE_BLOB);
+    if(it->second.type!=NVS_TYPE_BLOB && it->second.type!=NVS_TYPE_LEGACY)return ESP_ERR_NVS_NOT_FOUND;
     if (out) {
         CHECK(*size >= it->second.bytes.size());
         const size_t count = it->second.bytes.size() - (env.short_blob == key ? 1 : 0);
@@ -299,6 +308,15 @@ void Run(bool immediate) {
     CHECK(env.files.size() == 3 && Calls("format") == 0 && Calls("commit:wqn_boot") == 0);
     CHECK(Calls("partition-read") == 0);
     CHECK(env.data == original_data && env.files == original_files);
+    for(const char* key:{"schema_gen","reset_id","reset_pending"}) {
+        Reset(immediate);
+        env.data["wqn_boot"][key]=std::strcmp(key,"schema_gen")==0
+            ? Value{NVS_TYPE_BLOB,Bytes(16,0xa5)} : U32(3);
+        const auto before=env.data;
+        ExpectPreserved(ESP_ERR_NVS_TYPE_MISMATCH);
+        CHECK(InvalidateStorageSchemaForFactoryReset()==ESP_ERR_NVS_TYPE_MISMATCH);
+        CHECK(env.data==before && Calls("set:reset_pending")==0);
+    }
     for (uint32_t generation : {0u, 1u, 2u, 4u, 0xffffffffu}) {
         Reset(immediate); SetGeneration(generation);
         if (generation == 0) env.data["wqn_boot"].erase("reset_id");
@@ -318,7 +336,7 @@ void Run(bool immediate) {
         Reset(immediate); Fail("init", 1, error); ExpectPreserved(error);
         CHECK(Calls("open-ro:wqn_boot") == 0);
     }
-    for (const char* fault : {"open-ro:wqn_boot", "get:schema_gen", "get-size:reset_id",
+    for (const char* fault : {"open-ro:wqn_boot", "find:schema_gen", "find:reset_id", "find:reset_pending", "get:schema_gen", "get-size:reset_id",
                              "get-data:reset_id", "get-size:reset_pending", "get-data:reset_pending"}) {
         Reset(immediate); SetIntent(); Fail(fault, 1, ESP_ERR_INVALID_CRC);
         ExpectPreserved(ESP_ERR_INVALID_CRC);
@@ -369,13 +387,18 @@ void Run(bool immediate) {
         CHECK(InvalidateStorageSchemaForFactoryReset() == ESP_ERR_INVALID_STATE);
         CHECK(env.data == before && !HasIntent());
     }
-    for (const char* fault : {"open-ro:wqn_boot", "get:schema_gen", "get-size:reset_id",
-                             "get-data:reset_id", "get-size:reset_pending", "open-rw:wqn_boot",
+    for (const char* fault : {"open-ro:wqn_boot", "find:schema_gen", "find:reset_id", "find:reset_pending", "get:schema_gen", "get-size:reset_id",
+                             "get-data:reset_id", "open-rw:wqn_boot",
                              "set:reset_pending", "commit:wqn_boot"}) {
         Reset(immediate); Fail(fault);
         CHECK(InvalidateStorageSchemaForFactoryReset() == ESP_FAIL);
         CHECK(env.files == before_files && env.handles.empty() && Calls("format") == 0);
         if (HasIntent()) { Reboot(); ExpectComplete(); }
+    }
+    for(const char* fault:{"find:reset_pending","get-size:reset_pending","get-data:reset_pending"}) {
+        Reset(immediate);SetIntent();const auto before=env.data;Fail(fault);
+        CHECK(InvalidateStorageSchemaForFactoryReset()==ESP_FAIL);
+        CHECK(env.data==before && Calls("set:reset_pending")==0 && Calls("format")==0);
     }
     // Fail each reset phase, then re-enter with persisted progress in both models.
     for (const auto& fault : std::vector<std::pair<std::string, unsigned>>{
