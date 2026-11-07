@@ -45,6 +45,8 @@ def cases():
         ('note_index_delivery', 'N-02: delayed results across full/targeted lanes', ()),
         ('storage_schema', 'R-18: explicit recovery intent, stale consent and boot replay', ()),
         ('storage_mount_guard', 'R-18: ambiguous SPIFFS registration errors require actual mount proof', ()),
+        ('nvs_storage_core', 'R-08/R-18: actual SDK type/presence, common cursor and boot guards, supported volume formats', ()),
+        ('nvs_pause_pipeline', 'R-08: actual SDK cursor errors reach the pause reader and session loader across all seven modes', ()),
         ('outbox_forensics', 'R-08 ongoing: offline raw preservation and native journal/SDK CRC parity', ()),
         ('outbox_reconcile', 'R-08 ongoing: pinned raw evidence, authenticated receipts and non-authorizing review plans', ()),
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
@@ -91,6 +93,14 @@ def cases():
         result.append(Case(f'forensics-{mutation}', 'R-08 ongoing: CRC, profile capacity, descriptors and independently recomputed reports', 'controls',
                            ('test_outbox_forensics.py', '--mutation', mutation), r'^FAIL:',
                            r'Outbox forensics: \d+ scenarios, [1-9]\d* failures, 0 errors \(NOT HIL\)'))
+    for mutation in ('hide-wrong-type', 'ignore-disappearance', 'overwrite-cursor', 'hide-boot-intent', 'drop-legacy-volume', 'accept-embedded-nul'):
+        result.append(Case(f'nvs-core-{mutation}', 'R-08/R-18: development common readers cannot hide unknown types, disappearance or supported formats', 'controls',
+                           ('test_nvs_storage_core.py', '--mutation', mutation), r'^FAIL typed-nvs:',
+                           r'NVS storage core total: \d+ checks, [1-9]\d* failures \(actual SDK and production functions; host bridge; NOT HIL\)'))
+    for mutation in ('swallow-layer-error', 'hide-reader-error'):
+        result.append(Case(f'nvs-pause-{mutation}', 'R-08: neither production layer may turn cursor errors into a successful unpaused load', 'controls',
+                           ('test_nvs_pause_pipeline.py', '--mutation', mutation), r'^FAIL typed-nvs:',
+                           r'NVS pause pipeline total: 140 checks, [1-9]\d* failures \(actual SDK/readers/loader; healthy journal ports; NOT HIL\)'))
     for mutation in ('trust-request-id', 'forget-suspension', 'trust-assessment'):
         result.append(Case(f'reconcile-{mutation}', 'R-08 ongoing: exact payload, suspend intent and derived evidence', 'controls',
                            ('test_outbox_reconcile.py', '--mutation', mutation), r'^FAIL reconcile:',

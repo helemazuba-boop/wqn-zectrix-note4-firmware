@@ -12,6 +12,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "runtime/sleep_coordinator.h"
+#include "runtime/nvs_typed_value.h"
 
 namespace {
 
@@ -90,18 +91,22 @@ esp_err_t ReadSchemaMarker(
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open storage schema marker");
 
-    result = nvs_get_u32(nvs.handle, kGenerationKey, generation);
-    if (result == ESP_OK) {
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::ReadNvsTypedPresence(nvs.handle, kGenerationKey, NVS_TYPE_U32, &present),
+        kTag, "check storage schema generation type");
+    if (present) {
+        ESP_RETURN_ON_ERROR(nvs_get_u32(nvs.handle, kGenerationKey, generation),
+                            kTag, "read storage schema generation");
         *generation_found = true;
-    } else if (result != ESP_ERR_NVS_NOT_FOUND) {
-        return result;
     }
 
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::ReadNvsTypedPresence(nvs.handle, kResetIdKey, NVS_TYPE_BLOB, &present),
+        kTag, "check storage reset id type");
+    if (!present) return ESP_OK;
     size_t required_size = 0;
     result = nvs_get_blob(nvs.handle, kResetIdKey, nullptr, &required_size);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
     if (result != ESP_OK) {
         return result;
     }
@@ -147,11 +152,13 @@ esp_err_t ReadResetIntent(bool* found, ResetId* reset_id)
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open reset intent");
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::ReadNvsTypedPresence(nvs.handle, kResetIntentKey, NVS_TYPE_BLOB, &present),
+        kTag, "check reset intent type");
+    if (!present) return ESP_OK;
     size_t size = 0;
     result = nvs_get_blob(nvs.handle, kResetIntentKey, nullptr, &size);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
     ESP_RETURN_ON_ERROR(result, kTag, "read reset intent size");
     if (size != sizeof(ResetIntent)) {
         return ESP_ERR_INVALID_STATE;

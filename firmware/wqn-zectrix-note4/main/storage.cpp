@@ -30,6 +30,7 @@
 #include "services/sync_service.h"
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
+#include "runtime/nvs_typed_value.h"
 #include "runtime/storage_temp_file_lease.h"
 #include "services/storage_service.h"
 #include "sdkconfig.h"
@@ -261,18 +262,25 @@ esp_err_t LoadStringFromNvs(const char* key, std::string* value)
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
 
-    size_t required_size = 0;
-    result = nvs_get_str(nvs.handle, key, nullptr, &required_size);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::ReadNvsTypedPresence(nvs.handle, key, NVS_TYPE_STR, &present),
+        kTag, "check NVS string type");
+    if (!present) {
         value->clear();
         return ESP_OK;
     }
+    size_t required_size = 0;
+    result = nvs_get_str(nvs.handle, key, nullptr, &required_size);
     ESP_RETURN_ON_ERROR(result, kTag, "measure NVS string");
+    if (required_size == 0) return ESP_ERR_INVALID_SIZE;
 
     std::vector<char> buffer(required_size);
+    const size_t measured_size = required_size;
     ESP_RETURN_ON_ERROR(nvs_get_str(nvs.handle, key, buffer.data(), &required_size), kTag, "read NVS string");
-
-    *value = std::string(buffer.data());
+    if (required_size != measured_size || buffer.back() != '\0' ||
+        std::memchr(buffer.data(), '\0', measured_size - 1) != nullptr) return ESP_ERR_INVALID_SIZE;
+    value->assign(buffer.data(), measured_size - 1);
     return ESP_OK;
 }
 
@@ -320,11 +328,15 @@ esp_err_t LoadU64FromNvs(const char* key, uint64_t* value, bool* found)
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
 
-    result = nvs_get_u64(nvs.handle, key, value);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::ReadNvsTypedPresence(nvs.handle, key, NVS_TYPE_U64, &present),
+        kTag, "check NVS u64 type");
+    if (!present) return ESP_OK;
+    uint64_t internal = 0;
+    result = nvs_get_u64(nvs.handle, key, &internal);
     ESP_RETURN_ON_ERROR(result, kTag, "read NVS u64");
+    *value = internal;
     *found = true;
     return ESP_OK;
 }
@@ -372,18 +384,26 @@ esp_err_t LoadBlobFromNvs(const char* key, std::string* value)
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
 
-    size_t required_size = 0;
-    result = nvs_get_blob(nvs.handle, key, nullptr, &required_size);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        wqn::runtime::ReadNvsTypedPresence(nvs.handle, key, NVS_TYPE_BLOB, &present),
+        kTag, "check NVS blob type");
+    if (!present) {
         value->clear();
         return ESP_OK;
     }
+    size_t required_size = 0;
+    result = nvs_get_blob(nvs.handle, key, nullptr, &required_size);
     ESP_RETURN_ON_ERROR(result, kTag, "measure NVS blob");
 
     std::vector<char> buffer(required_size);
-    ESP_RETURN_ON_ERROR(nvs_get_blob(nvs.handle, key, buffer.data(), &required_size), kTag, "read NVS blob");
-
-    value->assign(buffer.data(), required_size);
+    const size_t measured_size = required_size;
+    char empty = 0;
+    void* destination = buffer.empty() ? static_cast<void*>(&empty) : buffer.data();
+    ESP_RETURN_ON_ERROR(nvs_get_blob(nvs.handle, key, destination, &required_size), kTag, "read NVS blob");
+    if (required_size != measured_size) return ESP_ERR_INVALID_SIZE;
+    if (buffer.empty()) value->clear();
+    else value->assign(buffer.data(), required_size);
     return ESP_OK;
 }
 
@@ -1071,24 +1091,30 @@ bool ReadStorageCapacitySnapshot(StorageCapacitySnapshot* snapshot)
 // the existing error and retry behavior.
 esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t size)
 {
+    if (key == nullptr || record == nullptr || size == 0) return ESP_ERR_INVALID_ARG;
     NvsHandle nvs;
     ESP_RETURN_ON_ERROR(
         nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle), kTag, "open NVS namespace");
 
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        runtime::ReadNvsTypedPresence(nvs.handle, key, NVS_TYPE_BLOB, &present),
+        kTag, "check existing word session cursor type");
     size_t existing_size = 0;
-    esp_err_t result = nvs_get_blob(nvs.handle, key, nullptr, &existing_size);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        existing_size = 0;
-    } else {
+    esp_err_t result = ESP_OK;
+    if (present) {
+        result = nvs_get_blob(nvs.handle, key, nullptr, &existing_size);
         ESP_RETURN_ON_ERROR(result, kTag, "measure existing word session cursor");
+        if (existing_size != size) return ESP_ERR_INVALID_SIZE;
     }
 
-    bool changed = existing_size != size;
+    bool changed = !present;
     if (!changed) {
         std::vector<uint8_t> existing(size);
         ESP_RETURN_ON_ERROR(
             nvs_get_blob(nvs.handle, key, existing.data(), &existing_size), kTag,
             "read existing word session cursor");
+        if (existing_size != size) return ESP_ERR_INVALID_SIZE;
         changed = std::memcmp(existing.data(), record, size) != 0;
     }
 
@@ -1115,6 +1141,7 @@ esp_err_t SaveWordSessionCursorNvs(const char* key, const void* record, size_t s
 // NOT_FOUND is success: clearing a mode that never had a cursor is normal.
 esp_err_t ClearWordSessionCursorNvs(const char* key)
 {
+    if (key == nullptr) return ESP_ERR_INVALID_ARG;
     NvsHandle nvs;
     esp_err_t result = nvs_open(WQN_NVS_NAMESPACE, NVS_READWRITE, &nvs.handle);
     if (result == ESP_ERR_NVS_NOT_FOUND) {
@@ -1122,10 +1149,12 @@ esp_err_t ClearWordSessionCursorNvs(const char* key)
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
 
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        runtime::ReadNvsTypedPresence(nvs.handle, key, NVS_TYPE_BLOB, &present),
+        kTag, "check word cursor type before clear");
+    if (!present) return ESP_OK;
     result = nvs_erase_key(nvs.handle, key);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
     if (result != ESP_OK) {
         return result;
     }
@@ -1135,7 +1164,7 @@ esp_err_t ClearWordSessionCursorNvs(const char* key)
 
 esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, bool* found)
 {
-    if (found == nullptr || record == nullptr) {
+    if (found == nullptr || record == nullptr || key == nullptr || size == 0) {
         return ESP_ERR_INVALID_ARG;
     }
     *found = false;
@@ -1147,22 +1176,24 @@ esp_err_t LoadWordSessionCursorNvs(const char* key, void* record, size_t size, b
     }
     ESP_RETURN_ON_ERROR(result, kTag, "open NVS namespace");
 
+    bool present = false;
+    ESP_RETURN_ON_ERROR(
+        runtime::ReadNvsTypedPresence(nvs.handle, key, NVS_TYPE_BLOB, &present),
+        kTag, "check word session cursor type");
+    if (!present) return ESP_OK;
     size_t stored_size = 0;
     result = nvs_get_blob(nvs.handle, key, nullptr, &stored_size);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
     ESP_RETURN_ON_ERROR(result, kTag, "measure word session cursor");
     if (stored_size != size) {
-        // A size change means a different schema generation of the cursor
-        // record. Treat it as absent rather than as corrupt: the legacy
-        // .cur file below is a better source than a half-shaped NVS value.
-        ESP_LOGW(kTag, "word session cursor size %u != %u, ignoring", (unsigned)stored_size,
+        // Present unknown bytes are not absence. A stale legacy cursor cannot
+        // establish the disposition of a newer/corrupt NVS value.
+        ESP_LOGW(kTag, "word session cursor size %u != %u, preserving", (unsigned)stored_size,
                  (unsigned)size);
-        return ESP_OK;
+        return ESP_ERR_INVALID_SIZE;
     }
     ESP_RETURN_ON_ERROR(
         nvs_get_blob(nvs.handle, key, record, &stored_size), kTag, "read word session cursor");
+    if (stored_size != size) return ESP_ERR_INVALID_SIZE;
     *found = true;
     return ESP_OK;
 }
@@ -1955,23 +1986,33 @@ esp_err_t LoadVolumePercent(int* percent)
         return ESP_ERR_INVALID_ARG;
     }
     int v = kVolumeDefaultPercent;
-    nvs_handle_t h = 0;
-    esp_err_t ret = nvs_open(kAudioNamespace, NVS_READONLY, &h);
-    if (ret == ESP_OK) {
-        int32_t i32v = 0;
-        esp_err_t gr = nvs_get_i32(h, kVolumeNvsKey, &i32v);
-        if (gr == ESP_ERR_NVS_TYPE_MISMATCH) {
-            // Origin firmware may have stored it as u8.
-            uint8_t u8v = 0;
-            gr = nvs_get_u8(h, kVolumeNvsKey, &u8v);
-            if (gr == ESP_OK) v = static_cast<int>(u8v);
-        } else if (gr == ESP_OK) {
-            v = static_cast<int>(i32v);
-        }
-        nvs_close(h);
-    } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    NvsHandle nvs;
+    esp_err_t ret = nvs_open(kAudioNamespace, NVS_READONLY, &nvs.handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
         // Namespace doesn't exist yet (first boot) - use default.
-        ret = ESP_OK;
+        *percent = v;
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(ret, kTag, "open volume namespace");
+    nvs_type_t type = NVS_TYPE_ANY;
+    ret = nvs_find_key(nvs.handle, kVolumeNvsKey, &type);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        *percent = v;
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(ret, kTag, "check volume type");
+    if (type == NVS_TYPE_I32) {
+        int32_t value = 0;
+        ESP_RETURN_ON_ERROR(nvs_get_i32(nvs.handle, kVolumeNvsKey, &value), kTag, "read i32 volume");
+        v = static_cast<int>(value);
+    } else if (type == NVS_TYPE_U8) {
+        // Explicitly supported origin-firmware format. A typed NOT_FOUND is
+        // insufficient to decide which format exists.
+        uint8_t value = 0;
+        ESP_RETURN_ON_ERROR(nvs_get_u8(nvs.handle, kVolumeNvsKey, &value), kTag, "read legacy volume");
+        v = static_cast<int>(value);
+    } else {
+        return ESP_ERR_NVS_TYPE_MISMATCH;
     }
     if (v < 0) v = 0;
     if (v > 100) v = 100;
@@ -1982,7 +2023,7 @@ esp_err_t LoadVolumePercent(int* percent)
     // failed-awaiting-retry; writing the old durable value back here silently
     // rolled the audible volume back under the user. Boot explicitly seeds the
     // cache via SetPlaybackVolumeCache (main.cpp).
-    return ret;
+    return ESP_OK;
 }
 
 esp_err_t SaveVolumePercentForeground(int percent)

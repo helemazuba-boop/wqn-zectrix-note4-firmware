@@ -606,12 +606,18 @@ esp_err_t WriteSessionCursor(const wqn::PersistedWordSession& session)
 bool ReadSessionCursorPaused(
     wqn::protocol::word_study_v1::Mode mode,
     const std::string& session_id,
-    bool* paused)
+    bool* paused,
+    esp_err_t* error = nullptr)
 {
+    if (error != nullptr) *error = ESP_OK;
+    const auto reject = [error](esp_err_t code) {
+        if (error != nullptr) *error = code;
+        return false;
+    };
     SessionPaths paths = {};
-    if (paused == nullptr || !GetSessionCursorPaths(mode, &paths)) return false;
+    if (paused == nullptr || !GetSessionCursorPaths(mode, &paths)) return reject(ESP_ERR_INVALID_ARG);
     const char* nvs_key = GetSessionCursorNvsKey(mode);
-    if (nvs_key == nullptr) return false;
+    if (nvs_key == nullptr) return reject(ESP_ERR_INVALID_ARG);
 
     // [word-session-cursor-nvs] NVS first. The legacy .cur file is still read
     // because devices that ran the SPIFFS cursor have one on disk and nothing
@@ -621,26 +627,26 @@ bool ReadSessionCursorPaused(
     // after the first successful read NVS is the only copy.
     SessionCursorRecord record = {};
     bool have_nvs_cursor = false;
-    if (wqn::LoadWordSessionCursorNvs(nvs_key, &record, sizeof(record), &have_nvs_cursor) !=
-        ESP_OK) {
-        return false;
-    }
+    const esp_err_t loaded = wqn::LoadWordSessionCursorNvs(
+        nvs_key, &record, sizeof(record), &have_nvs_cursor);
+    if (loaded != ESP_OK) return reject(loaded);
     if (!have_nvs_cursor) {
         FILE* file = std::fopen(paths.primary, "rb");
-        if (file == nullptr) return false;
+        if (file == nullptr) return errno == ENOENT ? false : reject(ESP_FAIL);
         const bool read_ok =
             std::fread(&record, 1, sizeof(record), file) == sizeof(record);
         const int trailing = std::fgetc(file);
-        const bool file_ok = read_ok && trailing == EOF && !std::ferror(file);
-        std::fclose(file);
-        if (!file_ok) return false;
+        const bool io_error = std::ferror(file) != 0;
+        const bool closed = std::fclose(file) == 0;
+        if (io_error || !closed) return reject(ESP_FAIL);
+        if (!read_ok || trailing != EOF) return reject(ESP_ERR_INVALID_SIZE);
     }
     if (record.magic != kSessionCursorMagic ||
         record.version != kSessionCursorVersion ||
         record.paused > 1 ||
         record.session_id[sizeof(record.session_id) - 1] != '\0' ||
         Crc32(&record, sizeof(record) - sizeof(record.crc)) != record.crc) {
-        return false;
+        return reject(ESP_ERR_INVALID_CRC);
     }
     // Reject a leftover cursor from a previous session in the same mode slot.
     if (session_id != record.session_id) return false;
@@ -1640,8 +1646,11 @@ esp_err_t LoadSessionTransaction(void* opaque)
     // snapshot on disk may still read unpaused; position/phase/sequence were
     // already reconciled from the outbox above.
     bool cursor_paused = false;
-    if (ReadSessionCursorPaused(
-            context->mode, session->remote.session_id, &cursor_paused)) {
+    esp_err_t cursor_error = ESP_OK;
+    const bool cursor_found = ReadSessionCursorPaused(
+        context->mode, session->remote.session_id, &cursor_paused, &cursor_error);
+    ESP_RETURN_ON_ERROR(cursor_error, kTag, "read authoritative word pause cursor");
+    if (cursor_found) {
         session->paused = cursor_paused;
     }
     ESP_LOGI(

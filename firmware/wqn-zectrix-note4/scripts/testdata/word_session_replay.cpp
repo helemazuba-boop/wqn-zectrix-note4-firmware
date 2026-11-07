@@ -97,6 +97,7 @@ Session disk[7];
 bool present[7] = {};
 OutboxScan journal, cache;
 bool cache_loaded = false, cursor_found = false, cursor_paused = false;
+esp_err_t cursor_read_error = ESP_OK;
 esp_err_t read_error = ESP_OK, scan_error = ESP_OK;
 esp_err_t save_error = ESP_OK, compact_error = ESP_OK;
 int reads = 0, scans = 0, saves = 0, compactions = 0, cursor_reads = 0;
@@ -219,8 +220,10 @@ esp_err_t CompactCachedOutbox(OutboxScan* scan) {
     journal = *scan;
     return ESP_OK;
 }
-bool ReadSessionCursorPaused(Mode, const std::string& session_id, bool* out) {
+bool ReadSessionCursorPaused(Mode, const std::string& session_id, bool* out, esp_err_t* error = nullptr) {
     ++cursor_reads;
+    if (error) *error = cursor_read_error;
+    if (cursor_read_error != ESP_OK) return false;
     if (!cursor_found || session_id != sid) return false;
     *out = cursor_paused;
     return true;
@@ -310,6 +313,7 @@ void Reset() {
     journal = {}; cache = {}; cache_loaded = false;
     g_session_mutation_generation = 0; wqn::scope_generation = 7; fixture_now = 0;
     cursor_found = false; cursor_paused = false;
+    cursor_read_error = ESP_OK;
     read_error = scan_error = save_error = compact_error = ESP_OK;
     reads = scans = saves = compactions = cursor_reads = 0;
     fail_save_call = 0;
@@ -1219,6 +1223,11 @@ int main() {
     TestMaintenanceDriver();
     TestOutboxQuota();
 #endif
+    for (esp_err_t error : {ESP_FAIL, ESP_ERR_INVALID_SIZE, ESP_ERR_INVALID_STATE}) {
+        Reset(); cursor_read_error = error;
+        Check(Load(&out) == error && cursor_reads == 1 && saves == 0 && compactions == 0,
+              "cursor read failure prevents successfully restoring an unpaused snapshot");
+    }
     TestObservationBatch();
     TestAckBatch();
     std::printf("%d PASS / %d FAIL (host storage mocks; NOT power-loss or concurrency HIL)\n",

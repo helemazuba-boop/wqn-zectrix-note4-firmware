@@ -149,6 +149,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/OUTBOX_RECOVERY_20261105.md` — ongoing R-08 offline raw
   preservation, native CRC inspection, pinned receipt collection/review plans,
   and remaining controlled repair/device work.
+- `docs/engineering/NVS_TYPE_GUARD_BACKPORT_20261107.md` — common NVS type/presence
+  fixes backported from validation, actual SDK regressions and remaining branch differences.
 - `docs/engineering/WIFI_CONNECTIVITY_REPAIR.md` — provisioning and network
   switching repair record.
 

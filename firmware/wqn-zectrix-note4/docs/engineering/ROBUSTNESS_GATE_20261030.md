@@ -18,8 +18,8 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-79 个执行项：35 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-34 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+89 个执行项：37 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+42 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
 1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
 R-18 另补充实际 SPIFFS 挂载证明的生产入口回归与语义负例；invalid-state 本身不能当作已挂载。
 参见 [挂载判定及未挂载导出依赖](STORAGE_MOUNT_GUARD_20261107.md)。
@@ -28,6 +28,9 @@ R-08 进行中的离线保全工具增加原生 codec/SDK CRC 检查和四个语
 其后增加原文绑定对账/审查计划入口与三个负例，保护完整 payload、suspend 和派生报告。
 本地 checkpoint 材料入口另增加两个负例，保护候选窗口约束和 NVS 证据边界。
 原生候选入口再增加两个负例，保护独立重算和原始 session 的精确字节往返。
+NVS 共有读取入口增加实际 SDK 专项与六个负例，覆盖错型折叠、查询后消失、游标
+覆盖、启动 intent 和支持的音量/字符串格式；见 [开发线回移](NVS_TYPE_GUARD_BACKPORT_20261107.md)。
+同一 SDK 夹具另串联七种模式的实际暂停读取与会话加载，覆盖错误传播及两层吞错负例。
 已有 outbox CRC/恢复副本、配额、会话重放、prune、M8 与
 HIL 解析器 fixture 仍由工作流原有步骤执行，不把它们写成原本缺失。
 
