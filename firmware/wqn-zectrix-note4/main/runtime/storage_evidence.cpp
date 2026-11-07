@@ -1,7 +1,6 @@
 #include "runtime/storage_evidence.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -26,10 +25,6 @@
 
 namespace wqn::runtime {
 namespace {
-enum class Mode : uint8_t { kUnset, kPublishing, kBootRecovery };
-std::atomic<Mode> g_mode{Mode::kUnset};
-esp_err_t g_boot_error = ESP_FAIL;
-uint32_t g_observed_generation = 0;
 constexpr size_t kChunk = 384, kName = 64;
 constexpr const char* kKeys[] = {"cur_seq", "cur_rnd", "cur_dic", "cur_rev",
     "cur_int", "cur_shf", "cur_mis", "word_deck_gen", "word_deck_chg",
@@ -340,21 +335,13 @@ template <size_t N> bool Nonzero(const std::array<uint8_t, N>& value) {
 }
 }  // namespace
 
-esp_err_t EnterStorageEvidenceBootRecovery(esp_err_t error, uint32_t observed_generation) {
-    Mode expected = Mode::kUnset;
-    if (!g_mode.compare_exchange_strong(expected, Mode::kPublishing, std::memory_order_acq_rel))
-        return ESP_ERR_INVALID_STATE;
-    g_boot_error = error; g_observed_generation = observed_generation;
-    g_mode.store(Mode::kBootRecovery, std::memory_order_release);
-    return ESP_OK;
-}
-
 esp_err_t CaptureStorageEvidenceOnOwner(const StorageEvidenceIdentity& identity,
     const StorageEvidenceSink& sink, StorageEvidenceSummary* summary) {
     if (summary == nullptr) return ESP_ERR_INVALID_ARG;
     *summary = {};
     auto fail = [summary](esp_err_t error) { summary->error = error; return error; };
-    if (!services::IsStorageServiceTask() || g_mode.load(std::memory_order_acquire) != Mode::kBootRecovery)
+    StorageEvidenceBootContext boot;
+    if (ReadStorageEvidenceBootContextOnOwner(&boot) != ESP_OK)
         return fail(ESP_ERR_INVALID_STATE);
     if (!esp_spiffs_mounted("storage") || HasActiveStorageTempFileLease() || HasActivePackStreamPath())
         return fail(ESP_ERR_INVALID_STATE);
@@ -374,7 +361,7 @@ esp_err_t CaptureStorageEvidenceOnOwner(const StorageEvidenceIdentity& identity,
     Bytes begin;
     begin.Raw(identity.capture_id.data(), 16); begin.Raw(identity.mac.data(), 6);
     begin.Raw(identity.firmware_elf_sha256.data(), 32);
-    begin.U(static_cast<uint32_t>(g_boot_error), 4); begin.U(g_observed_generation, 4);
+    begin.U(static_cast<uint32_t>(boot.error), 4); begin.U(boot.observed_generation, 4);
     begin.U(cached_generation, 4); begin.U(scope_ready, 1);
     begin.U(static_cast<uint32_t>(namespace_status == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : namespace_status), 4);
     begin.U(namespace_status == ESP_OK, 1);

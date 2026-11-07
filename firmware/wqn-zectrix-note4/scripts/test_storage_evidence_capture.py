@@ -67,6 +67,7 @@ def build(root, directory, mutation):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     source = (root / 'main/runtime/storage_evidence.cpp').read_text()
+    mode = (root / 'main/runtime/storage_evidence_mode.cpp').read_text()
     changes = {
         'ignore-mode': ('g_mode.load(std::memory_order_acquire) != Mode::kBootRecovery', 'false'),
         'skip-recheck': ('if (!unchanged) remember(ESP_ERR_INVALID_STATE);', 'unchanged = true; if (!unchanged) remember(ESP_ERR_INVALID_STATE);'),
@@ -76,15 +77,19 @@ def build(root, directory, mutation):
     if mutation in changes:
         old, new = changes[mutation]
         expected = 2 if mutation == 'write-open' else 1
-        if source.count(old) != expected:
+        target = mode if mutation == 'ignore-mode' else source
+        if target.count(old) != expected:
             raise RuntimeError('collector mutation boundary drift')
-        source = source.replace(old, new)
+        target = target.replace(old, new)
+        if mutation == 'ignore-mode': mode = target
+        else: source = target
     (directory / 'collector.cpp').write_text(source)
+    (directory / 'mode.cpp').write_text(mode)
     binary = directory / 'native'
     subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer',
         '-fno-pie', '-no-pie', '-I' + str(directory), '-I' + str(root / 'main'),
-        str(directory / 'collector.cpp'), str(root / 'scripts/testdata/storage_evidence.cpp'),
+        str(directory / 'collector.cpp'), str(directory / 'mode.cpp'), str(root / 'scripts/testdata/storage_evidence.cpp'),
         '-lcrypto', '-Wl,--wrap=open', '-Wl,--wrap=close', '-Wl,--wrap=read',
         '-Wl,--wrap=lstat', '-Wl,--wrap=opendir', '-o', str(binary)], check=True, timeout=60)
     return binary
