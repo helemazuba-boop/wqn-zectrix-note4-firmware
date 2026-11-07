@@ -25,6 +25,7 @@ idf_component_register(
         "runtime/storage_evidence.cpp"
         "runtime/storage_evidence_mode.cpp"
         "runtime/raw_flash_evidence.cpp"
+        "runtime/evidence_transfer.cpp"
         "runtime/pack_stream_path_lease.cpp"
         "runtime/memory_diagnostics.cpp"
         "runtime/wall_clock.cpp"
@@ -33,6 +34,7 @@ idf_component_register(
         "services/audio_service.cpp"
         "services/storage_service.cpp"
         "services/storage_recovery_service.cpp"
+        "services/storage_recovery_export.cpp"
         "services/sync_service.cpp"
         "sse_chunk.cpp"
         "storage.cpp"
@@ -100,6 +102,7 @@ idf_component_register(
         "stdpro_ws_transport.cpp"
     INCLUDE_DIRS "."
     REQUIRES
+        recovery_usb
         driver
         esp_hw_support
         esp_http_server

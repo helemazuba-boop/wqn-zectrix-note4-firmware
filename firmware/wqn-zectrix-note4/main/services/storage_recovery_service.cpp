@@ -5,6 +5,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "psram_task_stack.h"
 #include "services/storage_service.h"
 
@@ -18,6 +19,7 @@ struct Request {
     uint32_t operation_id = 0;
     StorageRecoveryOperation operation = StorageRecoveryOperation::kInspect;
     runtime::StorageRecoverySnapshot expected;
+    int64_t deadline_us = 0;
 };
 static_assert(std::is_trivially_copyable_v<Request>);
 static_assert(std::is_trivially_copyable_v<StorageRecoveryResult>);
@@ -27,12 +29,16 @@ Request g_request;
 StorageRecoveryResult g_result;
 std::atomic<State> g_state{State::kIdle};
 std::atomic<uint32_t> g_next_id{1};
+std::atomic<uint32_t> g_active_export{0}, g_export_progress{0};
+std::atomic<bool> g_export_cancelled{false};
 TaskHandle_t g_task = nullptr;
 TaskHandle_t g_ui = nullptr;
 StaticTask_t g_tcb;
 StackType_t* g_stack = nullptr;
 portMUX_TYPE g_start_lock = portMUX_INITIALIZER_UNLOCKED;
 bool g_starting = false;
+bool ExportCancelled(void*) { return g_export_cancelled.load(std::memory_order_acquire); }
+void ExportProgress(uint32_t bytes, void*) { g_export_progress.store(bytes, std::memory_order_release); }
 
 esp_err_t RunOnStorageOwner(void*)
 {
@@ -46,9 +52,16 @@ esp_err_t RunOnStorageOwner(void*)
             static_cast<unsigned long>(g_result.snapshot.observed_generation),
             static_cast<unsigned>(g_result.snapshot.reset_id_size),
             static_cast<unsigned>(g_result.snapshot.reset_policy));
-    } else {
+    } else if (g_request.operation == StorageRecoveryOperation::kAuthorizeReset) {
         g_result.reset = runtime::AuthorizeStorageRecoveryReset(g_request.expected);
         g_result.error = g_result.reset.error;
+    } else if (g_request.operation == StorageRecoveryOperation::kExportLogical ||
+               g_request.operation == StorageRecoveryOperation::kExportRaw) {
+        g_result.error = RunStorageRecoveryExportOnOwner(
+            g_request.operation == StorageRecoveryOperation::kExportRaw ? StorageRecoveryExportKind::kRaw : StorageRecoveryExportKind::kLogical,
+            ExportCancelled, nullptr, g_request.deadline_us, ExportProgress, &g_result.exported);
+    } else {
+        g_result.error = ESP_ERR_INVALID_ARG;
     }
     return ESP_OK;  // Transaction delivery succeeded; operation error is explicit.
 }
@@ -91,7 +104,12 @@ bool Submit(StorageRecoveryOperation operation,
             std::memory_order_acq_rel, std::memory_order_acquire)) return false;
     uint32_t id = g_next_id.fetch_add(1, std::memory_order_relaxed);
     if (id == 0) id = g_next_id.fetch_add(1, std::memory_order_relaxed);
-    g_request = {id, operation, snapshot};
+    g_request = {id, operation, snapshot, 0};
+    const bool export_operation = operation == StorageRecoveryOperation::kExportLogical || operation == StorageRecoveryOperation::kExportRaw;
+    g_export_progress.store(0, std::memory_order_relaxed);
+    g_export_cancelled.store(false, std::memory_order_relaxed);
+    g_active_export.store(export_operation ? id : 0, std::memory_order_release);
+    if (export_operation) g_request.deadline_us = esp_timer_get_time() + 30LL*60*1000000;
     *operation_id = id;
     g_state.store(State::kQueued, std::memory_order_release);
     xTaskNotifyGive(task);
@@ -145,6 +163,25 @@ bool SubmitStorageRecoveryReset(
 {
     return Submit(StorageRecoveryOperation::kAuthorizeReset, expected, operation_id);
 }
+bool SubmitStorageRecoveryExport(StorageRecoveryExportKind kind, bool confirmed, uint32_t* id)
+{
+    if (!confirmed || (kind != StorageRecoveryExportKind::kRaw && kind != StorageRecoveryExportKind::kLogical)) return false;
+    return Submit(kind == StorageRecoveryExportKind::kRaw ? StorageRecoveryOperation::kExportRaw :
+                  StorageRecoveryOperation::kExportLogical, {}, id);
+}
+bool CancelStorageRecoveryExport(uint32_t id)
+{
+    if (id == 0 || g_active_export.load(std::memory_order_acquire) != id) return false;
+    const State state = g_state.load(std::memory_order_acquire);
+    if (state != State::kQueued && state != State::kRunning) return false;
+    g_export_cancelled.store(true, std::memory_order_release);
+    return true;
+}
+bool ReadStorageRecoveryExportProgress(uint32_t id, uint32_t* bytes)
+{
+    if (bytes == nullptr || id == 0 || g_active_export.load(std::memory_order_acquire) != id) return false;
+    *bytes = g_export_progress.load(std::memory_order_acquire); return true;
+}
 bool ReadStorageRecoveryResult(StorageRecoveryResult* result)
 {
     if (result == nullptr || g_state.load(std::memory_order_acquire) != State::kDone) return false;
@@ -156,6 +193,7 @@ bool AcknowledgeStorageRecoveryResult(uint32_t operation_id)
     if (g_state.load(std::memory_order_acquire) != State::kDone ||
         operation_id == 0 || g_result.operation_id != operation_id) return false;
     g_result = {};
+    g_active_export.store(0, std::memory_order_release);
     g_state.store(State::kIdle, std::memory_order_release);
     return true;
 }

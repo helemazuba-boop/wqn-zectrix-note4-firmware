@@ -223,7 +223,10 @@ namespace Wqn.SerialMonitor {
         void Escape(SafeFileHandle handle, uint command);
         int Read(SafeFileHandle handle, byte[] buffer);
     }
-    internal sealed class Win32CommApi : ICommApi {
+    public interface IWriteCommApi {
+        int Write(SafeFileHandle handle, byte[] data);
+    }
+    internal sealed class Win32CommApi : ICommApi, IWriteCommApi {
         [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode,
             ExactSpelling = true, SetLastError = true)]
         private static extern SafeFileHandle CreateFile(string name, uint access,
@@ -239,6 +242,13 @@ namespace Wqn.SerialMonitor {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool ReadFile(SafeFileHandle handle, [Out] byte[] buffer,
             uint size, out uint read, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool WriteFile(SafeFileHandle handle, byte[] data, uint size, out uint written, IntPtr overlapped);
+        public int Write(SafeFileHandle handle, byte[] data) {
+            uint written;
+            if (!WriteFile(handle, data, (uint)data.Length, out written, IntPtr.Zero)) throw new Win32Exception();
+            return checked((int)written);
+        }
         public SafeFileHandle Open(string path) {
             // Synchronous reads use immediate-return COMMTIMEOUTS below.
             SafeFileHandle result = CreateFile(path, 0xc0000000u, 0, IntPtr.Zero,
@@ -314,6 +324,7 @@ namespace Wqn.SerialMonitor {
                 dtr = rts = true;
                 CommTimeouts timeouts = new CommTimeouts();
                 timeouts.ReadInterval = UInt32.MaxValue;
+                timeouts.WriteConstant = 250;
                 api.SetTimeouts(handle, timeouts);
                 // Release RTS before DTR. Re-apply DTR when changing RTS for
                 // Windows usbser.sys, matching the IDF Monitor ordering.
@@ -344,6 +355,15 @@ namespace Wqn.SerialMonitor {
             if (count == 0) return String.Empty;
             int decoded = decoder.GetChars(bytes, 0, count, chars, 0, false);
             return new String(chars, 0, decoded);
+        }
+        public void WriteAscii(string text) {
+            RequireOpen();
+            if (text == null || text.Length > 512) throw new ArgumentException("Invalid protocol line");
+            foreach (char c in text) if (c > 127) throw new ArgumentException("Protocol must be ASCII");
+            IWriteCommApi writer = api as IWriteCommApi;
+            if (writer == null) throw new NotSupportedException("Serial backend has no bounded writer");
+            byte[] data = Encoding.ASCII.GetBytes(text);
+            if (writer.Write(handle, data) != data.Length) throw new InvalidOperationException("Incomplete serial write");
         }
         public void Close() {
             // Generic handle disposal only: never implicitly toggle DTR/RTS.

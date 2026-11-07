@@ -115,6 +115,31 @@ int main() {
       CHECK(h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress) == Action::kInspect);
       h.model.Begin(Action::kInspect, 4); StorageRecoverySnapshot snapshot; snapshot.error = ESP_OK;
       CHECK(h.model.Inspected(4, snapshot, ESP_OK)); CHECK(h.model.page() == Page::kDiagnostics); }
+    for (bool raw : {false, true}) {
+        Harness h; h.Ready(); h.Select(2);
+        h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress);
+        CHECK(h.model.page() == Page::kPreservation); h.Present();
+        if (raw) { h.Send(ButtonId::kDownPower, ButtonEventType::kShortPress); h.Present(); }
+        CHECK(h.model.export_raw() == raw);
+        h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress);
+        CHECK(h.model.page() == Page::kPreservation); // A fresh press is required.
+        h.Send(ButtonId::kConfirm, ButtonEventType::kPress);
+        h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress);
+        CHECK(h.model.page() == Page::kConfirmExport);
+        CHECK(h.Hold(3000) == Action::kNone); // Unpresented warning cannot consent.
+        h.Present(); CHECK(h.Hold(1999) == Action::kNone);
+        CHECK(h.Hold(2500) == (raw ? Action::kExportRaw : Action::kExportLogical));
+        h.model.Begin(raw ? Action::kExportRaw : Action::kExportLogical, 42);
+        CHECK(h.model.exporting());
+        CHECK(h.Send(ButtonId::kUp, ButtonEventType::kPress) == Action::kCancelExport);
+        CHECK(h.model.page() == Page::kBusy && h.model.operation_id() == 42);
+        CHECK(h.Send(ButtonId::kUp, ButtonEventType::kPress) == Action::kNone);
+        h.model.ExportProgress(1234); CHECK(h.model.exported_bytes() == 1234);
+        wqn::services::StorageRecoveryExportResult result; result.commit_acknowledged = true;
+        CHECK(!h.model.ExportFinished(41, result, ESP_OK));
+        CHECK(h.model.ExportFinished(42, result, ESP_OK));
+        CHECK(h.model.page() == Page::kExportResult && h.model.export_result().commit_acknowledged);
+    }
     std::printf("Storage recovery model: %u checks, %u failures (NOT HIL)\n", checks, failures);
     return failures ? 1 : 0;
 }

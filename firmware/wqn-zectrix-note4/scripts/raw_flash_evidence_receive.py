@@ -152,6 +152,13 @@ class Receiver:
             handle.close()
         self.handles = []
 
+    def checkpoint(self):
+        for handle in self.handles:
+            handle.flush()
+            os.fsync(handle.fileno())
+        wire.sync_dir(self.output)
+        wire.sync_dir(self.output.parent)
+
     def partial(self, error):
         try:
             wire.private(self.output/'partial.json', encode(dict(
