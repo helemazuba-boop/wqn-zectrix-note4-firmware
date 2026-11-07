@@ -51,6 +51,7 @@ def cases():
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
         ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
         ('storage_evidence_capture', 'R-08 ongoing: frozen owner raw files/NVS, pinned stream receive and independent replay', ()),
+        ('raw_flash_evidence', 'R-08 ongoing: unmounted main Flash, raw bytes, full-range recheck and independent replay', ()),
         ('word_cursor_guards', 'R-08 ongoing: pause source validation, migration and explicit read errors', ()),
         ('word_deck_scope_tail', 'R-08/R-18: preserve unknown scope metadata and replay only valid interrupted changes', ()),
         ('word_scope_autorepair', 'R-08: storage readiness and accepted manual/auto scope obligations', ()),
@@ -117,6 +118,10 @@ def cases():
     result.append(Case('agent-wire-unbounded-budget', 'Agent: wire health remains bounded while business progress waits', 'controls',
                        ('test_agent_run_progress.py', '--mutation', 'wire-unbounded-budget'), r'^FAIL ',
                        r'Agent stream/client: \d+ checks, [1-9]\d* failures;'))
+    for mutation in ('ignore-consent', 'ignore-size', 'skip-recheck'):
+        result.append(Case(f'raw-flash-{mutation}', 'R-08: sensitive scope, physical size and source reread cannot be bypassed', 'controls',
+                           ('test_raw_flash_evidence.py', '--mutation', mutation), r'^FAIL raw-flash:',
+                           r'Raw Flash evidence: \d+ scenarios, [1-9]\d* failures, 0 errors \(host SDK ports; NOT HIL\)'))
     for mutation in ('ignore-nvs-size', 'truncate-size', 'write-open'):
         result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
                            ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',
