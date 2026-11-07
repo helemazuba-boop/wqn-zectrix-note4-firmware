@@ -417,7 +417,10 @@ git -c core.whitespace=cr-at-eol diff --check   # clean (CRLF-aware; see §7)
 
 ## 8. Conventions & footguns
 
-- **Serial output: `ESP_LOGx` only.** Never `uart_write_bytes` from `main/` — it
+- **Normal serial output: `ESP_LOGx` only.** Recovery evidence is the sole
+  exception: `components/recovery_usb` owns bounded USB Serial/JTAG I/O after
+  physical consent; it routes logs to the existing primary UART. M8 rejects
+  USB driver calls elsewhere. Never `uart_write_bytes` from `main/` — it
   collides with the console UART driver and breaks logging.
 - **`// [power-fix]`, `// [sleep-race]`, `// [epd-owner]`, `// [persist-worker]`,
   `// [deck-scope]` comments** encode the measured "why" behind a hotspot.

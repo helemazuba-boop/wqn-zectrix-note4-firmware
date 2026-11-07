@@ -300,6 +300,19 @@ class Receiver:
             if handle is not None:
                 handle.close()
 
+    def checkpoint(self):
+        if self.wire is not None:
+            self.wire.flush()
+            os.fsync(self.wire.fileno())
+        if self.active is not None and 'handle' in self.active:
+            handle = self.active['handle']
+            handle.flush()
+            os.fsync(handle.fileno())
+        for name in ('objects', 'files', 'nvs'):
+            sync_dir(self.output / name)
+        sync_dir(self.output)
+        sync_dir(self.output.parent)
+
     def preserve_partial(self, error):
         rows = []
         for item in self.entities:

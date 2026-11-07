@@ -77,7 +77,7 @@ set(deep_sleep_call_count 0)
 foreach(source IN LISTS firmware_sources)
     wqn_read("${source}" contents)
 
-    if(source MATCHES "^components/(platform_note4|power_runtime|display_service|device_protocol)/" AND
+    if(source MATCHES "^components/(platform_note4|power_runtime|display_service|device_protocol|recovery_usb)/" AND
        contents MATCHES "device_ui_internal|#[ \t]*include[ \t]*[<\"](storage|power_manager|device_ui|services/|ui/)")
         message(FATAL_ERROR
             "M8 architecture gate: ${source}: extracted component depends back on main/features")
@@ -98,6 +98,10 @@ endif()
 
 foreach(source IN LISTS firmware_sources)
     wqn_read("${source}" contents)
+    if(contents MATCHES "usb_serial_jtag_(read_bytes|write_bytes|driver_install)[ \t\r\n]*\\(" AND
+       NOT source STREQUAL "components/recovery_usb/recovery_usb.cpp")
+        message(FATAL_ERROR "M8 architecture gate: ${source}: USB-EVIDENCE-OWNER: protocol I/O belongs to recovery_usb")
+    endif()
     if(contents MATCHES "esp_wifi_[A-Za-z0-9_]+[ \t\r\n]*\\(" AND
        NOT source STREQUAL "main/wifi_manager.cpp" AND
        NOT source STREQUAL "components/wqn_wifi_provision/wifi_provision_portal.cpp")
@@ -146,6 +150,14 @@ foreach(source IN LISTS firmware_sources)
     #    pass a *Path variable or a .c_str() path, the idiom never does.
     #  * bare rename/unlink are constrained the same way.
     if(NOT source IN_LIST spiffs_writer_files)
+        # Device-node stdio is not a durable SPIFFS write. Strip only these
+        # exact literal opens in the console owner, then apply every normal
+        # writer rule to the rest of that file (including dynamic paths).
+        if(source STREQUAL "components/recovery_usb/recovery_usb.cpp")
+            foreach(port RANGE 0 2)
+                string(REPLACE "std::fopen(\"/dev/uart/${port}\", \"w\")" "" contents "${contents}")
+            endforeach()
+        endif()
         if(contents MATCHES "fopen[ \t\r\n]*\\([^;]*\"[^\"]*[wa+][^\"]*\"")
             message(FATAL_ERROR
                 "M8 architecture gate: ${source}: rule SPIFFS-WRITER: fopen with a writing mode -- route durable writes through StorageService")

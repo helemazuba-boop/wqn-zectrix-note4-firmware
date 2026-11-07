@@ -9,7 +9,7 @@ import tempfile
 ERRORS = '''#pragma once
 using esp_err_t=int;
 constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NO_MEM=257, ESP_ERR_INVALID_ARG=258,
- ESP_ERR_INVALID_STATE=259, ESP_ERR_NOT_SUPPORTED=262;
+ ESP_ERR_INVALID_STATE=259, ESP_ERR_NOT_SUPPORTED=262, ESP_ERR_TIMEOUT=263;
 inline const char* esp_err_to_name(int) { return "host-error"; }
 '''
 RTOS = '''#pragma once
@@ -74,6 +74,7 @@ def main():
             'freertos/task.h': '#pragma once\n#include "freertos/FreeRTOS.h"\n',
             'esp_heap_caps.h': '#pragma once\nvoid heap_caps_free(void*);\n',
             'esp_log.h': '#pragma once\nvoid HostLog(const char*,const char*,...);\n#define ESP_LOGI(...) HostLog(__VA_ARGS__)\n',
+            'esp_timer.h': '#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n',
             'esp_system.h': '#pragma once\nvoid esp_restart();\n',
             'ui/ui_internal.h': UI,
             'ui/storage_recovery_model.h': (root/'main/ui/storage_recovery_model.h').read_text(),

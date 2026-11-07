@@ -191,7 +191,7 @@ finally {
     # Compile the production backend with a fake Win32 boundary, not a fake port.
     Add-Type -TypeDefinition ((Get-MonitorPortSource) + @'
 namespace Wqn.SerialMonitor.Tests {
-    public sealed class CommApi : ICommApi {
+    public sealed class CommApi : ICommApi, IWriteCommApi {
         public readonly System.Collections.Generic.List<string> Calls = new System.Collections.Generic.List<string>();
         public readonly System.Collections.Generic.List<Dcb> Configurations = new System.Collections.Generic.List<Dcb>();
         public readonly System.Collections.Generic.Queue<byte[]> Chunks = new System.Collections.Generic.Queue<byte[]>();
@@ -199,6 +199,12 @@ namespace Wqn.SerialMonitor.Tests {
         public CommTimeouts Timeouts;
         public bool Dtr, Rts, DisconnectOnRead, FailReset;
         public int ResetPulses;
+        public bool PartialWrite;
+        public string LastWrite;
+        public int Write(Microsoft.Win32.SafeHandles.SafeFileHandle handle, byte[] data) {
+            Touch("Write"); LastWrite = System.Text.Encoding.ASCII.GetString(data);
+            return data.Length - (PartialWrite ? 1 : 0);
+        }
         public string FailAt;
         private void Touch(string call) {
             Calls.Add(call);
@@ -271,6 +277,17 @@ public sealed class FailingMonitorWriter : System.IO.StringWriter {
     Check (($api.Calls -join ',') -eq 'Open:\\.\COM7,GetState,SetState,SetTimeouts,Escape:4,Escape:5,Escape:6') 'native open configures first then releases RTS before DTR with the Windows workaround'
     Check ($api.Timeouts.ReadInterval -eq [uint32]::MaxValue -and $api.Timeouts.ReadMultiplier -eq 0 -and $api.Timeouts.ReadConstant -eq 0) 'native reads return immediately so keyboard polling stays responsive'
     Check ($api.ResetPulses -eq 0 -and -not $fake.DtrEnabled -and -not $fake.RtsEnabled) 'real backend opening emits no simulated reset pulse'
+    Check ($api.Timeouts.WriteConstant -eq 250) 'native writes have a finite 250 ms deadline'
+    $callsBeforeWrite = $api.Calls.Count
+    $fake.WriteAscii("WQNT1 R test`n")
+    Check ($api.LastWrite -eq "WQNT1 R test`n" -and $api.Calls.Count -eq $callsBeforeWrite + 1 -and
+        $api.Calls[$callsBeforeWrite] -eq 'Write') 'protocol write never toggles modem lines'
+    $api.PartialWrite = $true
+    $partialRejected = $false
+    try { $fake.WriteAscii("ACK`n") } catch { $partialRejected = $true }
+    Check $partialRejected 'partial writes fail instead of confirming delivery'
+    $api.PartialWrite = $false
+
     Send-DeviceReset $fake 'manual'
     Check ($api.ResetPulses -eq 1 -and -not $api.Dtr -and -not $api.Rts -and $script:writer.ToString() -match 'manual reset requested: COM7') 'explicit manual reset sends one pulse and records its source'
     $api.FailReset = $true

@@ -35,6 +35,7 @@ void* ui = reinterpret_cast<void*>(1);
 StorageRecoverySnapshot returned_snapshot;
 StorageRecoverySnapshot observed_expected;
 StorageRecoveryResetResult returned_reset;
+int64_t esp_timer_get_time() { return 1000000; }
 void HostLog(const char*, const char*, ...) {}
 namespace wqn {
 StackType_t* AllocTaskStack(size_t bytes, const char*, bool*) {
@@ -64,6 +65,13 @@ int xTaskNotifyGive(TaskHandle_t target) {
     std::lock_guard<std::mutex> lock(task.mutex); ++task.notifications; task.cv.notify_all(); return pdTRUE;
 }
 namespace wqn::services {
+esp_err_t RunStorageRecoveryExportOnOwner(StorageRecoveryExportKind kind, bool(*cancelled)(void*), void* context,
+    int64_t deadline, void(*progress)(uint32_t,void*), StorageRecoveryExportResult* result) {
+    CHECK(storage_owner && deadline == 1801000000LL);
+    CHECK(kind == StorageRecoveryExportKind::kRaw || kind == StorageRecoveryExportKind::kLogical);
+    progress(1234, context); result->persisted_data_bytes = 1234;
+    return result->error = cancelled(context) ? ESP_ERR_INVALID_STATE : ESP_OK;
+}
 esp_err_t StartStorageService() { return start_error; }
 bool IsStorageServiceTask() { return storage_owner; }
 esp_err_t ExecuteStorageTransactionNamed(StorageTransaction transaction, void* context, const char*) {
@@ -145,8 +153,29 @@ int main() {
     CHECK(Wait([&] { return ReadStorageRecoveryResult(&result); }));
     CHECK(result.error == ESP_ERR_NO_MEM && result.reset.outcome == StorageRecoveryResetOutcome::kRejected);
     CHECK(AcknowledgeStorageRecoveryResult(id));
+    delivery_error = ESP_OK;
+    CHECK(!SubmitStorageRecoveryExport(StorageRecoveryExportKind::kRaw, false, &id));
+    CHECK(!SubmitStorageRecoveryExport(static_cast<StorageRecoveryExportKind>(99), true, &id));
+    for (auto kind : {StorageRecoveryExportKind::kRaw, StorageRecoveryExportKind::kLogical}) {
+        { std::lock_guard<std::mutex> lock(owner_mutex); block_owner = true; }
+        CHECK(SubmitStorageRecoveryExport(kind, true, &id));
+        CHECK(!CancelStorageRecoveryExport(id+1));
+        uint32_t progress = 999;
+        CHECK(ReadStorageRecoveryExportProgress(id, &progress) && progress == 0);
+        CHECK(CancelStorageRecoveryExport(id));
+        CHECK(!AcknowledgeStorageRecoveryResult(id));
+        { std::lock_guard<std::mutex> lock(owner_mutex); block_owner = false; owner_cv.notify_all(); }
+        CHECK(Wait([&] { return ReadStorageRecoveryResult(&result); }));
+        CHECK(result.operation_id == id && result.error == ESP_ERR_INVALID_STATE);
+        CHECK(ReadStorageRecoveryExportProgress(id, &progress) && progress == 1234);
+        CHECK(!CancelStorageRecoveryExport(id));
+        CHECK(!SubmitStorageRecoveryInspect(&ignored));
+        CHECK(!AcknowledgeStorageRecoveryResult(id+1));
+        CHECK(AcknowledgeStorageRecoveryResult(id));
+        CHECK(!ReadStorageRecoveryExportProgress(id, &progress));
+    }
     CHECK(inspect_calls == 1 && reset_calls == 3 && !wrong_owner);
-    CHECK(Wait([] { return ui_notifications.load() == 5; }));
+    CHECK(Wait([] { return ui_notifications.load() == 7; }));
     { std::lock_guard<std::mutex> lock(task.mutex); task.stop = true; task.cv.notify_all(); }
     task.thread.join(); heap_caps_free(allocation);
     CHECK(allocations == frees);

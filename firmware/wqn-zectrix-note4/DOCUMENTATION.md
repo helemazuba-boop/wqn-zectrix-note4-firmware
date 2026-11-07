@@ -149,6 +149,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/OUTBOX_RECOVERY_20261105.md` — ongoing R-08 offline raw
   preservation, native CRC inspection, pinned receipt collection/review plans,
   and remaining controlled repair/device work.
+- `docs/engineering/RECOVERY_DEVICE_EXPORT_20261107.md` - physically confirmed
+  recovery export, bounded USB transport, durable host ACK and remaining HIL.
 - `docs/engineering/WIFI_CONNECTIVITY_REPAIR.md` — provisioning and network
   switching repair record.
 

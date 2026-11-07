@@ -28,7 +28,8 @@ StorageRecoveryResult result;
 bool operation_pending = false, operation_ready = false, display_pending = false;
 bool warning_presented = false, stale_warning = false, stale_outcome = false;
 bool saw_uncertain = false, saw_diagnostics = false, paused_probe = false;
-bool startup_failed = false;
+bool startup_failed = false, export_started = false, export_cancelled = false;
+unsigned export_progress_polls = 0;
 esp_err_t input_error = ESP_OK, button_task_error = ESP_OK;
 unsigned restarts = 0;
 DisplayRecoveryPolicy recovery;
@@ -61,6 +62,24 @@ esp_err_t StartStorageRecoveryService(TaskHandle_t target) {
     CHECK(target == xTaskGetCurrentTaskHandle());
     if (scenario == 5 && !startup_failed) { startup_failed = true; return ESP_ERR_NO_MEM; }
     return ESP_OK;
+}
+bool SubmitStorageRecoveryExport(StorageRecoveryExportKind kind, bool confirmed, uint32_t* id) {
+    CHECK((scenario == 6 || scenario == 7) && !operation_pending && confirmed);
+    CHECK(kind == (scenario == 6 ? StorageRecoveryExportKind::kRaw : StorageRecoveryExportKind::kLogical));
+    export_started = true; operation_pending = true; operation_ready = false;
+    result = {}; *id = ++operation_count; result.operation_id = *id;
+    result.operation = kind == StorageRecoveryExportKind::kRaw ? StorageRecoveryOperation::kExportRaw : StorageRecoveryOperation::kExportLogical;
+    result.error = scenario == 6 ? ESP_OK : ESP_ERR_INVALID_STATE;
+    result.exported.commit_acknowledged = scenario == 6; result.exported.source_complete = scenario == 6;
+    return true;
+}
+bool CancelStorageRecoveryExport(uint32_t id) {
+    CHECK(scenario == 7 && export_started && operation_pending && result.operation_id == id);
+    export_cancelled = true; return true;
+}
+bool ReadStorageRecoveryExportProgress(uint32_t id, uint32_t* bytes) {
+    if (!export_started || !operation_pending || id != result.operation_id) return false;
+    ++export_progress_polls; *bytes = 1024; return true;
 }
 bool SubmitStorageRecoveryInspect(uint32_t* id) {
     CHECK(!operation_pending); ++inspect_count;
@@ -151,6 +170,9 @@ uint32_t ulTaskNotifyTake(int clear, TickType_t delay) {
         return 1;
     }
     if (operation_pending && !operation_ready) {
+        if (scenario == 7 && export_started && !export_cancelled) {
+            now += 10; Event(ButtonId::kUp, ButtonEventType::kPress, now); return 1;
+        }
         now += 10; operation_ready = true; return 1;
     }
     if (recovery.status().paused) {
@@ -185,17 +207,19 @@ uint32_t ulTaskNotifyTake(int clear, TickType_t delay) {
     return 1;
 }
 int main() {
-    for (scenario = 0; scenario < 6; ++scenario) {
+    for (scenario = 0; scenario < 8; ++scenario) {
         now = 100; sequence = 0; operation_count = inspect_count = reset_count = steps = attempts = 0;
         outstanding = received = 0; frame.lines.clear(); buttons.clear(); results.clear(); waits.clear();
         operation_pending = operation_ready = display_pending = false;
         warning_presented = stale_warning = stale_outcome = saw_uncertain = saw_diagnostics = paused_probe = false;
-        startup_failed = false;
+        startup_failed = export_started = export_cancelled = false; export_progress_polls = 0;
         recovery = {};
         if (scenario == 0) commands = {Confirm, Confirm, Down, Confirm, Press, Confirm};
         else if (scenario == 3) commands = {Down, Down, Down, Confirm, Up, Up, Confirm, Press, Confirm};
         else if (scenario == 4) commands = {Down, Confirm, Press, Confirm};
         else if (scenario == 5) commands = {Confirm, Confirm, Confirm, Down, Confirm, Press, Confirm};
+        else if (scenario == 6) commands = {Down, Down, Confirm, Down, Press, Confirm, Hold, Confirm, Up, Confirm, Press, Confirm};
+        else if (scenario == 7) commands = {Down, Down, Confirm, Press, Confirm, Hold, Confirm, Up, Confirm, Press, Confirm};
         else commands = {Down, Down, Down, Confirm, Hold, Press, Confirm};
         const unsigned before = restarts;
         try { RunStorageRecoveryUi(ESP_FAIL); CHECK(false); }
@@ -207,6 +231,8 @@ int main() {
         CHECK(scenario != 1 || (stale_warning && warning_presented && stale_outcome));
         CHECK(scenario != 2 || (saw_uncertain && stale_outcome));
         CHECK(scenario != 4 || paused_probe);
+        CHECK(scenario < 6 || (export_started && export_progress_polls != 0));
+        CHECK(scenario != 7 || export_cancelled);
         CHECK(scenario != 5 || (startup_failed && saw_diagnostics && inspect_count == 1));
     }
     const auto inspected = inspect_count;
