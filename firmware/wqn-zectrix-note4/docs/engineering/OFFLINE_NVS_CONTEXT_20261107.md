@@ -50,6 +50,11 @@ ASan/UBSan 保持启用虚类型检查。该检查首次可能读取进程映射
 没有放开隔离系统调用或关闭 vptr 检查。LeakSanitizer 在隔离 child 中关闭，不宣称完成
 泄漏检查；任何 sanitizer 诊断按执行故障处理，不作为语义负对照成功。
 
+主机回归使用固定的 robustness Python 依赖环境，官方 NVS generator 则使用 SDK Python。
+测试优先采用 `NVS_GENERATOR_PYTHON`，其次读取 `IDF_PYTHON_ENV_PATH`，最后在
+`IDF_TOOLS_PATH` 或当前用户的标准 ESP-IDF 5.5 环境中定位对应 Python 版本。
+CI 已显式 source SDK export.sh；不依赖某位开发者的绝对 home 路径。
+
 ## 使用
 
 只支持 Linux/WSL。先按原始导入文档固定 WQR1、profile、SPIFFS reader 和 import pin。

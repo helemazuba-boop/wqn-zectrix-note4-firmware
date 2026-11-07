@@ -24,7 +24,10 @@ from test_outbox_forensics import ForensicsTests
 SID='11111111-2222-4333-8444-555555555555'
 CANARY='SYNTHETIC_CREDENTIAL_NOT_IN_CONTEXT'
 IDF=Path(os.environ.get('IDF_PATH','/home/unknow/esp/esp-idf-v5.5'))
-IDF_PYTHON=os.environ.get('NVS_GENERATOR_PYTHON','/home/unknow/.espressif/python_env/idf5.5_py3.12_env/bin/python')
+IDF_ENV=Path(os.environ.get('IDF_PYTHON_ENV_PATH') or
+    Path(os.environ.get('IDF_TOOLS_PATH',Path.home()/'.espressif'))/'python_env'/
+    f'idf5.5_py{sys.version_info.major}.{sys.version_info.minor}_env')
+IDF_PYTHON=os.environ.get('NVS_GENERATOR_PYTHON') or str(IDF_ENV/'bin/python')
 
 
 def main():
