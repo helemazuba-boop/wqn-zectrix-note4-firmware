@@ -52,6 +52,7 @@ def cases():
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
         ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
         ('nvs_typed_presence', 'R-08/R-18: actual SDK typed presence, boot markers, cursor writes and supported volume formats', ()),
+        ('nvs_pause_pipeline', 'R-08: actual SDK cursor errors and scope readiness reach the production pause/session loaders', ()),
         ('storage_evidence_capture', 'R-08 ongoing: frozen owner raw files/NVS, pinned stream receive and independent replay', ()),
         ('evidence_transfer', 'R-08 ongoing: physical consent, bounded USB transport, durable ACK and loss/corruption recovery', ()),
         ('raw_flash_import', 'R-08: pinned raw image to read-only SDK SPIFFS, original facts, receipt bridge and replay verification', ()),
@@ -148,6 +149,10 @@ def cases():
         result.append(Case(f'nvs-typed-{mutation}', 'R-08/R-18: existing wrong types, disappearance, boot intent and legacy formats cannot be hidden', 'controls',
                            ('test_nvs_typed_presence.py', '--mutation', mutation), r'^FAIL typed-nvs:',
                            r'NVS typed presence total: \d+ checks, [1-9]\d* failures \(actual SDK and production functions; host bridge; NOT HIL\)'))
+    for mutation in ('swallow-layer-error', 'hide-reader-error', 'ignore-scope-readiness'):
+        result.append(Case(f'nvs-pause-{mutation}', 'R-08: neither pause layer may swallow NVS errors or bypass unready scope', 'controls',
+                           ('test_nvs_pause_pipeline.py', '--mutation', mutation), r'^FAIL typed-nvs:',
+                           r'NVS pause pipeline total: 154 checks, [1-9]\d* failures \(actual SDK/readers/loader; healthy journal ports; NOT HIL\)'))
     for mutation in ('ignore-consent', 'ignore-size', 'skip-recheck'):
         result.append(Case(f'raw-flash-{mutation}', 'R-08: sensitive scope, physical size and source reread cannot be bypassed', 'controls',
                            ('test_raw_flash_evidence.py', '--mutation', mutation), r'^FAIL raw-flash:',
