@@ -44,6 +44,7 @@ def cases():
         ('pack_json_boundaries', 'N-06: complete persisted pack text', ()),
         ('note_index_delivery', 'N-02: delayed results across full/targeted lanes', ()),
         ('storage_schema', 'R-18: explicit recovery intent, stale consent and boot replay', ()),
+        ('storage_mount_guard', 'R-18: ambiguous SPIFFS registration errors require actual mount proof', ()),
         ('outbox_forensics', 'R-08 ongoing: offline raw preservation and native journal/SDK CRC parity', ()),
         ('outbox_reconcile', 'R-08 ongoing: pinned raw evidence, authenticated receipts and non-authorizing review plans', ()),
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
@@ -76,6 +77,9 @@ def cases():
                                (f'test_{name}.py', '--tick-hz', str(hz))))
     for name in ('word', 'note', 'problem', 'home', 'todo', 'settings', 'navigation', 'agent', 'display_submit', 'stack_gate'):
         result.append(Case(f'ui-{name}', f'R-21: UI {name} production behavior/gate fixtures', 'ui', (f'test_ui_{name}.py',)))
+    result.append(Case('mount-guard-forget-mount-proof', 'R-18: an invalid-state error alone cannot prove storage is mounted', 'controls',
+                       ('test_storage_mount_guard.py', '--mutation', 'forget-mount-proof'), r'^FAIL mount-guard:',
+                       r'Storage mount guard: \d+ checks, [1-9]\d* failures \(production function; host SPIFFS API; NOT HIL\)'))
     for mutation in ('no-gap-escalation', 'forget-gap-session', 'drop-restored-attempt', 'retire-other-session'):
         result.append(Case(f'sync-{mutation}', 'R-21: escalation, restored attempts and session isolation', 'controls',
                            ('test_sync_control.py', '--mutation', mutation), r'^FAIL: GAP:', r'\d+ PASS / [1-9]\d* FAIL \(production control paths; NOT HIL\)'))
