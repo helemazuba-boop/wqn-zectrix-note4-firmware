@@ -60,3 +60,25 @@ CRC/schema/SID/pack admission、受控候选安装/回滚仍有各自的验证�
 实机仍需验证：支持类型的正常启动/音量/Word 行为，类型错误进入恢复且原始记录可
 保全，查询/读取故障的错误呈现，NVS 与 SPIFFS 交互、断电和栈水位。SDK 构建、主机
 测试和新候选不是这些物理结果。R-08 仍未关闭，也不代表全部鲁棒性问题完成验收。
+
+## 2026-11-08：实际 SDK 暂停调用链纳入验证线
+
+开发线 `eccfd7d` 已回移共有类型保护及 `b9dccbe` 的暂停错误传播。验证线原本已包含
+相同生产修正；本批同步更强的调用链回归，未改变运行时代码或固定 `.5` 镜像。
+严格 scope/恢复观察和 I-02/I-04 仍有依赖未完整回移，不能称两条线完全同步。
+
+`test_nvs_pause_pipeline.py` 与同名 C++ fixture 同时执行实际 SDK NVS/CRC、生产游标
+读取、`ReadSessionCursorPaused` 和完整 `LoadSessionTransaction`。复用验证线现有
+typed-presence bridge 与 SDK builder，无需移入仅供开发线使用的整套核心夹具。
+快照/健康 journal 和 scope 状态是显式 ports，SDK 全局锁、介质写入成功和物理调度
+不在结论内。源 NVS 及 legacy 字节前后核对；ASan/UBSan/LeakSanitizer 启用。
+
+七模式各覆盖错型、短记录、CRC、暂停/未暂停、真缺失、legacy、旧 SID、查询后消失、
+查询失败，以及验证线特有的 scope 未就绪，共 154 检查。未就绪必须在读取快照及
+打开 NVS 前拒绝；不能为了移植夹具而删除生产 guard。三个语义负例分别吞掉加载
+错误、吞掉暂停读取错误，以及只在实际加载函数内绕过 scope guard；异常或不完整
+执行不能算检出。门禁清单扩展至 142（52 runtime、10 UI、80 controls）。
+
+本次专项、三个负例、SDK 构建和继承证据核验记录在工作区
+`doc/validation-pause-pipeline-20261108/`；旧 138 项需核对定义、源码与非空日志后才能
+继承。未将继承证据称为 142 项一次新跑，亦未生成新的实机包或作设备验收。
