@@ -54,6 +54,7 @@ def cases():
         ('storage_evidence_capture', 'R-08 ongoing: frozen owner raw files/NVS, pinned stream receive and independent replay', ()),
         ('evidence_transfer', 'R-08 ongoing: physical consent, bounded USB transport, durable ACK and loss/corruption recovery', ()),
         ('raw_flash_import', 'R-08: pinned raw image to read-only SDK SPIFFS, original facts, receipt bridge and replay verification', ()),
+        ('nvs_context', 'R-08: actual SDK read-only NVS, ambiguous source states, exact u64 and pinned original-image replay', ()),
         ('raw_flash_evidence', 'R-08 ongoing: unmounted main Flash, raw bytes, full-range recheck and independent replay', ()),
         ('word_cursor_guards', 'R-08 ongoing: pause source validation, migration and explicit read errors', ()),
         ('word_deck_scope_tail', 'R-08/R-18: preserve unknown scope metadata and replay only valid interrupted changes', ()),
@@ -138,6 +139,10 @@ def cases():
         result.append(Case(f'raw-import-{mutation}', 'R-08: encrypted/unrechecked source, partition integrity and original-image replay cannot be bypassed', 'controls',
                            ('test_raw_flash_import.py', '--mutation', mutation), r'^FAIL raw-import:',
                            r'Raw Flash import: \d+ checks, [1-9]\d* failures \(SDK RO/native raw/forensics; synthetic media; NOT HIL\)'))
+    for mutation in ('ignore-flags', 'truncate-generation-policy', 'ignore-cursor-crc', 'ignore-session-binding', 'skip-replay'):
+        result.append(Case(f'nvs-context-{mutation}', 'R-08: unknown NVS, high generation, cursor/session binding and original-image replay stay held', 'controls',
+                           ('test_nvs_context.py', '--mutation', mutation), r'^FAIL nvs-context:',
+                           r'NVS context: \d+ checks, [1-9]\d* failures \(actual SDK RO/CRC/raw import; synthetic media; NOT HIL\)'))
     for mutation in ('ignore-consent', 'ignore-size', 'skip-recheck'):
         result.append(Case(f'raw-flash-{mutation}', 'R-08: sensitive scope, physical size and source reread cannot be bypassed', 'controls',
                            ('test_raw_flash_evidence.py', '--mutation', mutation), r'^FAIL raw-flash:',
