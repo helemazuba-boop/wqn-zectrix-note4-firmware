@@ -83,7 +83,8 @@ def main():
             old, new = {
                 'short-hold': ('event.occurred_at_ms - held >= 2000 &&\n                    event.duration_ms >= 2000',
                                'event.occurred_at_ms - held >= 0 &&\n                    event.duration_ms >= 0'),
-                'unpresented-reset': ('if (!presented_ || event.occurred_at_ms <= presented_at_ms_) {', 'if (false) {'),
+                'unpresented-reset': ('if (!presented_ || event.occurred_at_ms <= presented_at_ms_) {\n                held_at_ms_ = 0;',
+                                     'if (false) {\n                held_at_ms_ = 0;'),
                 'forget-uncertain': ('else if (result.outcome == Outcome::kUncertain) SetPage(Page::kUncertain);',
                                      'else if (result.outcome == Outcome::kUncertain) SetPage(Page::kError);'),
             }[args.mutation]
