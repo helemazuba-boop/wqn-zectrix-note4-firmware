@@ -44,7 +44,7 @@ esp_err_t esp_flash_get_physical_size(esp_flash_t* chip, uint32_t* size)
 bool esp_flash_encryption_enabled()
 {
     ++encryption_queries;
-    return scenario == "encrypted" || (scenario == "encryption-drift" && encryption_queries > 1);
+    return scenario == "encrypted" || scenario == "supplied-encrypted" || (scenario == "encryption-drift" && encryption_queries > 1);
 }
 esp_err_t esp_flash_read(esp_flash_t* chip, void* buffer, uint32_t address, uint32_t length)
 {
@@ -55,7 +55,7 @@ esp_err_t esp_flash_read(esp_flash_t* chip, void* buffer, uint32_t address, uint
         (reinterpret_cast<uintptr_t>(buffer) & 3) != 0 || address > flash.size() || length > flash.size()-address)
         { ++forbidden; return ESP_FAIL; }
     if ((scenario == "read-error" && address == 1152) ||
-        (scenario == "recheck-error" && pass == 1 && address == 384)) return ESP_FAIL;
+        ((scenario == "recheck-error" || scenario == "supplied-unstable") && pass == 1 && address == 384)) return ESP_FAIL;
     if (scenario == "drift-data" && pass == 1 && address == 0) flash[0] ^= 1;
     std::memcpy(buffer, flash.data()+address, length);
     if (scenario == "slow-read") now = deadline + 1;
@@ -75,15 +75,26 @@ esp_err_t Emit(const uint8_t* data, size_t size, void*)
 }
 int main(int argc, char** argv)
 {
-    if (argc != 3) return 2;
+    if (argc != 3 && argc != 4) return 2;
     scenario = argv[1]; output.open(argv[2], std::ios::binary);
     if (scenario == "board-16m") configured = physical = 16U*1024U*1024U;
     if (scenario == "one-byte") configured = physical = 1;
+    if (scenario == "supplied-image" || scenario == "supplied-encrypted" || scenario == "supplied-unstable") {
+        if (argc != 4) return 2;
+        std::ifstream input(argv[3],std::ios::binary|std::ios::ate);
+        const auto bytes=input.tellg();
+        if (!input || bytes<1 || bytes>wqn::runtime::kRawFlashEvidenceMaxBytes) return 2;
+        configured=physical=static_cast<uint32_t>(bytes);
+    }
     const uint32_t source_size = configured;
     flash.resize(source_size);
     for (size_t i = 0; i < flash.size(); ++i) flash[i] = static_cast<uint8_t>(17*i+29);
     const char marker[] = "SYNTHETIC_MAIN_FLASH_CREDENTIAL_REGION";
     if (flash.size() >= 4096+sizeof(marker)-1) std::memcpy(flash.data()+4096, marker, sizeof(marker)-1);
+    if (scenario == "supplied-image" || scenario == "supplied-encrypted" || scenario == "supplied-unstable") {
+        std::ifstream input(argv[3],std::ios::binary);
+        if (!input.read(reinterpret_cast<char*>(flash.data()),flash.size())) return 2;
+    }
     if (scenario == "size-mismatch") physical += 4096;
     if (scenario == "zero-size") configured = physical = 0;
     if (scenario == "too-big") configured = physical = wqn::runtime::kRawFlashEvidenceMaxBytes+1;
@@ -113,7 +124,7 @@ int main(int argc, char** argv)
     const int error = wqn::runtime::CaptureRawFlashEvidenceOnOwner(request, sink, &summary);
     output.close();
     const bool success = scenario == "normal" || scenario == "encrypted" || scenario == "board-16m" ||
-        scenario == "one-byte" || scenario == "republish";
+        scenario == "one-byte" || scenario == "republish" || scenario == "supplied-image" || scenario == "supplied-encrypted";
     const bool no_io = scenario == "not-mode" || scenario == "off-owner" || scenario == "temp-lease" ||
         scenario == "pack-lease" || scenario == "no-consent" || scenario == "empty-capture" ||
         scenario == "empty-mac" || scenario == "empty-firmware" || scenario == "no-sink" ||
