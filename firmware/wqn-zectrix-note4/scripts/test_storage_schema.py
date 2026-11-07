@@ -21,6 +21,7 @@ constexpr int ESP_ERR_INVALID_STATE = 259, ESP_ERR_INVALID_CRC = 265;
 constexpr int ESP_ERR_NOT_FOUND = 261;
 constexpr int ESP_ERR_NVS_NOT_FOUND = 4354, ESP_ERR_NVS_NOT_INITIALIZED = 4353;
 constexpr int ESP_ERR_NVS_NO_FREE_PAGES = 4365, ESP_ERR_NVS_NEW_VERSION_FOUND = 4368;
+constexpr int ESP_ERR_NVS_TYPE_MISMATCH = 4355;
 constexpr int NVS_READONLY = 0, NVS_READWRITE = 1;
 enum nvs_type_t { NVS_TYPE_U32 = 4, NVS_TYPE_LEGACY = 65,
                   NVS_TYPE_BLOB = 66, NVS_TYPE_ANY = 255 };
@@ -52,6 +53,7 @@ esp_err_t nvs_flash_deinit();
 esp_err_t nvs_flash_erase();
 esp_err_t nvs_open(const char*, int, nvs_handle_t*);
 void nvs_close(nvs_handle_t);
+esp_err_t nvs_find_key(nvs_handle_t, const char*, nvs_type_t*);
 esp_err_t nvs_get_u32(nvs_handle_t, const char*, uint32_t*);
 esp_err_t nvs_get_blob(nvs_handle_t, const char*, void*, size_t*);
 esp_err_t nvs_set_u32(nvs_handle_t, const char*, uint32_t);
