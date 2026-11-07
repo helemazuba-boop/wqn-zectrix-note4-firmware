@@ -18,9 +18,11 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-75 个执行项：33 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-32 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+79 个执行项：35 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+34 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
 1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
+R-18 另补充实际 SPIFFS 挂载证明的生产入口回归与语义负例；invalid-state 本身不能当作已挂载。
+参见 [挂载判定及未挂载导出依赖](STORAGE_MOUNT_GUARD_20261107.md)。
 R-08 进行中的离线保全工具增加原生 codec/SDK CRC 检查和四个语义负例，
 涵盖新旧容量配置、动态描述文件、CRC 与报告重算；不代表 R-08 已关闭。
 其后增加原文绑定对账/审查计划入口与三个负例，保护完整 payload、suspend 和派生报告。

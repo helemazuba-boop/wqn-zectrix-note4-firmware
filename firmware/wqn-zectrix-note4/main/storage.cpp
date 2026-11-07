@@ -468,7 +468,11 @@ esp_err_t InitStoragePartition()
     config.format_if_mount_failed = false;
 
     esp_err_t result = esp_vfs_spiffs_register(&config);
-    if (result == ESP_ERR_INVALID_STATE) {
+    // IDF also returns INVALID_STATE for exhausted mount slots and unsupported
+    // encrypted partitions. Only a mounted instance of OUR partition is an
+    // idempotent success; otherwise preserve the error for boot recovery.
+    if (result == ESP_ERR_INVALID_STATE &&
+        esp_spiffs_mounted(kStoragePartitionLabel)) {
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(result, kTag, "mount storage SPIFFS");
