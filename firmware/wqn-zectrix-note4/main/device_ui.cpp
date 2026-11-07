@@ -1793,7 +1793,7 @@ esp_err_t StartDeviceUiIfEnabled()
 #endif
 }
 
-esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
+esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error, bool preservation_only)
 {
 #if CONFIG_WQN_EPD_UI_ENABLE
     const esp_err_t start_result = EnsureDisplayPipelineStarted();
@@ -1801,8 +1801,9 @@ esp_err_t ShowStorageRecoveryUi(esp_err_t storage_error)
         return start_result;
     }
 
-    return device_ui_internal::RunStorageRecoveryUi(storage_error);
+    return device_ui_internal::RunStorageRecoveryUi(storage_error, preservation_only);
 #else
+    (void)preservation_only;
     ESP_LOGE(kTag, "storage recovery UI unavailable because EPD UI is disabled");
     return ESP_ERR_NOT_SUPPORTED;
 #endif

@@ -45,11 +45,15 @@ struct StorageEvidenceSummary {
 struct StorageEvidenceBootContext {
     esp_err_t error = ESP_FAIL;
     uint32_t observed_generation = 0;
+    bool preservation_only = false;  // Pre-NVS boot: raw export/restart only.
 };
 
 // One-way publication at EnterStorageRecoveryMode, which never resumes business
 // startup. Does no I/O and creates no task. A second publication is rejected.
 esp_err_t EnterStorageEvidenceBootRecovery(esp_err_t error, uint32_t observed_generation);
+
+// Pre-NVS manual preservation does not inspect/reset/mount source storage.
+esp_err_t EnterStorageEvidenceBootPreservation(esp_err_t reason = ESP_OK);
 
 // Copies the one-way boot publication only on the storage owner. No I/O.
 esp_err_t ReadStorageEvidenceBootContextOnOwner(StorageEvidenceBootContext* context);

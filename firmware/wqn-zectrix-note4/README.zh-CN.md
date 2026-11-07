@@ -22,6 +22,8 @@
 - AI 音频路径：长按确认键开始录音，松手上传 16 kHz mono PCM 到 WQN 服务器，然后显示转写、回复和动作摘要。
 - 本地存储：NVS 仅保存配对/WiFi 凭据、同步游标和设置等小型控制状态；SPIFFS 保存 durable 内容。当前 problem-study-v1 使用 manifest 与分错题集 WQNP pack，在 PSRAM 建立固定大小索引、按需读取题目正文，并通过 durable observation outbox 保证离线自评最终上传。
 
+需要保全故障数据时，可在用户主动重新启动前按住上翻页键至少 3 秒，进入只提供原始镜像导出的“数据保全”页；深睡唤醒不触发，确认键不能在复位时按住。该入口在业务存储初始化之前分流，仍需单独确认敏感导出。详见 [预初始化保全入口](docs/engineering/PRESERVATION_BOOT_ENTRY_20261107.md)。实机验收和受控维修仍待完成。
+
 
 默认 WQN ESP32 API 地址是：
 

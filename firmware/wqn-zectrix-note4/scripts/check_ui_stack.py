@@ -49,7 +49,7 @@ def check_frames(frames):
         ('display submit fixed frame', 512, lambda name:
          name.startswith('device_ui_internal::RequestEpdUiRefresh(')),
         ('boot recovery UI fixed frame', 1024, lambda name:
-         name == 'device_ui_internal::RunStorageRecoveryUi(int)'),
+         name == 'device_ui_internal::RunStorageRecoveryUi(int, bool)'),
         ('two out-of-line render frames', 6144, lambda name:
          'DeviceUiTask(void*)' in name and 'lambda' in name and 'operator()' in name),
     ]

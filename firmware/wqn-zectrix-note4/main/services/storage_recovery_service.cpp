@@ -43,6 +43,15 @@ void ExportProgress(uint32_t bytes, void*) { g_export_progress.store(bytes, std:
 esp_err_t RunOnStorageOwner(void*)
 {
     if (!IsStorageServiceTask()) return ESP_ERR_INVALID_STATE;
+    runtime::StorageEvidenceBootContext boot;
+    const esp_err_t admission = runtime::ReadStorageEvidenceBootContextOnOwner(&boot);
+    if (admission != ESP_OK || (boot.preservation_only &&
+        g_request.operation != StorageRecoveryOperation::kExportRaw)) {
+        g_result.error = admission != ESP_OK ? admission : ESP_ERR_INVALID_STATE;
+        g_result.snapshot.error = g_result.error;
+        g_result.reset.error = g_result.error;
+        return ESP_OK;
+    }
     if (g_request.operation == StorageRecoveryOperation::kInspect) {
         g_result.error = runtime::InspectStorageRecovery(&g_result.snapshot);
         // Metadata diagnostics only; no reset-id bytes, credentials, paths or

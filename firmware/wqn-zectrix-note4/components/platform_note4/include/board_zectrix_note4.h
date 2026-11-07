@@ -13,6 +13,10 @@ inline constexpr int kNote4I2cClockHz = 100000;
 
 esp_err_t InitZectrixNote4SafePins();
 
+// Boot-only, after safe pins and before the button sampler owns the inputs.
+// Reads the non-strapping page-up pin; does not reconfigure any pin.
+int ReadNote4BootPageUpLevel();
+
 // Active-low indicator only. Pins are already configured by bootstrap;
 // AudioService validates the recording session before runtime changes.
 esp_err_t SetNote4RecordingLed(bool enabled);

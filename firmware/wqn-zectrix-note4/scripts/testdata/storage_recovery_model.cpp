@@ -8,7 +8,8 @@ using Page = Model::Page;
 unsigned checks = 0, failures = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failures; std::printf("FAIL recovery-model:%d: %s\n", __LINE__, #x); } } while (false)
 struct Harness {
-    Model model{ESP_FAIL};
+    Model model;
+    explicit Harness(bool manual=false) : model(ESP_FAIL, manual) {}
     uint32_t sequence = 0;
     int64_t now = 100;
     Action Send(ButtonId key, ButtonEventType type, int64_t duration = 0, bool repeat = false) {
@@ -140,6 +141,24 @@ int main() {
         CHECK(h.model.ExportFinished(42, result, ESP_OK));
         CHECK(h.model.page() == Page::kExportResult && h.model.export_result().commit_acknowledged);
     }
+    { Harness h(true); CHECK(h.model.preservation_only() && h.model.export_raw() && !h.model.CanReset());
+      h.model.Begin(Action::kInspect, 88); CHECK(h.model.operation_id() == 0);
+      h.model.Begin(Action::kAuthorizeReset, 88); CHECK(h.model.operation_id() == 0);
+      h.model.Begin(Action::kExportLogical, 88); CHECK(h.model.operation_id() == 0);
+      h.Present(); h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress);
+      CHECK(h.model.page() == Page::kConfirmExport && h.Hold(3000) == Action::kNone);
+      h.Send(ButtonId::kUp, ButtonEventType::kPress); CHECK(h.model.page() == Page::kOverview);
+      h.Present(); h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress);
+      CHECK(h.model.page() == Page::kConfirmExport && h.model.export_raw());
+      h.Present(); CHECK(h.Hold(1999) == Action::kNone);
+      CHECK(h.Hold(2500) == Action::kExportRaw);
+      h.model.Begin(Action::kExportRaw, 88); CHECK(h.model.operation_id() == 88);
+      wqn::services::StorageRecoveryExportResult result;
+      CHECK(h.model.ExportFinished(88, result, ESP_FAIL)); h.Present();
+      h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress); h.Present();
+      h.Send(ButtonId::kDownPower, ButtonEventType::kShortPress); h.Present();
+      CHECK(h.model.selection() == 1); h.Send(ButtonId::kConfirm, ButtonEventType::kShortPress);
+      CHECK(h.model.page() == Page::kConfirmRestart); }
     std::printf("Storage recovery model: %u checks, %u failures (NOT HIL)\n", checks, failures);
     return failures ? 1 : 0;
 }

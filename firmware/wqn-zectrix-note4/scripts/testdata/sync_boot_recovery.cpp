@@ -36,6 +36,8 @@ void Log(const char*, const char*, ...) {}
 std::vector<std::string> calls;
 int journal_error = ESP_OK, recovery_error = ESP_OK, storage_error = ESP_OK;
 int journal_reads = 0, mutex_creations = 0;
+bool preservation_requested = false, published_preservation = false;
+int preservation_check = ESP_OK;
 bool journal_loaded = false, fail_mutex = false, fail_timer = false, fail_task = false;
 void* g_sync_journal_mutex = nullptr;
 StaticSemaphore_t g_sync_journal_mutex_storage;
@@ -93,10 +95,14 @@ esp_err_t InitOpenCodeSession() { calls.push_back("agent"); return ESP_OK; }
 esp_err_t StartDeviceUiIfEnabled() { calls.push_back("ui"); return ESP_OK; }
 esp_err_t RunAudioSelfTestIfEnabled() { return ESP_OK; }
 esp_err_t StartPowerCoordinator() { calls.push_back("power"); return ESP_OK; }
-esp_err_t ShowStorageRecoveryUi(int error) {
+esp_err_t ShowStorageRecoveryUi(int error, bool preservation_only = false) {
+    if (preservation_only) calls.push_back("preservation-ui");
     calls.push_back("recovery-ui"); recovery_error = error; return ESP_OK;
 }
 namespace runtime {
+esp_err_t CheckStoragePreservationBoot(bool* out) { calls.push_back("boot-key"); *out=preservation_requested; return preservation_check; }
+esp_err_t EnterStorageEvidenceBootRecovery(int, uint32_t) { calls.push_back("recovery-publication"); return ESP_OK; }
+esp_err_t EnterStorageEvidenceBootPreservation(int) { calls.push_back("preservation-publication"); published_preservation=true; return ESP_OK; }
 int fault_code = 0;
 uint32_t fault_generation = 0;
 BootPhase fault_boot_phase = BootPhase::kPlatform;
@@ -147,6 +153,7 @@ void Check(bool result, const char* label) {
 }
 bool Called(const char* name) { return std::find(calls.begin(), calls.end(), name) != calls.end(); }
 void Reset() {
+    preservation_requested = published_preservation = false; preservation_check = ESP_OK;
     calls.clear(); journal_reads = mutex_creations = 0;
     journal_error = recovery_error = storage_error = ESP_OK;
     journal_loaded = fail_mutex = fail_timer = fail_task = false;
@@ -161,6 +168,7 @@ void Reset() {
 }
 bool BootRecovers() {
     try { app_main(); } catch (RecoveryStop&) { return true; }
+    catch (RestartStop&) { return false; } catch (Abort&) { return false; }
     return false;
 }
 bool NoBusiness() {
@@ -168,6 +176,15 @@ bool NoBusiness() {
         !Called("ui") && !Called("sync-task") && !Called("power");
 }
 int main() {
+    for (int error : {ESP_OK, ESP_ERR_INVALID_STATE}) {
+        Reset(); preservation_requested = error == ESP_OK; preservation_check = error;
+        // Even a previously authorized reset must not execute before capture.
+        wqn::runtime::schema_result.action = wqn::runtime::StorageSchemaBootAction::kRestartRequired;
+        Check(BootRecovers() && NoBusiness() && !Called("schema") && !Called("storage") && !Called("journal") && !Called("confirm-app"),
+              "physical preservation/error precedes every storage/reset/OTA gate");
+        Check(Called("boot-key") && Called("preservation-ui") && published_preservation && recovery_error == error,
+              "manual preservation publishes the one-way context and reaches its UI");
+    }
     for (int error : {ESP_ERR_INVALID_CRC, ESP_ERR_INVALID_STATE}) {
         Reset();
         wqn::runtime::schema_result.action = wqn::runtime::StorageSchemaBootAction::kRecoveryRequired;

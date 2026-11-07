@@ -43,6 +43,7 @@ def cases():
         ('json_string_boundaries', 'N-04/N-06: external NUL and Unicode identity', ()),
         ('pack_json_boundaries', 'N-06: complete persisted pack text', ()),
         ('note_index_delivery', 'N-02: delayed results across full/targeted lanes', ()),
+        ('sync_boot_recovery', 'R-08/R-18: pre-NVS preservation and normal recovery/startup ordering across WiFi/Agent profiles', ()),
         ('storage_schema', 'R-18: explicit recovery intent, stale consent and boot replay', ()),
         ('storage_mount_guard', 'R-18: ambiguous SPIFFS registration errors require actual mount proof', ()),
         ('outbox_forensics', 'R-08 ongoing: offline raw preservation and native journal/SDK CRC parity', ()),
@@ -72,6 +73,7 @@ def cases():
     for name, model in (
         ('ws_release_deadline', 'R-24: missing release and stale request/generation'),
         ('storage_prepare_deadline', 'R-07: absolute deadline and detached owner lifetime'),
+        ('storage_preservation_boot', 'R-08: physical boot hold, normal wake exclusion and fail-closed sampling'),
         ('storage_recovery', 'R-18: recovery model, owner delivery and UI confirmation'),
     ):
         for hz in (100, 1000):
@@ -93,6 +95,14 @@ def cases():
         result.append(Case(f'ws-lifetime-{mutation}', 'R-25: retired payload, client identity, generation and wake-only semantics', 'controls',
                            ('test_ws_event_lifetime.py', '--mutation', mutation), r'^FAIL ',
                            r'WS event lifetime: \d+ checks, [1-9]\d* failures'))
+    for mutation in ('short-hold', 'wake-select'):
+        result.append(Case(f'preservation-boot-{mutation}', 'R-08: boot consent hold and deep-sleep exclusion', 'controls',
+                           ('test_storage_preservation_boot.py', '--mutation', mutation), r'^FAIL preservation-boot:',
+                           r'Preservation boot: \d+ checks, [1-9]\d* failures \(production selector; 1000 Hz; NOT HIL\)'))
+    for mutation in ('late-preservation-gate', 'ignore-preservation-error'):
+        result.append(Case(f'startup-{mutation}', 'R-08: boot preservation precedes schema/reset and sampling errors cannot resume startup', 'controls',
+                           ('test_sync_boot_recovery.py', '--mutation', mutation), r'^FAIL:',
+                           r'Sync boot recovery: 3 configurations, [1-9]\d* failures \(production startup; NOT HIL\)'))
     for mutation in ('short-hold', 'unpresented-reset', 'forget-uncertain'):
         result.append(Case(f'recovery-{mutation}', 'R-18: fresh held confirmation, presentation and uncertain writes', 'controls',
                            ('test_storage_recovery.py', '--part', 'model', '--mutation', mutation),
@@ -119,7 +129,7 @@ def cases():
     result.append(Case('agent-wire-unbounded-budget', 'Agent: wire health remains bounded while business progress waits', 'controls',
                        ('test_agent_run_progress.py', '--mutation', 'wire-unbounded-budget'), r'^FAIL ',
                        r'Agent stream/client: \d+ checks, [1-9]\d* failures;'))
-    for mutation in ('trust-ack', 'skip-ready'):
+    for mutation in ('trust-ack', 'skip-ready', 'allow-manual-logical'):
         result.append(Case(f'evidence-transfer-{mutation}', 'R-08: READY and group ACK bind the capture and persisted bytes', 'controls',
                            ('test_evidence_transfer.py', '--mutation', mutation), r'^FAIL transfer:',
                            r'Evidence transfer: \d+ checks, [1-9]\d* failures \(production worker/transport/raw; host SDK ports; NOT HIL\)'))
@@ -131,7 +141,7 @@ def cases():
         result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
                            ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',
                            r'Storage maintenance NVS: \d+ checks, [1-9]\d* failures \(host ports; NOT HIL\)'))
-    for mutation in ('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility'):
+    for mutation in ('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility', 'allow-manual-logical'):
         result.append(Case(f'evidence-capture-{mutation}', 'R-08: maintenance admission, raw source recheck, read-only NVS and transcript integrity', 'controls',
                            ('test_storage_evidence_capture.py', '--mutation', mutation), r'^FAIL evidence:',
                            r'Storage evidence: \d+ scenarios, [1-9]\d* failures, 0 errors \(host ports; NOT HIL\)'))

@@ -21,6 +21,7 @@ idf_component_register(
         "pcf8563.cpp"
         "provision_manager.cpp"
         "runtime/storage_schema.cpp"
+        "runtime/storage_preservation_boot.cpp"
         "runtime/storage_temp_file_lease.cpp"
         "runtime/storage_evidence.cpp"
         "runtime/storage_evidence_mode.cpp"

@@ -38,7 +38,7 @@ def build(root, directory, mutation):
     for name, content in headers.items():
         path = directory/name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(content)
     source = (root/'main/runtime/evidence_transfer.cpp').read_text()
-    if mutation:
+    if mutation and mutation != 'allow-manual-logical':
         old, new = {
             'trust-ack': ('std::strcmp(line_, expected) == 0) {', 'std::strncmp(line_, "WQNT1 A ", 8) == 0) {'),
             'skip-ready': ('if (std::strcmp(line_, expected) == 0) return result_.error = ESP_OK;',
@@ -49,12 +49,18 @@ def build(root, directory, mutation):
         # keep the expected variable used when weakening READY in the control
         if mutation == 'skip-ready': source = source.replace('return result_.error = ESP_OK;\n        }', '(void)expected; return result_.error = ESP_OK;\n        }', 1)
     (directory/'transfer.cpp').write_text(source)
+    worker = (root/'main/services/storage_recovery_export.cpp').read_text()
+    if mutation == 'allow-manual-logical':
+        old = 'boot.preservation_only && kind != StorageRecoveryExportKind::kRaw'
+        if worker.count(old) != 1: raise RuntimeError('preservation worker mutation drift')
+        worker = worker.replace(old, 'false')
+    (directory/'worker.cpp').write_text(worker)
     binary = directory/'native'
     subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-pthread',
         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer', '-fno-pie', '-no-pie',
         '-I'+str(directory), '-I'+str(root/'main'), '-I'+str(root/'components/recovery_usb/include'),
         str(directory/'transfer.cpp'), str(root/'main/runtime/raw_flash_evidence.cpp'),
-        str(root/'main/runtime/storage_evidence_mode.cpp'), str(root/'main/services/storage_recovery_export.cpp'),
+        str(root/'main/runtime/storage_evidence_mode.cpp'), str(directory/'worker.cpp'),
         str(root/'scripts/testdata/evidence_transfer.cpp'), '-lcrypto', '-o', str(binary)], check=True, timeout=60)
     return binary
 
@@ -86,7 +92,7 @@ class FaultLines(ProcessLines):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mutation', choices=('trust-ack', 'skip-ready'))
+    parser.add_argument('--mutation', choices=('trust-ack', 'skip-ready', 'allow-manual-logical'))
     args = parser.parse_args()
     checks = failures = 0
     def check(good, name):
@@ -102,7 +108,8 @@ def main():
         check(logical_good, 'production logical collector fixture')
         for name, mode, fault in (
             ('normal', 'normal', ''), ('final-retry', 'final-retry', 'drop-final'),
-            ('logical-success', 'logical-success', ''), ('partial', 'partial', ''), ('large', 'large', ''),
+            ('logical-success', 'logical-success', ''), ('manual-raw', 'manual-raw', ''),
+            ('manual-error', 'manual-error', ''), ('manual-logical', 'manual-logical', ''), ('partial', 'partial', ''), ('large', 'large', ''),
             ('drop-ack', 'normal', 'drop-ack'), ('corrupt', 'normal', 'corrupt'),
             ('drop-data', 'normal', 'drop-data'), ('wrong-ack', 'timeout-ack', 'wrong-ack'),
             ('no-ack', 'timeout-ack', 'drop-all-acks'), ('wrong-ready', 'no-ready', 'wrong-ready'),
@@ -117,7 +124,7 @@ def main():
             process = subprocess.Popen([str(binary), mode, str(logical_wire)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, bufsize=0)
             io = FaultLines(process, fault)
-            session = Session(directory/name, PINS[1], PINS[2], 'L' if mode.startswith('logical') else 'R', True)
+            session = Session(directory/name, PINS[1], PINS[2], 'L' if mode.startswith('logical') or mode == 'manual-logical' else 'R', True)
             answer = None; error = None
             if name == 'no-ready': io.write(b'not a READY\n')
             try:
@@ -133,7 +140,7 @@ def main():
             if process.returncode != 0 or not diagnostic.startswith('{'):
                 raise RuntimeError('native infrastructure failure '+diagnostic[-4096:])
             state = json.loads(diagnostic)
-            success = name in ('normal', 'partial', 'large', 'drop-ack', 'corrupt', 'drop-data', 'lose-finish', 'final-retry', 'logical-success')
+            success = name in ('normal', 'partial', 'large', 'drop-ack', 'corrupt', 'drop-data', 'lose-finish', 'final-retry', 'logical-success', 'manual-raw', 'manual-error')
             committed = success or name in ('late-fail', 'source-error')
             check((state['error'] == 0) == success, name+' device result')
             check(state['ack'] == committed and state['leaks'] == 0, name+' commit/heap')
@@ -153,8 +160,10 @@ def main():
                 check(state['bytes'] == expected_size and state['progress'] == expected_size, name+' ACKed progress')
             else:
                 check(error is not None and (directory/name/'.transport-incomplete').exists(), name+' preserve incomplete')
-            if name in ('no-ready', 'wrong-ready', 'cancel-peer', 'not-mode', 'off-owner', 'oom', 'invalid-kind', 'expired', 'cancel-early'):
+            if name in ('no-ready', 'wrong-ready', 'cancel-peer', 'not-mode', 'off-owner', 'oom', 'invalid-kind', 'expired', 'cancel-early', 'manual-logical'):
                 check(state['reads'] == 0, name+' no source reads before admission')
+            if name == 'manual-logical':
+                check(state['opens'] == 0, name+' raw-only policy before reserving transport')
             if name in ('wrong-ack', 'no-ack'):
                 check(state['bytes'] == 0, name+' invalid ACK cannot advance progress')
         # Host durability failures must prevent both group and final ACKs.

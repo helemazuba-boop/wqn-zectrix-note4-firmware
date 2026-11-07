@@ -25,8 +25,16 @@ void BuildRecoveryFrame(const Model& model, esp_err_t boot_error, wqn::UiFrame* 
         frame->lines.push_back({style, text});
     };
     char text[100];
-    line("存储恢复", wqn::UiTextStyle::kTitle);
+    line(model.preservation_only() ? "数据保全" : "存储恢复", wqn::UiTextStyle::kTitle);
     if (model.page() == Page::kOverview) {
+        if (model.preservation_only()) {
+            line("常规启动已暂停。未初始化或挂载业务存储。", wqn::UiTextStyle::kWrappedBody);
+            line("松开上键，再选择操作。");
+            if (boot_error != ESP_OK) line("启动按键检查异常，已保留数据。", wqn::UiTextStyle::kWarning);
+            line(model.selection() == 0 ? "> 保全原始镜像到电脑" : "  保全原始镜像到电脑");
+            line(model.selection() == 1 ? "> 重启正常启动" : "  重启正常启动");
+            return;
+        }
         std::snprintf(text, sizeof(text), "启动错误：%s", esp_err_to_name(boot_error));
         line(text, wqn::UiTextStyle::kWarning);
         if (model.snapshot().reset_policy == Policy::kNewerFirmwareRequired)
@@ -48,7 +56,7 @@ void BuildRecoveryFrame(const Model& model, esp_err_t boot_error, wqn::UiFrame* 
         line("按住确认满 2 秒，再松开。");
         line("按上键取消。");
     } else if (model.page() == Page::kConfirmRestart) {
-        line("确认重启并重新检查存储？");
+        line(model.preservation_only() ? "恢复常规启动？" : "确认重启并重新检查存储？");
         line("若先前已确认重置，重启将继续清除数据。", wqn::UiTextStyle::kWrappedBody);
         line("短按确认重启，按上键返回。");
     } else if (model.page() == Page::kPreservation) {
@@ -107,6 +115,7 @@ void SubmitAction(Model* model, Action action, TaskHandle_t ui)
 {
     if (action == Action::kNone) return;
     if (action == Action::kRestart) { esp_restart(); return; }
+    if (model->preservation_only() && action != Action::kExportRaw && action != Action::kCancelExport) return;
     if (action == Action::kCancelExport) {
         (void)wqn::services::CancelStorageRecoveryExport(model->operation_id()); return;
     }
@@ -124,13 +133,13 @@ void SubmitAction(Model* model, Action action, TaskHandle_t ui)
 }
 }  // namespace
 
-esp_err_t RunStorageRecoveryUi(esp_err_t boot_error)
+esp_err_t RunStorageRecoveryUi(esp_err_t boot_error, bool preservation_only)
 {
     const TaskHandle_t ui = xTaskGetCurrentTaskHandle();
     ESP_RETURN_ON_ERROR(wqn::InitButtonInput(), kTag, "initialize recovery buttons");
     ESP_RETURN_ON_ERROR(wqn::StartButtonInputTask(ui), kTag, "start recovery buttons");
-    Model model(boot_error);
-    SubmitAction(&model, Action::kInspect, ui);
+    Model model(boot_error, preservation_only);
+    if (!preservation_only) SubmitAction(&model, Action::kInspect, ui);
     // Keep the large UiFrame off the IDF main stack. Recovery is the only boot
     // UI consumer and never coexists with DeviceUiTask; use one static frame.
     static wqn::UiFrame frame;
