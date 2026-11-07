@@ -11,7 +11,7 @@ UI = '(anonymous namespace)::DeviceUiTask(void*)'
 SUBMIT = 'device_ui_internal::RequestEpdUiRefresh(wqn::UiFrame const&)'
 RENDER = UI + '::{lambda()#1}::operator()() const'
 INITIAL = UI + '::{lambda()#2}::operator()() const'
-RECOVERY = 'device_ui_internal::RunStorageRecoveryUi(int)'
+RECOVERY = 'device_ui_internal::RunStorageRecoveryUi(int, bool)'
 
 
 class StackGateTest(unittest.TestCase):

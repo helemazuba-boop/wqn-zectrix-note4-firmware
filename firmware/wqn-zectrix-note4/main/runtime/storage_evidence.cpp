@@ -343,6 +343,7 @@ esp_err_t CaptureStorageEvidenceOnOwner(const StorageEvidenceIdentity& identity,
     StorageEvidenceBootContext boot;
     if (ReadStorageEvidenceBootContextOnOwner(&boot) != ESP_OK)
         return fail(ESP_ERR_INVALID_STATE);
+    if (boot.preservation_only) return fail(ESP_ERR_INVALID_STATE);
     if (!esp_spiffs_mounted("storage") || HasActiveStorageTempFileLease() || HasActivePackStreamPath())
         return fail(ESP_ERR_INVALID_STATE);
     if (sink.emit == nullptr || !Nonzero(identity.capture_id) || !Nonzero(identity.mac) ||

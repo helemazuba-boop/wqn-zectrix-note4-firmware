@@ -28,7 +28,7 @@ bool block_owner = false;
 std::atomic<unsigned> owner_entered{0}, inspect_calls{0}, reset_calls{0}, ui_notifications{0};
 std::atomic<bool> wrong_owner{false};
 int start_error = ESP_OK, delivery_error = ESP_OK;
-bool fail_alloc = false, fail_create = false;
+bool fail_alloc = false, fail_create = false, preservation_only = false;
 unsigned allocations = 0, frees = 0;
 void* allocation = nullptr;
 void* ui = reinterpret_cast<void*>(1);
@@ -86,6 +86,9 @@ esp_err_t ExecuteStorageTransactionNamed(StorageTransaction transaction, void* c
 }
 }
 namespace wqn::runtime {
+esp_err_t ReadStorageEvidenceBootContextOnOwner(StorageEvidenceBootContext* out) {
+    CHECK(storage_owner); out->preservation_only = preservation_only; return ESP_OK;
+}
 esp_err_t InspectStorageRecovery(StorageRecoverySnapshot* out) {
     if (!storage_owner) wrong_owner.store(true);
     inspect_calls.fetch_add(1); *out = returned_snapshot; return returned_snapshot.error;
@@ -174,8 +177,21 @@ int main() {
         CHECK(AcknowledgeStorageRecoveryResult(id));
         CHECK(!ReadStorageRecoveryExportProgress(id, &progress));
     }
+    preservation_only = true;
+    for (int operation = 0; operation < 3; ++operation) {
+        CHECK(operation == 0 ? SubmitStorageRecoveryInspect(&id) :
+              operation == 1 ? SubmitStorageRecoveryReset(returned_snapshot, &id) :
+              SubmitStorageRecoveryExport(StorageRecoveryExportKind::kLogical, true, &id));
+        CHECK(Wait([&] { return ReadStorageRecoveryResult(&result); }));
+        CHECK(result.error == ESP_ERR_INVALID_STATE);
+        CHECK(AcknowledgeStorageRecoveryResult(id));
+    }
+    CHECK(SubmitStorageRecoveryExport(StorageRecoveryExportKind::kRaw, true, &id));
+    CHECK(Wait([&] { return ReadStorageRecoveryResult(&result); }));
+    CHECK(result.error == ESP_OK && result.exported.persisted_data_bytes == 1234);
+    CHECK(AcknowledgeStorageRecoveryResult(id));
     CHECK(inspect_calls == 1 && reset_calls == 3 && !wrong_owner);
-    CHECK(Wait([] { return ui_notifications.load() == 7; }));
+    CHECK(Wait([] { return ui_notifications.load() == 11; }));
     { std::lock_guard<std::mutex> lock(task.mutex); task.stop = true; task.cv.notify_all(); }
     task.thread.join(); heap_caps_free(allocation);
     CHECK(allocations == frees);

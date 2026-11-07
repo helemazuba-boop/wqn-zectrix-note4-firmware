@@ -64,13 +64,13 @@ esp_err_t StartStorageRecoveryService(TaskHandle_t target) {
     return ESP_OK;
 }
 bool SubmitStorageRecoveryExport(StorageRecoveryExportKind kind, bool confirmed, uint32_t* id) {
-    CHECK((scenario == 6 || scenario == 7) && !operation_pending && confirmed);
-    CHECK(kind == (scenario == 6 ? StorageRecoveryExportKind::kRaw : StorageRecoveryExportKind::kLogical));
+    CHECK((scenario == 6 || scenario == 7 || scenario == 8) && !operation_pending && confirmed);
+    CHECK(kind == ((scenario == 6 || scenario == 8) ? StorageRecoveryExportKind::kRaw : StorageRecoveryExportKind::kLogical));
     export_started = true; operation_pending = true; operation_ready = false;
     result = {}; *id = ++operation_count; result.operation_id = *id;
     result.operation = kind == StorageRecoveryExportKind::kRaw ? StorageRecoveryOperation::kExportRaw : StorageRecoveryOperation::kExportLogical;
-    result.error = scenario == 6 ? ESP_OK : ESP_ERR_INVALID_STATE;
-    result.exported.commit_acknowledged = scenario == 6; result.exported.source_complete = scenario == 6;
+    result.error = (scenario == 6 || scenario == 8) ? ESP_OK : ESP_ERR_INVALID_STATE;
+    result.exported.commit_acknowledged = scenario == 6 || scenario == 8; result.exported.source_complete = scenario == 6 || scenario == 8;
     return true;
 }
 bool CancelStorageRecoveryExport(uint32_t id) {
@@ -82,7 +82,7 @@ bool ReadStorageRecoveryExportProgress(uint32_t id, uint32_t* bytes) {
     ++export_progress_polls; *bytes = 1024; return true;
 }
 bool SubmitStorageRecoveryInspect(uint32_t* id) {
-    CHECK(!operation_pending); ++inspect_count;
+    CHECK(scenario < 8 && !operation_pending); ++inspect_count;
     operation_pending = true; operation_ready = false;
     result = {}; *id = ++operation_count; result.operation_id = *id;
     result.operation = StorageRecoveryOperation::kInspect; result.error = ESP_OK;
@@ -207,7 +207,7 @@ uint32_t ulTaskNotifyTake(int clear, TickType_t delay) {
     return 1;
 }
 int main() {
-    for (scenario = 0; scenario < 8; ++scenario) {
+    for (scenario = 0; scenario < 10; ++scenario) {
         now = 100; sequence = 0; operation_count = inspect_count = reset_count = steps = attempts = 0;
         outstanding = received = 0; frame.lines.clear(); buttons.clear(); results.clear(); waits.clear();
         operation_pending = operation_ready = display_pending = false;
@@ -219,10 +219,12 @@ int main() {
         else if (scenario == 4) commands = {Down, Confirm, Press, Confirm};
         else if (scenario == 5) commands = {Confirm, Confirm, Confirm, Down, Confirm, Press, Confirm};
         else if (scenario == 6) commands = {Down, Down, Confirm, Down, Press, Confirm, Hold, Confirm, Up, Confirm, Press, Confirm};
+        else if (scenario == 8) commands = {Confirm, Hold, Confirm, Down, Confirm, Press, Confirm};
+        else if (scenario == 9) commands = {Down, Confirm, Press, Confirm};
         else if (scenario == 7) commands = {Down, Down, Confirm, Press, Confirm, Hold, Confirm, Up, Confirm, Press, Confirm};
         else commands = {Down, Down, Down, Confirm, Hold, Press, Confirm};
         const unsigned before = restarts;
-        try { RunStorageRecoveryUi(ESP_FAIL); CHECK(false); }
+        try { RunStorageRecoveryUi(scenario == 8 ? ESP_OK : ESP_FAIL, scenario >= 8); CHECK(false); }
         catch (const Restart&) {}
         catch (const Exhausted&) { CHECK(false); }
         CHECK(restarts == before+1 && commands.empty());
@@ -231,8 +233,9 @@ int main() {
         CHECK(scenario != 1 || (stale_warning && warning_presented && stale_outcome));
         CHECK(scenario != 2 || (saw_uncertain && stale_outcome));
         CHECK(scenario != 4 || paused_probe);
-        CHECK(scenario < 6 || (export_started && export_progress_polls != 0));
+        CHECK(scenario < 6 || scenario == 9 || (export_started && export_progress_polls != 0));
         CHECK(scenario != 7 || export_cancelled);
+        CHECK(scenario < 8 || (inspect_count == 0 && reset_count == 0));
         CHECK(scenario != 5 || (startup_failed && saw_diagnostics && inspect_count == 1));
     }
     const auto inspected = inspect_count;

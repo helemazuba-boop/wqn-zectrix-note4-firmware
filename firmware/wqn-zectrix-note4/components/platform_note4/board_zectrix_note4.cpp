@@ -56,6 +56,8 @@ esp_err_t ConfigureInputs(uint64_t pin_mask, gpio_pullup_t pull_up = GPIO_PULLUP
 
 namespace wqn {
 
+int ReadNote4BootPageUpLevel() { return gpio_get_level(kPageUp); }
+
 esp_err_t SetNote4RecordingLed(bool enabled)
 {
     return gpio_set_level(kLed, enabled ? 0 : 1);

@@ -24,6 +24,7 @@
 #include "runtime/sleep_coordinator.h"
 #include "runtime/storage_schema.h"
 #include "runtime/storage_evidence.h"
+#include "runtime/storage_preservation_boot.h"
 #include "runtime/memory_diagnostics.h"
 #include "runtime/fault_diagnostics.h"
 #include "runtime/wake_context.h"
@@ -98,12 +99,27 @@ void ConfirmRunningApp()
     }
 }
 
+[[noreturn]] void EnterStoragePreservationMode(esp_err_t reason)
+{
+    const esp_err_t published = wqn::runtime::EnterStorageEvidenceBootPreservation(reason);
+    if (published == ESP_OK) {
+        ESP_LOGW(kTag, "pre-NVS preservation: normal storage startup blocked; reason=%s", esp_err_to_name(reason));
+        const esp_err_t ui = wqn::ShowStorageRecoveryUi(reason, true);
+        if (ui != ESP_OK) ESP_LOGE(kTag, "preservation UI failed: %s", esp_err_to_name(ui));
+    } else ESP_LOGE(kTag, "preservation publication failed: %s", esp_err_to_name(published));
+    while (true) vTaskDelay(pdMS_TO_TICKS(60000));
+}
+
 }  // namespace
 
 extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(wqn::InitZectrixNote4SafePins());
     wqn::runtime::InitFaultDiagnostics();
+    // Check before PM can isolate boot inputs. This does not initialize NVS,
+    // mount SPIFFS or acknowledge OTA. GPIO0 must not be held across reset.
+    bool preservation_requested = false;
+    const esp_err_t preservation_check = wqn::runtime::CheckStoragePreservationBoot(&preservation_requested);
     ESP_ERROR_CHECK(wqn::InitPowerHardware(
         wqn::kNote4I2cPort,
         wqn::kNote4I2cSda,
@@ -143,6 +159,9 @@ extern "C" void app_main(void)
 #endif
     ESP_ERROR_CHECK(wqn::runtime::InitSleepCoordinator());
     wqn::RefreshUsbPowerSleepPolicy();
+
+    if (preservation_check != ESP_OK || preservation_requested)
+        EnterStoragePreservationMode(preservation_check);
 
     // M7 boot gate: validate storage or finish an explicitly authorized reset
     // (including final marker and intent removal) before any audio, storage,

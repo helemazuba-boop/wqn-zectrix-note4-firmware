@@ -12,7 +12,8 @@ public:
     enum class Page { kOverview, kDiagnostics, kPreservation, kConfirmReset,
                       kConfirmRestart, kBusy, kRecorded, kUncertain, kError, kConfirmExport, kExportResult };
     enum class Action { kNone, kInspect, kAuthorizeReset, kRestart, kExportLogical, kExportRaw, kCancelExport };
-    explicit StorageRecoveryModel(esp_err_t boot_error) : error_(boot_error) {}
+    explicit StorageRecoveryModel(esp_err_t boot_error, bool preservation_only = false)
+        : error_(boot_error), preservation_only_(preservation_only), export_raw_(preservation_only) {}
 
     Page page() const { return page_; }
     unsigned selection() const { return selection_; }
@@ -20,6 +21,7 @@ public:
     uint32_t operation_id() const { return operation_id_; }
     Action operation() const { return operation_; }
     esp_err_t error() const { return error_; }
+    bool preservation_only() const { return preservation_only_; }
     bool export_raw() const { return export_raw_; }
     bool exporting() const { return operation_ == Action::kExportLogical || operation_ == Action::kExportRaw; }
     bool export_cancel_requested() const { return export_cancel_requested_; }
@@ -30,7 +32,7 @@ public:
     }
     const wqn::runtime::StorageRecoverySnapshot& snapshot() const { return snapshot_; }
     bool CanReset() const {
-        return snapshot_.error == ESP_OK &&
+        return !preservation_only_ && snapshot_.error == ESP_OK &&
             snapshot_.reset_policy == wqn::runtime::StorageRecoveryResetPolicy::kAllowed;
     }
     void Presented(uint64_t version, int64_t now_ms) {
@@ -38,6 +40,7 @@ public:
     }
     void Begin(Action operation, uint32_t id) {
         if (id == 0 || operation_id_ != 0) return;
+        if (preservation_only_ && operation != Action::kExportRaw) return;
         operation_id_ = id;
         operation_ = operation;
         exported_bytes_ = 0; export_cancel_requested_ = false;
@@ -104,7 +107,7 @@ public:
         }
         if (page_ == Page::kConfirmExport) {
             if (event.button == ButtonId::kUp && event.type == ButtonEventType::kPress) {
-                SetPage(Page::kPreservation); return Action::kNone;
+                SetPage(preservation_only_ ? Page::kOverview : Page::kPreservation); return Action::kNone;
             }
             if (!presented_ || event.occurred_at_ms <= presented_at_ms_) { held_at_ms_ = 0; return Action::kNone; }
             if (event.button != ButtonId::kConfirm) { held_at_ms_ = 0; return Action::kNone; }
@@ -169,6 +172,14 @@ public:
                 SetPage(Page::kOverview);
             return Action::kNone;
         }
+        if (preservation_only_) {
+            if (event.button == ButtonId::kUp || event.button == ButtonId::kDownPower) {
+                selection_ = (selection_+1)%2; SetPage(Page::kOverview);
+            } else if (event.button == ButtonId::kConfirm) {
+                SetPage(selection_ == 0 ? Page::kConfirmExport : Page::kConfirmRestart);
+            }
+            return Action::kNone;
+        }
         if (event.button == ButtonId::kUp || event.button == ButtonId::kDownPower) {
             selection_ = (selection_ + (event.button == ButtonId::kUp ? 3u : 1u)) % 4;
             SetPage(Page::kOverview);
@@ -197,6 +208,7 @@ private:
     int64_t held_at_ms_ = 0, presented_at_ms_ = 0;
     esp_err_t error_;
     wqn::runtime::StorageRecoverySnapshot snapshot_;
+    bool preservation_only_ = false;
     bool export_raw_ = false, export_cancel_requested_ = false;
     uint32_t exported_bytes_ = 0;
     wqn::services::StorageRecoveryExportResult exported_;

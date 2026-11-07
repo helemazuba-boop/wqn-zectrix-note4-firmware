@@ -44,6 +44,8 @@ esp_err_t RunStorageRecoveryExportOnOwner(StorageRecoveryExportKind kind,
     runtime::StorageEvidenceBootContext boot;
     if (runtime::ReadStorageEvidenceBootContextOnOwner(&boot) != ESP_OK)
         return result->error = ESP_ERR_INVALID_STATE;
+    if (boot.preservation_only && kind != StorageRecoveryExportKind::kRaw)
+        return result->error = ESP_ERR_INVALID_STATE;
     if (cancelled != nullptr && cancelled(context)) return result->error = ESP_ERR_INVALID_STATE;
     if (deadline <= esp_timer_get_time()) return result->error = ESP_ERR_TIMEOUT;
     runtime::StorageEvidenceIdentity identity;

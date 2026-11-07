@@ -86,10 +86,13 @@ int main(int argc,char** argv) {
     if (argc==3) logical_wire=argv[2];
     mode=argv[1]; if (mode=="large") flash_size=1024*1024;
     owner=mode!="off-owner";
-    if (mode!="not-mode") wqn::runtime::EnterStorageEvidenceBootRecovery(ESP_ERR_INVALID_CRC,3);
+    if (mode.rfind("manual-",0)==0) {
+        wqn::runtime::EnterStorageEvidenceBootPreservation(mode=="manual-error" ? ESP_FAIL : ESP_OK);
+        if (wqn::runtime::EnterStorageEvidenceBootRecovery(ESP_FAIL,99)!=ESP_ERR_INVALID_STATE) std::abort();
+    } else if (mode!="not-mode") wqn::runtime::EnterStorageEvidenceBootRecovery(ESP_ERR_INVALID_CRC,3);
     wqn::services::StorageRecoveryExportResult result;
     const auto kind=mode=="invalid-kind" ? static_cast<wqn::services::StorageRecoveryExportKind>(99) :
-        (mode=="logical" || mode=="logical-success") ? wqn::services::StorageRecoveryExportKind::kLogical : wqn::services::StorageRecoveryExportKind::kRaw;
+        (mode=="logical" || mode=="logical-success" || mode=="manual-logical") ? wqn::services::StorageRecoveryExportKind::kLogical : wqn::services::StorageRecoveryExportKind::kRaw;
     const int64_t budget=mode=="final-retry" ? 1500000000LL : (mode=="no-ready" || mode=="zero-write") ? 200000 : mode=="timeout-ack" ? 350000 : 15000000;
     const int error=wqn::services::RunStorageRecoveryExportOnOwner(kind,Cancel,nullptr,
         mode=="expired" ? 1 : esp_timer_get_time()+budget,Progress,&result);

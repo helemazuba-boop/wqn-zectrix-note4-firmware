@@ -196,7 +196,8 @@ int main(int argc,char** argv) {
     if(scenario=="nvs-unsupported")values["cur_seq"].type=NVS_TYPE_ANY;
     if(scenario=="nvs-empty")values["cur_seq"].bytes.clear();
     if(scenario=="key-missing")values.erase("cur_seq");
-    if(scenario!="not-mode")wqn::runtime::EnterStorageEvidenceBootRecovery(ESP_ERR_INVALID_CRC,3);
+    if(scenario=="manual-preservation")wqn::runtime::EnterStorageEvidenceBootPreservation();
+    else if(scenario!="not-mode")wqn::runtime::EnterStorageEvidenceBootRecovery(ESP_ERR_INVALID_CRC,3);
     wqn::runtime::StorageEvidenceIdentity identity;
     identity.capture_id.fill(0x11);identity.mac.fill(0x22);identity.firmware_elf_sha256.fill(0x33);
     wqn::runtime::StorageEvidenceSink sink{Emit,nullptr,Cancel,nullptr,500000000};
@@ -205,7 +206,7 @@ int main(int argc,char** argv) {
     const int error=wqn::runtime::CaptureStorageEvidenceOnOwner(identity,sink,&summary);
     output.close();
     const bool success=scenario=="normal" || scenario=="namespace-missing" || scenario=="key-missing" || scenario=="nvs-empty";
-    const bool early=scenario=="not-mode" || scenario=="off-owner" || scenario=="unmounted" ||
+    const bool early=scenario=="manual-preservation" || scenario=="not-mode" || scenario=="off-owner" || scenario=="unmounted" ||
         scenario=="temp-lease" || scenario=="pack-lease" || scenario=="cancel-early" || scenario=="deadline" ||
         scenario=="deadline-during-yield" || scenario=="cancel-during-yield";
     const bool expected=success?(error==ESP_OK && summary.capture_complete):(error!=ESP_OK && !summary.capture_complete);

@@ -69,6 +69,7 @@ def build(root, directory, mutation):
     source = (root / 'main/runtime/storage_evidence.cpp').read_text()
     mode = (root / 'main/runtime/storage_evidence_mode.cpp').read_text()
     changes = {
+        'allow-manual-logical': ('if (boot.preservation_only) return fail(ESP_ERR_INVALID_STATE);', 'if (false) return fail(ESP_ERR_INVALID_STATE);'),
         'ignore-mode': ('g_mode.load(std::memory_order_acquire) != Mode::kBootRecovery', 'false'),
         'skip-recheck': ('if (!unchanged) remember(ESP_ERR_INVALID_STATE);', 'unchanged = true; if (!unchanged) remember(ESP_ERR_INVALID_STATE);'),
         'write-open': ('NVS_READONLY', 'NVS_READWRITE'),
@@ -179,7 +180,7 @@ def altered(stream, change):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mutation', choices=('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility'))
+    parser.add_argument('--mutation', choices=('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility', 'allow-manual-logical'))
     parser.add_argument('--save-example', type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -199,7 +200,7 @@ def main():
             global receiver
             receiver = module
         binary = build(root, directory, args.mutation)
-        scenarios = ('normal', 'not-mode', 'off-owner', 'unmounted', 'temp-lease', 'pack-lease',
+        scenarios = ('normal', 'manual-preservation', 'not-mode', 'off-owner', 'unmounted', 'temp-lease', 'pack-lease',
             'deadline', 'deadline-during-yield', 'cancel-during-yield', 'cancel-early', 'cancel-mid', 'sink-error', 'late-sink-error', 'oom',
             'namespace-missing', 'namespace-error', 'key-missing', 'nvs-empty', 'nvs-error',
             'nvs-oversize', 'nvs-unsupported', 'read-error', 'bigfile', 'many', 'symlink', 'fifo',
