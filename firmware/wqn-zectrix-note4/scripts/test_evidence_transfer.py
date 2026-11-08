@@ -41,6 +41,7 @@ def build(root, directory, mutation):
     if mutation and mutation != 'allow-manual-logical':
         old, new = {
             'trust-ack': ('std::strcmp(line_, expected) == 0) {', 'std::strncmp(line_, "WQNT1 A ", 8) == 0) {'),
+            'allow-nul': ("if (c == '\\0') overflow = true;", 'if (false) overflow = true;'),
             'skip-ready': ('if (std::strcmp(line_, expected) == 0) return result_.error = ESP_OK;',
                            'return result_.error = ESP_OK;'),
         }[mutation]
@@ -78,6 +79,11 @@ class FaultLines(ProcessLines):
             return line[:-3]+b'!\n'
         return line
     def write(self, data):
+        nul_kind = {'nul-ready': b'WQNT1 R ', 'nul-ack': b'WQNT1 A ',
+                    'nul-ready-once': b'WQNT1 R ', 'nul-ack-once': b'WQNT1 A ', 'nul-final': b'WQNT1 C '}.get(self.fault)
+        if nul_kind is not None and data.startswith(nul_kind) and (not self.fault.endswith('-once') or not self.changed):
+            self.changed = True
+            data = data[:-1] + b'\0trailing-garbage\n'
         if self.fault == 'wrong-ready' and data.startswith(b'WQNT1 R '): data = b'WQNT1 R '+b'44'*16+b'\n'
         if self.fault == 'peer-cancel' and data.startswith(b'WQNT1 R '): data = b'WQNT1 Q '+b'11'*16+b'\n'
         if self.fault in ('drop-ack', 'wrong-ack') and not self.changed and data.startswith(b'WQNT1 A '):
@@ -92,7 +98,7 @@ class FaultLines(ProcessLines):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mutation', choices=('trust-ack', 'skip-ready', 'allow-manual-logical'))
+    parser.add_argument('--mutation', choices=('trust-ack', 'skip-ready', 'allow-manual-logical', 'allow-nul'))
     args = parser.parse_args()
     checks = failures = 0
     def check(good, name):
@@ -114,6 +120,9 @@ def main():
             ('drop-data', 'normal', 'drop-data'), ('wrong-ack', 'timeout-ack', 'wrong-ack'),
             ('no-ack', 'timeout-ack', 'drop-all-acks'), ('wrong-ready', 'no-ready', 'wrong-ready'),
             ('no-ready', 'no-ready', 'drop-all-acks'), ('cancel-peer', 'normal', 'peer-cancel'),
+            ('nul-ready', 'no-ready', 'nul-ready'), ('nul-ack', 'timeout-ack', 'nul-ack'),
+            ('nul-final', 'timeout-ack', 'nul-final'),
+            ('nul-ready-retry', 'normal', 'nul-ready-once'), ('nul-ack-retry', 'normal', 'nul-ack-once'),
             ('late-fail', 'late-fail', ''), ('lose-finish', 'normal', 'lose-finish'),
             ('source-error', 'source-error', ''), ('open-error', 'open-error', ''),
             ('zero-write', 'zero-write', ''), ('write-error', 'write-error', ''),
@@ -140,11 +149,11 @@ def main():
             if process.returncode != 0 or not diagnostic.startswith('{'):
                 raise RuntimeError('native infrastructure failure '+diagnostic[-4096:])
             state = json.loads(diagnostic)
-            success = name in ('normal', 'partial', 'large', 'drop-ack', 'corrupt', 'drop-data', 'lose-finish', 'final-retry', 'logical-success', 'manual-raw', 'manual-error')
+            success = name in ('normal', 'partial', 'large', 'drop-ack', 'corrupt', 'drop-data', 'lose-finish', 'final-retry', 'logical-success', 'manual-raw', 'manual-error', 'nul-ready-retry', 'nul-ack-retry')
             committed = success or name in ('late-fail', 'source-error')
             check((state['error'] == 0) == success, name+' device result')
             check(state['ack'] == committed and state['leaks'] == 0, name+' commit/heap')
-            if committed:
+            if committed or name == 'nul-final':
                 check(answer is not None and answer['source_complete'] == (name != 'source-error'), name+' host durable result')
                 if name == 'logical-success':
                     receipt = logical.verify_bundle(session.evidence, answer['manifest_sha256'])
@@ -156,15 +165,19 @@ def main():
                 expected_size = 384 if name == 'source-error' else 1024*1024 if name == 'large' else 32769
                 check(image == bytes((17*i+29)&255 for i in range(expected_size)), name+' exact source prefix')
                 check(not receipt['repair_authorized'] and not answer['identity_authenticated'], name+' no inferred authority')
-                check(answer['device_received_commit_ack'] == (name not in ('late-fail', 'lose-finish')), name+' final delivery certainty')
-                check(state['bytes'] == expected_size and state['progress'] == expected_size, name+' ACKed progress')
+                check(answer['device_received_commit_ack'] == (name not in ('late-fail', 'lose-finish', 'nul-final')), name+' final delivery certainty')
+                if name == 'nul-final':
+                    check(0 < state['bytes'] < expected_size and state['progress'] == state['bytes'], name+' unacknowledged final window stays pending')
+                    check((directory/name/'.transport-incomplete').exists(), name+' host commit does not imply device confirmation')
+                else:
+                    check(state['bytes'] == expected_size and state['progress'] == expected_size, name+' ACKed progress')
             else:
                 check(error is not None and (directory/name/'.transport-incomplete').exists(), name+' preserve incomplete')
-            if name in ('no-ready', 'wrong-ready', 'cancel-peer', 'not-mode', 'off-owner', 'oom', 'invalid-kind', 'expired', 'cancel-early', 'manual-logical'):
+            if name in ('no-ready', 'wrong-ready', 'nul-ready', 'cancel-peer', 'not-mode', 'off-owner', 'oom', 'invalid-kind', 'expired', 'cancel-early', 'manual-logical'):
                 check(state['reads'] == 0, name+' no source reads before admission')
             if name == 'manual-logical':
                 check(state['opens'] == 0, name+' raw-only policy before reserving transport')
-            if name in ('wrong-ack', 'no-ack'):
+            if name in ('wrong-ack', 'no-ack', 'nul-ack'):
                 check(state['bytes'] == 0, name+' invalid ACK cannot advance progress')
         # Host durability failures must prevent both group and final ACKs.
         for failure in ('checkpoint', 'verify', 'delivery-sync'):

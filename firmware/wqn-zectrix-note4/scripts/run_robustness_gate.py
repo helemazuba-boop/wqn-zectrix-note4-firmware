@@ -217,6 +217,12 @@ def cases():
         result.append(Case(f'problem-park-{mutation}', 'Problem park: strict bounded frames, upload admission and uncertain-write confirmation', 'controls',
                            ('test_problem_outbox_recovery.py', '--mutation', f'park-{mutation}'), r'^FAIL: park',
                            r'Problem park total: \d+ checks, [1-9]\d* failures \(real SDK/transactions/upload; NOT HIL\)'))
+    result.append(Case('evidence-transfer-allow-nul', 'R-08: complete control lines must reject hidden NUL suffixes before READY or ACK admission', 'controls',
+                       ('test_evidence_transfer.py', '--mutation', 'allow-nul'), r'^FAIL transfer: nul-',
+                       r'Evidence transfer: \d+ checks, [1-9]\d* failures \(production worker/transport/raw; host SDK ports; NOT HIL\)'))
+    result.append(Case('storage-control-lost-notify', 'Host controller: notifications before wait cannot consume the entire unchanged watchdog budget', 'controls',
+                       ('test_storage_prepare_deadline.py', '--mutation', 'control-lost-notify'), r'^FAIL controller handles notification before wait',
+                       r'Storage preparation deadline: \d+ checks, [1-9]\d* failures;'))
     return result
 
 
@@ -275,8 +281,14 @@ def main():
             output = done.stdout
             passed = accepted(case, done.returncode, output)
             code = done.returncode
-        except (OSError, subprocess.TimeoutExpired):
-            output, passed, code = 'FAIL: runner could not complete the child process\n', False, None
+        except subprocess.TimeoutExpired as error:
+            partial = error.stdout or ''
+            if isinstance(partial, bytes):
+                partial = partial.decode('utf-8', errors='replace')
+            output = partial + f'\nFAIL: runner child exceeded {error.timeout} seconds\n'
+            passed, code = False, None
+        except OSError:
+            output, passed, code = 'FAIL: runner could not start the child process\n', False, None
         results.append(dict(name=case.name, fault_model=case.model, passed=passed,
                             returncode=code, seconds=round(time.monotonic() - started, 3)))
         if args.output_dir:

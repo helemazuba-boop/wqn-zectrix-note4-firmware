@@ -91,7 +91,7 @@ def main():
     parser.add_argument('--before')
     parser.add_argument('--tick-hz',type=int,choices=(100,1000),default=100)
     parser.add_argument('--mutation',choices=('double-budget','abandon-payload','skip-blocker',
-        'wrong-generation','skip-expired-owner','publish-ready-late','skip-worker-reference','entry-only-deadline'))
+        'wrong-generation','skip-expired-owner','publish-ready-late','skip-worker-reference','entry-only-deadline','control-lost-notify'))
     args=parser.parse_args()
     def source(name):
         if args.before:
@@ -113,7 +113,7 @@ def main():
         'publish-ready-late':('service','esp_timer_get_time() >= deadline_us ? ESP_ERR_TIMEOUT : completion->result','completion->result'),
         'skip-worker-reference':('service','if (owned) ReleaseOwnedCompletion(completion);','if (owned) { /* leak command reference */ }'),
     }
-    if args.mutation:
+    if args.mutation and args.mutation != 'control-lost-notify':
         if args.mutation=='entry-only-deadline':
             needle='    if (deadline_reached()) return ESP_OK;'
             assert word.count(needle)==3
@@ -131,6 +131,10 @@ def main():
             if target=='service': service=code
             else: runtime=code
     fixture=(root/'scripts/testdata/storage_prepare_deadline.cpp').read_text()
+    if args.mutation == 'control-lost-notify':
+        old='changed.wait_until(lock,std::min(deadline,now+1ms));'
+        assert fixture.count(old)==1,'controller mutation boundary drift'
+        fixture=fixture.replace(old,'changed.wait_until(lock,deadline);')
     start=word.index('struct OutboxMaintenanceContext {')
     context=word[start:word.index('\nesp_err_t OutboxMaintenanceStepTransaction(',start)]
     request=''
@@ -171,7 +175,7 @@ def main():
             check=True,timeout=60)
         cases={'double-budget':'queue','abandon-payload':'running','skip-blocker':'running',
                'wrong-generation':'lease','skip-expired-owner':'expired','publish-ready-late':'late',
-               'skip-worker-reference':'publication','entry-only-deadline':'cache'}
+               'skip-worker-reference':'publication','entry-only-deadline':'cache','control-lost-notify':'control-wakeup'}
         case=cases[args.mutation] if args.mutation else ('running' if args.before else 'all')
         return subprocess.run([str(binary),case],timeout=30,env=dict(os.environ,
             ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1')).returncode

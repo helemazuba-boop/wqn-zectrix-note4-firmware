@@ -60,7 +60,15 @@ void Check(bool pass,const char* message)
 template <class Predicate> void UntilImpl(Predicate predicate,int line)
 {
     std::unique_lock<std::mutex> lock(control);
-    if (!changed.wait_for(lock,2s,predicate)) {
+    const auto deadline=std::chrono::steady_clock::now()+2s;
+    while (!predicate()) {
+        const auto now=std::chrono::steady_clock::now();
+        if (now < deadline) {
+            // Atomic port flags may change without the controller mutex. A
+            // notification before wait must not spend the full watchdog.
+            changed.wait_until(lock,std::min(deadline,now+1ms));
+            continue;
+        }
         std::fprintf(stderr,"HARNESS control wait did not settle at line %d, stage=%d completed=%d entered=%d clock=%lld\n",
             line,static_cast<int>(stall_stage),completed.load(),static_cast<int>(io_entered.load()),
             static_cast<long long>(clock_us.load())); std::abort();
@@ -380,10 +388,27 @@ void PowerBroadcast()
     }
 }
 #endif
+void ControlWakeup()
+{
+    std::atomic<bool> ready{false};
+    bool published=false;
+    const auto started=std::chrono::steady_clock::now();
+    Until([&] {
+        const bool observed=ready.load();
+        if (!published) {
+            published=true; ready=true;
+            changed.notify_all();  // Deliberately before the controller waits.
+        }
+        return observed;
+    });
+    Check(std::chrono::steady_clock::now()-started < 1s,
+          "controller handles notification before wait without spending watchdog budget");
+}
 int main(int argc,char** argv)
 {
     Check(InitSleepCoordinator()==ESP_OK && wqn::services::StartStorageService()==ESP_OK,"real coordinators initialize with host ports");
     const std::string selected=argc>1?argv[1]:"all";
+    if(selected=="all" || selected=="control-wakeup") ControlWakeup();
     if(selected=="all" || selected=="running") Running(Stage::kCheckpoint);
 #if HAS_OWNED
     if(selected=="cache") Running(Stage::kCache);

@@ -66,7 +66,8 @@ esp_err_t EvidenceTransfer::Line(int64_t until) {
             char quit[48]; std::snprintf(quit, sizeof(quit), "WQNT1 Q %s", capture_);
             return std::strcmp(line_, quit) == 0 ? ESP_ERR_INVALID_STATE : ESP_OK;
         }
-        if (count+1 >= sizeof(line_)) overflow = true;
+        if (c == '\0') overflow = true;  // Reject the whole malformed line.
+        else if (count+1 >= sizeof(line_)) overflow = true;
         else if (!overflow) line_[count++] = c;
     }
 }
