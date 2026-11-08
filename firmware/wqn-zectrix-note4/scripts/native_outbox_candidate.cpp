@@ -67,7 +67,15 @@ void Counts(const OutboxScan& scan) {
         scan.pending.size(), scan.acknowledged.size(), scan.suspended.size(), scan.total_records);
 }
 int main(int argc, char** argv) {
-    if (argc != 6) return Fail("NATIVE_ARGUMENTS");
+    if (argc != 6 && argc != 7) return Fail("NATIVE_ARGUMENTS");
+    if (argc == 7) {
+#if WORD
+        if (std::strcmp(argv[6], "0") != 0 && std::strcmp(argv[6], "1") != 0)
+            return Fail("NATIVE_PAUSE_ARGUMENT");
+#else
+        return Fail("NATIVE_PAUSE_WORD_ONLY");
+#endif
+    }
     Session original;
     if (LoadSessionFile(argv[1], &original@@LOAD_SCOPE@@) != ESP_OK) return Fail("NATIVE_SESSION_INVALID");
     std::vector<uint8_t> original_session;
@@ -123,6 +131,11 @@ int main(int argc, char** argv) {
     auto result = original;
     Replay(source, &expected);
     Replay(candidate, &result);
+    // Match the production load order: NVS/legacy pause wins after replay,
+    // including terminal replay. No argument preserves the prior behavior.
+    if (argc == 7) {
+        expected.paused = result.paused = argv[6][0] == '1';
+    }
     const auto bytes = SessionBytes(result);
     if (bytes.empty() || bytes != SessionBytes(expected)) return Fail("NATIVE_REPLAY_CHANGED_BY_ACK_PARTITION");
 #if WORD
@@ -140,6 +153,7 @@ int main(int argc, char** argv) {
     std::printf("{\"session_id\":\"%s\",\"mode\":%u,\"proposals\":%zu,\"matching_proposals\":%zu,",
         original.remote.session_id.c_str(), static_cast<unsigned>(original.remote.mode), ids.size(), matching);
     std::printf("\"source\":"); Counts(source); std::printf(",\"candidate\":"); Counts(candidate);
+    if (argc == 7) std::printf(",\"pause_overlay_applied\":true,\"checkpoint_paused\":%s", result.paused ? "true" : "false");
     std::printf(",\"checkpoint_next_sequence\":%llu,\"position\":%u,\"prefix_bytes\":%zu,"
         "\"replay_partition_invariant\":true,\"native_reload_verified\":true}\n",
         static_cast<unsigned long long>(result.remote.next_sequence), result.position, original_size);

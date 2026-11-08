@@ -83,6 +83,9 @@ def cases():
         for hz in (100, 1000):
             result.append(Case(f'{name}-{hz}', model, 'runtime',
                                (f'test_{name}.py', '--tick-hz', str(hz))))
+    for part in ('facts', 'candidate'):
+        result.append(Case(f'outbox_nvs_plan_{part}', 'R-08: source-bound NVS facts, pause precedence and complete native/CLI plan verification', 'runtime',
+                           ('test_outbox_nvs_plan.py', '--part', part)))
     for name in ('word', 'note', 'problem', 'home', 'todo', 'settings', 'navigation', 'agent', 'display_submit', 'stack_gate'):
         result.append(Case(f'ui-{name}', f'R-21: UI {name} production behavior/gate fixtures', 'ui', (f'test_ui_{name}.py',)))
     result.append(Case('mount-guard-forget-mount-proof', 'R-18: an invalid-state error alone cannot prove storage is mounted', 'controls',
@@ -153,6 +156,10 @@ def cases():
         result.append(Case(f'nvs-pause-{mutation}', 'R-08: neither pause layer may swallow NVS errors or bypass unready scope', 'controls',
                            ('test_nvs_pause_pipeline.py', '--mutation', mutation), r'^FAIL typed-nvs:',
                            r'NVS pause pipeline total: 154 checks, [1-9]\d* failures \(actual SDK/readers/loader; healthy journal ports; NOT HIL\)'))
+    for mutation in ('skip-replay', 'ignore-source-binding', 'drop-false', 'drop-native-overlay', 'drop-verify-context', 'ignore-output-boundary', 'pause-before-replay'):
+        result.append(Case(f'nvs-plan-{mutation}', 'R-08: original-image replay, exact source binding, false/terminal pause and input isolation cannot be bypassed', 'controls',
+                           ('test_outbox_nvs_plan.py', '--mutation', mutation), r'^FAIL nvs-plan:',
+                           r'NVS plan context: 1 scenarios, [1-9]\d* failures, 0 errors \(actual SDK/raw/native; NOT HIL\)'))
     for mutation in ('ignore-consent', 'ignore-size', 'skip-recheck'):
         result.append(Case(f'raw-flash-{mutation}', 'R-08: sensitive scope, physical size and source reread cannot be bypassed', 'controls',
                            ('test_raw_flash_evidence.py', '--mutation', mutation), r'^FAIL raw-flash:',

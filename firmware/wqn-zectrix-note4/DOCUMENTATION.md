@@ -152,7 +152,9 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/RAW_FLASH_OFFLINE_IMPORT_20261107.md` - pinned raw images,
   read-only SDK import, forensic/receipt bridge and unresolved repair context.
 - `docs/engineering/OFFLINE_NVS_CONTEXT_20261107.md` - pinned raw NVS context,
-  SDK read-only interpretation, ambiguity handling and remaining plan integration.
+  SDK read-only interpretation and ambiguity handling.
+- `docs/engineering/OFFLINE_NVS_PLAN_20261108.md` - source-bound NVS plan/native
+  candidate integration, pause precedence and remaining installation/HIL work.
 - `docs/engineering/NVS_TYPED_PRESENCE_20261107.md` - actual SDK typed lookup
   folding, runtime presence/type guards, legacy volume support and device acceptance.
 - `docs/engineering/PRESERVATION_BOOT_ENTRY_20261107.md` - pre-NVS manual boot

@@ -25,8 +25,9 @@
 
 `session_context()` 只把匹配当前 mode/SID 的 NVS 暂停值、相同的已提交 generation
 与一个已解码的保留会话关联。它不证明当前 pack admission、RAM scope ready 或来源
-身份。现有 review-plan/candidate CLI 尚未消费这个补充包，仍保留原来的 NVS/身份前提；
-后续接入必须重新验证包、原始镜像与 forensic pin，不能只把 JSON 值当可信输入。
+身份。[计划与原生候选入口](OFFLINE_NVS_PLAN_20261108.md) 现已接入这个补充包，
+每次重验包、原始镜像与 forensic pin，并覆盖重放后的暂停值；设备运行时复验、
+来源身份和安装/维修授权前提仍然保留。固定的旧离线工具包不随源码自动更新。
 
 ## 只读 SDK 适配
 

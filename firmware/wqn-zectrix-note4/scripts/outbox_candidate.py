@@ -19,6 +19,7 @@ import outbox_forensics as f
 
 ROOT = Path(__file__).resolve().parents[1]
 FORMAT = 'wqn-outbox-native-candidate-v1'
+NVS_FORMAT = 'wqn-outbox-native-candidate-v2'
 MAX_PACKAGE = 8 * 1024 * 1024
 
 
@@ -139,14 +140,19 @@ inline void heap_caps_free(void* p){std::free(p);}
             'generated_unit_sha256': f.sha256(unit.encode()),
             'scope_generation_check': 'not_attested; native file decode only'}
 
-    def run(self, session, journal, ids, job):
+    def run(self, session, journal, ids, job, pause_override=None):
         job.mkdir(mode=0o700)
         for name, raw in [('source-session', session), ('source-journal', journal),
                           ('request-ids', ('\n'.join(ids)+'\n').encode())]:
             f.write_private(job/name, raw)
         try:
-            done = subprocess.run([str(self.binary), str(job/'source-session'), str(job/'source-journal'),
-                str(job/'request-ids'), str(job/'candidate-session'), str(job/'candidate-journal')],
+            command = [str(self.binary), str(job/'source-session'), str(job/'source-journal'),
+                str(job/'request-ids'), str(job/'candidate-session'), str(job/'candidate-journal')]
+            if pause_override is not None:
+                if self.domain != 'word' or type(pause_override) is not bool:
+                    raise NativeError('NATIVE_PAUSE_OVERRIDE_INVALID')
+                command.append('1' if pause_override else '0')
+            done = subprocess.run(command,
                 capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as error:
             raise NativeError('NATIVE_VALIDATION_DID_NOT_COMPLETE') from error
@@ -163,12 +169,17 @@ inline void heap_caps_free(void* p){std::free(p);}
                 bounded(job/'candidate-journal', 4*1024*1024), report)
 
 
-def generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, output):
+def generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, output, *,
+             nvs_inputs=None, nvs_inputs_pin=None, sensitive_confirmed=False):
     api.check_pin(plan_pin)
     if plan_dir.is_symlink() or set(p.name for p in plan_dir.iterdir()) != {'plan.json'}:
         api.fail('PLAN_INCOMPLETE')
     saved, raw = api.read_json(plan_dir/'plan.json')
-    plan = api.review_plan(source, source_pin, evidence, evidence_pin)
+    options = {}
+    if nvs_inputs is not None or nvs_inputs_pin is not None or sensitive_confirmed:
+        options = dict(nvs_inputs=nvs_inputs, nvs_inputs_pin=nvs_inputs_pin, sensitive_confirmed=sensitive_confirmed)
+    plan = api.review_plan(source, source_pin, evidence, evidence_pin, **options,
+        **({'output': output} if options else {}))
     if f.sha256(raw) != plan_pin or saved != plan:
         api.fail('PLAN_DIFFERS_FROM_EVIDENCE')
     if any(output.resolve().is_relative_to(p.resolve()) for p in (source, evidence, plan_dir)):
@@ -210,13 +221,30 @@ def generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin
             final_journal = None
             for index, (name, ops) in enumerate(sorted(groups.items())):
                 session = pinned(name, checkpoint.MAX_PAYLOAD[domain]+16)
-                candidate, candidate_journal, proof = driver.run(session, journal, ids, temp/f'job-{index}')
+                observed = ops[0].get('nvs_session_context')
+                pause_override = None
+                if 'nvs_context' in plan:
+                    if not isinstance(observed, dict) or observed.get('usable') is not True or \
+                            type(observed.get('overlay_present')) is not bool or \
+                            any(op.get('nvs_session_context') != observed for op in ops):
+                        api.fail('NATIVE_NVS_SESSION_CONTEXT_MISMATCH')
+                    if observed['overlay_present']:
+                        if type(observed.get('paused')) is not bool:
+                            api.fail('NATIVE_NVS_PAUSE_INVALID')
+                        pause_override = observed['paused']
+                candidate, candidate_journal, proof = driver.run(session, journal, ids, temp/f'job-{index}',
+                    **({'pause_override': pause_override} if pause_override is not None else {}))
                 if not candidate_journal.startswith(journal) or \
                         len(candidate_journal) != len(journal)+len(ids)*f.LAYOUTS[domain].record.size or \
                         proof['matching_proposals'] != len(ops) or \
                         proof['session_id'] != ops[0]['session_id'] or not proof['native_reload_verified'] or \
                         not proof['replay_partition_invariant']:
                     api.fail('NATIVE_PROOF_BINDING_MISMATCH')
+                if pause_override is not None:
+                    decoded = checkpoint.decode_session(candidate, domain)
+                    if proof.get('pause_overlay_applied') is not True or proof.get('checkpoint_paused') is not pause_override or \
+                            decoded['native_error'] != 0 or decoded['value']['paused'] != int(pause_override):
+                        api.fail('NATIVE_NVS_PAUSE_NOT_PRESERVED')
                 if final_journal is not None and final_journal != candidate_journal:
                     api.fail('NATIVE_JOURNAL_DIFFERS_ACROSS_SESSIONS')
                 final_journal = candidate_journal
@@ -224,6 +252,8 @@ def generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin
                 write(candidate_name, candidate)
                 proofs.append({'source_session': name, 'source_session_sha256': f.sha256(session),
                     'candidate_session': candidate_name, 'request_ids': [op['request_id'] for op in ops], 'native': proof})
+                if 'nvs_context' in plan:
+                    proofs[-1]['nvs_session_context'] = observed
             write('journal.v1', final_journal)
             write('proof.json', api.encoded({'native_build': native_receipt, 'sessions': proofs,
                 'source_journal': plan['native_source'], 'source_journal_sha256': f.sha256(journal)}))
@@ -236,6 +266,8 @@ def generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin
         f.sync_directory(output)
         api.fail(str(error))
     api.source_manifest(source, source_pin)
+    if options and api.review_plan(source, source_pin, evidence, evidence_pin, **options) != plan:
+        api.fail('NVS_PLAN_CHANGED_DURING_NATIVE_EXECUTION')
     result = {'format': FORMAT, 'source_manifest_sha256': source_pin, 'evidence_manifest_sha256': evidence_pin,
         'plan_sha256': plan_pin, 'domain': domain, 'files': files,
         'scope': 'append ACK markers and checkpoint every proposed session using all native record groups',
@@ -243,12 +275,16 @@ def generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin
         'blocking_preconditions': [p for p in plan['blocking_preconditions'] if p != 'combined_native_candidate_not_validated'] +
             ['target_firmware_native_build_not_attested'],
         'installation_ready': False, 'repair_authorized': False, 'source_bytes_retained': True}
+    if 'nvs_context' in plan:
+        result['format'] = NVS_FORMAT
+        result['nvs_context'] = plan['nvs_context']
     pin = api.finish_output(output, 'manifest.json', result)
     return {'status': 'native_candidate_prepared', 'candidate_manifest_sha256': pin,
             'proposed_operations': len(proposals), 'installation_ready': False, 'repair_authorized': False}
 
 
-def verify(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, candidate, candidate_pin):
+def verify(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, candidate, candidate_pin, *,
+           nvs_inputs=None, nvs_inputs_pin=None, sensitive_confirmed=False):
     api.check_pin(candidate_pin)
     if candidate.is_symlink() or (candidate/'.incomplete').exists() or (candidate/'.incomplete').is_symlink():
         api.fail('NATIVE_CANDIDATE_INCOMPLETE')
@@ -257,7 +293,8 @@ def verify(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, 
         api.fail('NATIVE_CANDIDATE_DIGEST_MISMATCH')
     with tempfile.TemporaryDirectory(prefix='wqn-native-verify-') as temp:
         rebuilt = Path(temp)/'candidate'
-        generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, rebuilt)
+        generate(api, source, source_pin, evidence, evidence_pin, plan_dir, plan_pin, rebuilt,
+            nvs_inputs=nvs_inputs, nvs_inputs_pin=nvs_inputs_pin, sensitive_confirmed=sensitive_confirmed)
         wanted = {p.name for p in rebuilt.iterdir()}
         if {p.name for p in candidate.iterdir()} != wanted:
             api.fail('NATIVE_CANDIDATE_FILE_INVENTORY_MISMATCH')

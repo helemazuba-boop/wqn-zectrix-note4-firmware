@@ -182,8 +182,9 @@ def session_policy(s, domain):
 
 
 class Material:
-    def __init__(self, source, manifest):
+    def __init__(self, source, manifest, nvs_context=None):
         self.source, self.manifest, self.cache = source, manifest, {}
+        self.nvs_context = nvs_context
 
     def raw(self, name):
         if name not in self.cache:
@@ -222,6 +223,9 @@ class Material:
         result = {'state': 'held', 'scope': 'single_fact_against_retained_snapshot', 'session_attempts': attempts,
                   'unverified_context': (['word_nvs_pause_not_exported', 'committed_scope_generation_unverified',
                       'word_session_origin_and_current_pack_pins_unverified'] if word else ['current_pack_pins_unverified'])}
+        if self.nvs_context is not None:
+            result['unverified_context'] = ['word_pause_and_scope_not_bound_to_retained_session',
+                'word_session_origin_and_current_pack_pins_unverified', 'device_nvs_pause_and_scope_revalidation_required']
         def held(why):
             result['reason'] = why
             return result
@@ -234,7 +238,13 @@ class Material:
             return held('session_repair_policy_unproven')
         if word:
             cursor = stem + '.cur'
-            if cursor in self.manifest['files']:
+            if self.nvs_context is not None:
+                resolved = self.nvs_context.resolve(s, self, cursor)
+                result['nvs_session_context'] = resolved
+                if not resolved['usable']:
+                    return held(resolved['reason'])
+                result['unverified_context'].remove('word_pause_and_scope_not_bound_to_retained_session')
+            elif cursor in self.manifest['files']:
                 result['legacy_cursor'] = {**self.reference(cursor),
                     **decode_cursor(self.raw(cursor), s['session_id']), 'authoritative_nvs': False}
             descriptor_stem = 'wl' + s['session_id'].replace('-', '')[:24]
@@ -254,6 +264,13 @@ class Material:
             return held('note_next_sequence_inconsistent')
         result['before'] = {k: s[k] for k in (('position', 'phase', 'next_sequence', 'paused', 'active')
                                              if word else ('position', 'next_sequence', 'paused', 'active'))}
+        def complete():
+            observed = result.get('nvs_session_context')
+            if observed is not None and observed['overlay_present']:
+                # Match LoadSessionTransaction: authoritative pause is overlaid
+                # AFTER replay, even when terminal replay changed paused.
+                result['candidate']['paused'] = int(observed['paused'])
+            return result
         pin_update = None
         if not word and row['action'] == 0:
             item = next((item for item in s['items'] if item['item_id'] == row['item_id']), None)
@@ -265,7 +282,7 @@ class Material:
             if pin_update:
                 result['state'] = 'requires_last_opened_pin_checkpoint'
                 result['candidate']['last_opened_pin_update'] = pin_update
-            return result
+            return complete()
         if not any(item['item_id'] == row['item_id'] for item in s['items']):
             return held('observation_item_not_in_candidate_window')
         target = checkpoint['next_position']
@@ -285,7 +302,7 @@ class Material:
             candidate['last_opened_pin_update'] = pin_update
         if word:
             candidate['phase'] = checkpoint['next_phase']
-            if s['mode'] == 0 and position == len(s['items']) and not s['has_more']:
+            if s['mode'] in (0, 5) and position == len(s['items']) and not s['has_more']:
                 candidate.update(active=0, paused=0)
         result.update(state='structurally_replayable', candidate=candidate)
-        return result
+        return complete()
