@@ -27,6 +27,16 @@ class Case:
 
 def cases():
     result = []
+    for name in ('learning_time', 'word_session_start', 'rtc_timekeep', 'time_retention'):
+        result.append(Case(name, 'R-11: calibrated-time admission, provenance/epoch, existing fact preservation and RTC/timer producers',
+                           'runtime', (f'test_{name}.py',)))
+    for mutation in ('allow-build', 'skip-input', 'skip-epoch', 'fabricate-timestamp', 'hold-old-buffer', 'skip-note-start'):
+        result.append(Case(f'learning-time-{mutation}', 'R-11: reject approximate time, missing admission, mixed epochs, fake timestamps and held accepted facts',
+                           'controls', ('test_learning_time.py', '--mutation', mutation), r'^FAIL learning-time:',
+                           r'Learning time: \d+ checks, [1-9]\d* failures \(production clock/input admission/pumps; host ports; NOT HIL\)'))
+    result.append(Case('word-session-clock-bypass', 'R-11: automatic offline continuation cannot bypass time admission', 'controls',
+                       ('test_word_session_start.py', '--mutation', 'skip-clock-gate'), r'^FAIL: uncalibrated clock',
+                       r'\d+ PASS / [1-9]\d* FAIL \(production start/chain/batch/pump, host cloud/card/I/O seams; NOT HIL\)'))
     for name, model, args in (
         ('word_offline_dispatch', 'Offline words: cached controls do not acquire radio demand', ()),
         ('protocol_request_oom', 'R-28/N-03/N-05: allocation failure and pinned wire contracts', ('--validate-schema',)),

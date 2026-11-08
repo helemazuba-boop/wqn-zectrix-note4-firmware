@@ -11,6 +11,7 @@
 #include "ui/persist_worker.h"
 #include "provision_manager.h"
 #include "stdpro_ws_transport.h"
+#include "runtime/wall_clock.h"
 
 namespace {
 
@@ -451,6 +452,20 @@ void HandleUiInput(UiState* state, UiInput input)
 {
     if (state == nullptr) {
         return;
+    }
+    // Gate every learning input before reducers can open/advance a card,
+    // arm an observation, or consume a cached offline session. Navigation
+    // and leaving/pausing remain available; accepted records may still flush.
+    if ((state->screen == UiScreen::kWord || state->screen == UiScreen::kNote) &&
+        (input == UiInput::kUp || input == UiInput::kDown || input == UiInput::kConfirm)) {
+        std::string& message = state->screen == UiScreen::kWord
+            ? state->word_app.message
+            : (state->problem_app.active ? state->problem_app.message : state->note_app.message);
+        if (!runtime::IsLearningTimeReady()) {
+            message = "请先联网校正时间";
+            return;
+        }
+        if (message == "请先联网校正时间") message.clear();
     }
     ClampUiSelection(state);
     const wqn::UiScreen screen_before = state->screen;

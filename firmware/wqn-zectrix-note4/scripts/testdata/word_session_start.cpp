@@ -5,6 +5,12 @@
 #include <utility>
 #include <vector>
 #include "device_protocol/word_study.h"
+// Calibrated-time port; provenance and epoch handling use the real clock in
+// test_learning_time.py. This fixture tests the actual session-start pump.
+namespace wqn::runtime {
+bool learning_ready=true;
+bool IsLearningTimeReady(){return learning_ready;}
+}
 constexpr int ESP_OK=0,ESP_FAIL=1,ESP_ERR_INVALID_STATE=2,ESP_ERR_NOT_FOUND=3;
 constexpr const char* kTag="fixture";
 void Log(const char*,const char*,...) {}
@@ -125,6 +131,7 @@ using Mode=protocol::word_study_v1::Mode;
 int passes=0,failures=0;
 void Check(bool okay,const char* name){std::printf("%s: %s\n",okay?"PASS":"FAIL",name);okay?++passes:++failures;}
 UiRuntime Initial(){
+    wqn::runtime::learning_ready=true;
     cloud_busy=persist_busy=false;queue_allowed=true;attempts=0;queued.clear();metadata_count=0;card_reads=saves=0;
     UiRuntime runtime;
     auto& word=runtime.state_.word_app;
@@ -142,6 +149,10 @@ int main(){
     Check(!stale_review.queue_unavailable,"a refreshed online review clears the old offline-queue marker");
     auto runtime=Initial();auto* word=&runtime.state_.word_app;
     EmptyIntake(&runtime);
+    wqn::runtime::learning_ready=false;PumpWordSessionStart(&runtime);
+    Check(queued.empty() && metadata_count==0 && word->session.start_requested &&
+        !word->session.start_result_expected,"uncalibrated clock holds automatic offline continuation without consuming it");
+    wqn::runtime::learning_ready=true;
     Check(word->session.start_requested && word->session.requested_mode==Mode::kSequential &&
         word->mode==WordAppMode::kSessionStarting,"empty intake arms the sequential continuation");
     cloud_busy=true;PumpWordSessionStart(&runtime);

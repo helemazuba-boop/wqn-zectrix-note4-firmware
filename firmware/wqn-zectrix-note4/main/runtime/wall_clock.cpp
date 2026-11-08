@@ -1,6 +1,7 @@
 #include "runtime/wall_clock.h"
 
 #include <atomic>
+#include <ctime>
 
 #include "esp_timer.h"
 
@@ -36,6 +37,15 @@ WallClockSnapshot GetWallClockSnapshot()
 void NoteBuildTimeApplied()
 {
     PublishNewEpoch(WallClockSource::kBuildTime);
+}
+
+bool IsLearningTimeReady()
+{
+    const auto before = GetWallClockSnapshot();
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const auto after = GetWallClockSnapshot();
+    return IsCalibratedLearningTime(before, now) &&
+        after.network_calibrated() && after.epoch == before.epoch;
 }
 
 void NoteSntpTimeSynchronized(int64_t unix_seconds, int64_t applied_unix_seconds)

@@ -76,6 +76,7 @@ public:
     uint64_t revision() const { return state_.revision; }
 
     UiUpdate DispatchButton(const wqn::ButtonEvent& event, int64_t event_time_ms);
+    UiUpdate DispatchLearningTimeRequired();
     UiUpdate DispatchTodoCloudResult(const TodoCloudResult& result);
     UiUpdate DispatchWordCloudResult(WordCloudResult& result);
     UiUpdate DispatchNoteCloudResult(NoteCloudResult& result);

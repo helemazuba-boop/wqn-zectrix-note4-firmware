@@ -5,6 +5,7 @@
 #include "ui_runtime.h"
 #include "persist_worker.h"
 #include "word_app.h"
+#include "runtime/wall_clock.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -54,18 +55,23 @@ RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
     RefreshSchedule refresh = RefreshSchedule::kNone;
     const int64_t now_ms = esp_timer_get_time() / 1000;
     if (runtime->state().word_app.session.observation_effect_ready) {
-        // The RAM buffer needs its own lease BEFORE acceptance; the worker's
-        // lease only covers an individual flush. This prevents normal sleep
-        // or power-off from quiescing over unpersisted events.
-        if (!g_word_buffer_sleep_lease) {
-            g_word_buffer_sleep_lease = wqn::runtime::SleepLease::TryAcquire(
-                wqn::runtime::SleepBlocker::kStorage, "word-RAM-buffer", __FILE__, __LINE__);
-            if (!g_word_buffer_sleep_lease) return refresh;
+        const std::string occurred_at = CurrentIsoTimestamp();
+        if (occurred_at.empty()) {
+            refresh = runtime->DispatchLearningTimeRequired().refresh;
+        } else {
+            // Accepted RAM facts still flush below while new facts are held.
+            // Acquire the buffer's lease BEFORE acceptance. The worker lease
+            // covers only its flush and cannot protect an unpersisted RAM tail
+            // from normal sleep or power-off.
+            if (!g_word_buffer_sleep_lease) {
+                g_word_buffer_sleep_lease = wqn::runtime::SleepLease::TryAcquire(
+                    wqn::runtime::SleepBlocker::kStorage, "word-RAM-buffer", __FILE__, __LINE__);
+                if (!g_word_buffer_sleep_lease) return refresh;
+            }
+            const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+            refresh = runtime->DispatchWordObservationBuffered(
+                metadata.request_id, occurred_at, now_ms).refresh;
         }
-        const auto metadata = wqn::services::MakeDeviceRequestMetadata();
-        std::string occurred_at = CurrentIsoTimestamp();
-        if (occurred_at.empty()) occurred_at = "2024-01-01T00:00:00Z";
-        refresh = runtime->DispatchWordObservationBuffered(metadata.request_id, occurred_at, now_ms).refresh;
     }
     const auto& session = runtime->state().word_app.session;
     if (session.buffered_observations.empty()) {
@@ -341,6 +347,7 @@ void PumpWordSessionStart(UiRuntime* runtime)
         QueueWordCloudRequest(clear);
         return;
     }
+    if (!wqn::runtime::IsLearningTimeReady()) return;
     if (runtime->state().screen != wqn::UiScreen::kWord ||
         (!pending.session.start_requested && !pending.chain.segment_finished && !pending.shuffle_chain.segment_finished)) return;
     if (!pending.chain.segment_finished && !pending.shuffle_chain.segment_finished &&

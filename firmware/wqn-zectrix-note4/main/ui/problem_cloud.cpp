@@ -171,15 +171,13 @@ RefreshSchedule PumpProblemVerdictCommit(UiRuntime* runtime)
     if (!runtime->state().problem_app.verdict_effect_ready) {
         return RefreshSchedule::kNone;
     }
+    const std::string occurred_at = CurrentIsoTimestamp();
+    if (occurred_at.empty()) return runtime->DispatchLearningTimeRequired().refresh;
     PersistTicket ticket = TryReservePersist(PersistKind::kProblemVerdict);
     if (!ticket.valid()) {
         return RefreshSchedule::kNone;
     }
     const auto metadata = wqn::services::MakeDeviceRequestMetadata();
-    std::string occurred_at = CurrentIsoTimestamp();
-    if (occurred_at.empty()) {
-        occurred_at = "2024-01-01T00:00:00Z";
-    }
     wqn::DurableProblemObservation observation;
     if (!runtime->TakeProblemVerdictEffect(
             metadata.request_id, occurred_at, ticket.operation_id, &observation)) {

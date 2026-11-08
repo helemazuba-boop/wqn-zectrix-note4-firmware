@@ -25,11 +25,16 @@ def main():
     parser.add_argument('--loop', type=Path, default=root / 'main/device_ui.cpp')
     parser.add_argument('--input', type=Path, default=root / 'main/ui/ui_input.cpp')
     parser.add_argument('--runtime', type=Path, default=root / 'main/ui/ui_runtime.cpp')
+    parser.add_argument('--mutation', choices=('skip-clock-gate',))
     args = parser.parse_args()
     source = args.source.read_text(encoding='utf-8')
     header = (root / 'main/word_app.h').read_text(encoding='utf-8')
     store = (root / 'main/word_study_store.h').read_text(encoding='utf-8')
     cloud = args.cloud.read_text(encoding='utf-8')
+    if args.mutation:
+        old='    if (!wqn::runtime::IsLearningTimeReady()) return;'
+        assert cloud.count(old)==1
+        cloud=cloud.replace(old,'    // removed session clock admission')
     loop = args.loop.read_text(encoding='utf-8')
     inputs = args.input.read_text(encoding='utf-8')
     runtime = args.runtime.read_text(encoding='utf-8')

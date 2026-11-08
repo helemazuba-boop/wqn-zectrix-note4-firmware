@@ -5,6 +5,7 @@
 #include "ui_internal.h"
 #include "ui_runtime.h"
 #include "persist_worker.h"
+#include "runtime/wall_clock.h"
 
 #include <atomic>
 #include <cstdio>
@@ -102,7 +103,8 @@ bool QueueNotePackSync()
 bool QueueNoteSessionStart(
     const wqn::protocol::note_study_v1::CreateSessionRequest& session)
 {
-    if (session.metadata.request_id.empty() || session.scope.notebook_ids.empty()) {
+    if (!wqn::runtime::IsLearningTimeReady() ||
+        session.metadata.request_id.empty() || session.scope.notebook_ids.empty()) {
         return false;
     }
     NoteCloudRequest request;
@@ -243,15 +245,13 @@ RefreshSchedule PumpNoteObservationCommit(UiRuntime* runtime)
     if (!runtime->state().note_app.session.observation_effect_ready) {
         return RefreshSchedule::kNone;
     }
+    const std::string occurred_at = CurrentIsoTimestamp();
+    if (occurred_at.empty()) return runtime->DispatchLearningTimeRequired().refresh;
     PersistTicket ticket = TryReservePersist(PersistKind::kNoteObservation);
     if (!ticket.valid()) {
         return RefreshSchedule::kNone;
     }
     const auto metadata = wqn::services::MakeDeviceRequestMetadata();
-    std::string occurred_at = CurrentIsoTimestamp();
-    if (occurred_at.empty()) {
-        occurred_at = "2024-01-01T00:00:00Z";
-    }
     wqn::DurableNoteObservation observation;
     wqn::PersistedNoteSession advanced;
     if (!runtime->TakeNoteObservationEffect(

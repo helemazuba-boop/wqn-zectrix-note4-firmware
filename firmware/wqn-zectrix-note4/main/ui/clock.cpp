@@ -7,6 +7,7 @@
 #include <ctime>
 
 #include "power/rtc_timekeep.h"
+#include "runtime/wall_clock.h"
 
 namespace device_ui_internal {
 
@@ -24,6 +25,7 @@ void SeedClockFromBuildTimeIfNeeded()
 
 std::string CurrentDateLabel()
 {
+    if (!wqn::runtime::IsLearningTimeReady()) return "时间未校正";
     const std::time_t now = CurrentUnixTime();
     if (now < kMinReasonableUnixTime) {
         return "--月--日";
@@ -47,6 +49,7 @@ std::string CurrentDateLabel()
 
 std::string CurrentClockLabel()
 {
+    if (!wqn::runtime::IsLearningTimeReady()) return "--:--";
     const std::time_t now = CurrentUnixTime();
     if (now < kMinReasonableUnixTime) {
         return "--:--";
@@ -63,17 +66,20 @@ std::string CurrentClockLabel()
 
 std::string CurrentIsoTimestamp()
 {
+    const auto clock = wqn::runtime::GetWallClockSnapshot();
     const std::time_t now = CurrentUnixTime();
-    if (now < kMinReasonableUnixTime) {
+    if (!wqn::runtime::IsCalibratedLearningTime(clock, now)) {
         return "";
     }
 
     std::tm time_info = {};
-    gmtime_r(&now, &time_info);
+    if (gmtime_r(&now, &time_info) == nullptr) return "";
     char buffer[24] = {};
     if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &time_info) == 0) {
         return "";
     }
+    const auto after = wqn::runtime::GetWallClockSnapshot();
+    if (!after.network_calibrated() || after.epoch != clock.epoch) return "";
     return buffer;
 }
 

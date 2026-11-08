@@ -149,6 +149,23 @@ void UiRuntime::Initialize(wqn::AppState&& initial_state)
     FinishEvent(AppEventKind::kBootstrap, RefreshSchedule::kImmediate, true);
 }
 
+UiUpdate UiRuntime::DispatchLearningTimeRequired()
+{
+    constexpr const char* message = "请先联网校正时间";
+    bool changed = false;
+    const auto notify = [&](std::string& target) {
+        changed = target != message || changed;
+        target = message;
+    };
+    if (state_.word_app.session.observation_effect_ready) notify(state_.word_app.message);
+    if (state_.note_app.session.observation_effect_ready) notify(state_.note_app.message);
+    if (state_.problem_app.verdict_effect_ready) notify(state_.problem_app.message);
+    const bool visible = state_.screen == wqn::UiScreen::kWord ||
+        state_.screen == wqn::UiScreen::kNote;
+    return FinishEvent(AppEventKind::kStatusReload,
+        changed && visible ? RefreshSchedule::kSelection : RefreshSchedule::kNone, changed);
+}
+
 UiUpdate UiRuntime::DispatchButton(
     const wqn::ButtonEvent& event,
     int64_t event_time_ms)
