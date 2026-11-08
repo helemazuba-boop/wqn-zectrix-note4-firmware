@@ -39,10 +39,16 @@
 固件 WSL 工作树使用其自己的 `build-wsl`；加载 ESP-IDF 5.5.x 后，显式选择 profile 和验证版本：
 
 ```sh
-WQN_RELEASE_VERSION=val-20261107.1 idf.py -B build-wsl -DWQN_BUILD_PROFILE=ai-local build
+WQN_RELEASE_VERSION=val-20261107.1 idf.py -B build-wsl -DWQN_BUILD_PROFILE=ai-local reconfigure build
 python3 scripts/check_firmware_profile.py --config build-wsl/config/sdkconfig.json --profile ai-local
-python3 scripts/run_robustness_gate.py --output-dir /tmp/note4-validation-results
+python3 -m venv /tmp/note4-validation-python
+/tmp/note4-validation-python/bin/python -m pip install -r scripts/robustness-requirements.txt
+/tmp/note4-validation-python/bin/python scripts/run_robustness_gate.py --output-dir /tmp/note4-validation-results
 ```
+
+切换 `WQN_RELEASE_VERSION` 时必须显式 `reconfigure`；环境变量变化本身不会保证增量构建重新运行 CMake。
+构建结束后读回 `project_description.json` 和应用镜像内的版本、Git 身份及 ELF 摘要，不能仅凭构建成功认定版本已切换。
+主机门禁使用隔离 Python 环境中的固定依赖，包括日期格式校验器；依赖缺失应先修复环境，再完整执行门禁。
 
 实际工作应先准备可追溯且私有的 sdkconfig，不输出配置中的凭证。不从另一个 build 目录复制
 应用镜像冒充当前源码构建；先核对 project path、版本、ELF 和每个包文件摘要。
