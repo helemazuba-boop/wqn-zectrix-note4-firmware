@@ -27,6 +27,7 @@ import outbox_checkpoint as checkpoint
 
 FORMAT = 'wqn-outbox-reconciliation-evidence-v1'
 PLAN_FORMAT = 'wqn-outbox-repair-review-v2'
+PLAN_NVS_FORMAT = 'wqn-outbox-repair-review-v3'
 CONTRACT = 'outbox-reconciliation-v1'
 SCHEMA_SHA = '8d8f8f8ed86f94eb8cca0999be0a0e97b2ea727f72c496f61e6a5bf3bbe83d69'
 ENDPOINT_PATH = '/api/esp32/v3/study/observations/receipts'
@@ -479,8 +480,19 @@ def verify(source, source_pin, evidence, evidence_pin):
     return original, rows, assessment, manifest
 
 
-def review_plan(source, source_pin, evidence, evidence_pin):
+def review_plan(source, source_pin, evidence, evidence_pin, *, nvs_inputs=None,
+                nvs_inputs_pin=None, sensitive_confirmed=False, output=None):
     original, rows, assessment, manifest = verify(source, source_pin, evidence, evidence_pin)
+    nvs = None
+    if nvs_inputs is not None or nvs_inputs_pin is not None or sensitive_confirmed:
+        if nvs_inputs is None or nvs_inputs_pin is None:
+            fail('NVS_INPUTS_PAIR_REQUIRED')
+        import outbox_nvs_context
+        try:
+            nvs = outbox_nvs_context.VerifiedContext(nvs_inputs, nvs_inputs_pin, source_pin,
+                original['domain'], sensitive_confirmed, output)
+        except outbox_nvs_context.ContextError as error:
+            fail(str(error))
     selected, blockers = None, ['device_source_identity_not_attested', 'maintenance_revalidation_required',
         'checkpoint_runtime_context_not_attested', 'combined_native_candidate_not_validated',
         'controlled_publication_not_implemented',
@@ -516,7 +528,7 @@ def review_plan(source, source_pin, evidence, evidence_pin):
             local[key].discard('pending')
             local[key].add('suspended' if row['kind'] == 'suspend' else 'acknowledged')
     decisions, operations, checkpoint_checks = [], [], []
-    material = checkpoint.Material(source, original)
+    material = checkpoint.Material(source, original, nvs)
     for row, item in zip(rows, assessment['records']):
         action = 'retain_raw_evidence'
         if row.get('kind') == 'observation' and row.get('identity_usable_for_lookup'):
@@ -549,6 +561,8 @@ def review_plan(source, source_pin, evidence, evidence_pin):
                         'requires': ['maintenance_identity_check', 'fresh_receipt_revalidation',
                                      'native_candidate_validation', 'durable_checkpoint', 'explicit_repair_authorization',
                                      *check['unverified_context']]})
+                    if nvs is not None:
+                        operations[-1]['nvs_session_context'] = check['nvs_session_context']
             else:
                 action = 'hold_pending_'+item['state']
         decisions.append({'file': row['file'], 'offset': row['offset'], 'action': action})
@@ -564,8 +578,13 @@ def review_plan(source, source_pin, evidence, evidence_pin):
                 blockers.append(reason)
     # Material is read again after the initial receipt verification; retain
     # the independent source pin across these extra file reads as well.
+    if nvs is not None:
+        try:
+            nvs.reverify()
+        except outbox_nvs_context.ContextError as error:
+            fail(str(error))
     source_manifest(source, source_pin)
-    return {'format': PLAN_FORMAT, 'source_manifest_sha256': source_pin,
+    plan = {'format': PLAN_FORMAT, 'source_manifest_sha256': source_pin,
         'evidence_manifest_sha256': evidence_pin, 'expected_actor': manifest['expected_actor'],
         'native_source': selected, 'proposed_operations': operations, 'decisions': decisions,
         'local_checkpoint_checks': checkpoint_checks,
@@ -574,6 +593,10 @@ def review_plan(source, source_pin, evidence, evidence_pin):
             ('session', 'cursor', 'local-session-descriptor', 'opaque-word-descriptor')},
         'blocking_preconditions': blockers, 'installation_ready': False, 'repair_authorized': False,
         'source_bytes_retained': True}
+    if nvs is not None:
+        plan['format'] = PLAN_NVS_FORMAT
+        plan['nvs_context'] = nvs.summary()
+    return plan
 
 
 def main():
@@ -601,8 +624,15 @@ def main():
         if command == 'verify-candidate':
             item.add_argument('--candidate', type=Path, required=True)
             item.add_argument('--candidate-manifest-sha256', required=True)
+        if command in ('plan', 'verify-plan', 'candidate', 'verify-candidate'):
+            item.add_argument('--nvs-context-inputs', type=Path)
+            item.add_argument('--nvs-context-inputs-sha256')
+            item.add_argument('--sensitive-main-flash', action='store_true')
     args = parser.parse_args()
     try:
+        nvs_options = dict(nvs_inputs=getattr(args, 'nvs_context_inputs', None),
+            nvs_inputs_pin=getattr(args, 'nvs_context_inputs_sha256', None),
+            sensitive_confirmed=getattr(args, 'sensitive_main_flash', False))
         if args.command == 'collect':
             result = collect(args.source_bundle, args.source_manifest_sha256, args.output, args.endpoint,
                 args.device_token_file, {'user_id': args.expected_user_id, 'device_id': args.expected_device_id},
@@ -616,11 +646,12 @@ def main():
             common = (sys.modules[__name__], args.source_bundle, args.source_manifest_sha256,
                 args.evidence, args.evidence_manifest_sha256, args.plan, args.plan_sha256)
             if args.command == 'candidate':
-                result = native_candidate.generate(*common, args.output)
+                result = native_candidate.generate(*common, args.output, **nvs_options)
             else:
-                result = native_candidate.verify(*common, args.candidate, args.candidate_manifest_sha256)
+                result = native_candidate.verify(*common, args.candidate, args.candidate_manifest_sha256, **nvs_options)
         else:
-            plan = review_plan(args.source_bundle, args.source_manifest_sha256, args.evidence, args.evidence_manifest_sha256)
+            plan = review_plan(args.source_bundle, args.source_manifest_sha256, args.evidence, args.evidence_manifest_sha256,
+                **nvs_options, output=args.output if args.command == 'plan' else None)
             if args.command == 'plan':
                 if args.output.resolve().is_relative_to(args.source_bundle.resolve()) or \
                         args.output.resolve().is_relative_to(args.evidence.resolve()):
