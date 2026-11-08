@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from unittest.mock import patch
 
 from capture_recovery_evidence import ProcessLines
@@ -72,6 +73,10 @@ class FaultLines(ProcessLines):
     def read_line(self, timeout):
         line = super().read_line(timeout)
         if not line: return line
+        if self.fault == 'nul-final' and line.startswith(b'WQNT1 D '):
+            fields = line.split()
+            if len(fields) == 7 and base64.b64decode(fields[6], validate=True)[4] == 5:
+                time.sleep(0.4)  # Host finalization latency precedes the bad C line.
         if self.fault == 'lose-finish' and line.startswith(b'WQNT1 F '): return b''
         if self.fault in ('corrupt', 'drop-data') and not self.changed and line.startswith(b'WQNT1 D ') and line.split()[3] == b'00000002':
             self.changed = True
@@ -120,8 +125,8 @@ def main():
             ('drop-data', 'normal', 'drop-data'), ('wrong-ack', 'timeout-ack', 'wrong-ack'),
             ('no-ack', 'timeout-ack', 'drop-all-acks'), ('wrong-ready', 'no-ready', 'wrong-ready'),
             ('no-ready', 'no-ready', 'drop-all-acks'), ('cancel-peer', 'normal', 'peer-cancel'),
-            ('nul-ready', 'no-ready', 'nul-ready'), ('nul-ack', 'timeout-ack', 'nul-ack'),
-            ('nul-final', 'timeout-ack', 'nul-final'),
+            ('nul-ready', 'nul-ready', 'nul-ready'), ('nul-ack', 'nul-ack', 'nul-ack'),
+            ('nul-final', 'nul-final', 'nul-final'),
             ('nul-ready-retry', 'normal', 'nul-ready-once'), ('nul-ack-retry', 'normal', 'nul-ack-once'),
             ('late-fail', 'late-fail', ''), ('lose-finish', 'normal', 'lose-finish'),
             ('source-error', 'source-error', ''), ('open-error', 'open-error', ''),
@@ -155,6 +160,9 @@ def main():
             check(state['ack'] == committed and state['leaks'] == 0, name+' commit/heap')
             if committed or name == 'nul-final':
                 check(answer is not None and answer['source_complete'] == (name != 'source-error'), name+' host durable result')
+                if answer is None:
+                    print('DETAIL transfer: '+name+' '+json.dumps(state, sort_keys=True)+' '+repr(error), flush=True)
+                    continue  # Keep this failure and complete the other scenarios.
                 if name == 'logical-success':
                     receipt = logical.verify_bundle(session.evidence, answer['manifest_sha256'])
                     check((session.evidence/'wire.bin').read_bytes() == logical_wire.read_bytes(), 'logical transcript exact')

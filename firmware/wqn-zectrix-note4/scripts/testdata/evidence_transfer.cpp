@@ -18,9 +18,13 @@ unsigned reads=0, opens=0, allocations=0, progress_bytes=0, yields=0;
 size_t flash_size=32769;
 std::string logical_wire;
 bool owner=true;
+// Owner-thread-only clock fault: expire after a complete bad control line
+// when parsing has not resumed output, instead of racing host fsync latency.
+int64_t control_clock_offset=0;
+bool control_has_nul=false, bad_control_complete=false, output_after_bad_control=false;
 void Destination(const void*) {}
 int64_t esp_timer_get_time() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() * (mode=="final-retry" ? 50 : 1);
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() * (mode=="final-retry" ? 50 : 1) + control_clock_offset;
 }
 void vTaskDelay(unsigned) { ++yields; std::this_thread::yield(); }
 void* heap_caps_malloc(size_t size, unsigned flags) {
@@ -55,18 +59,32 @@ namespace wqn::recovery_usb {
 esp_err_t Reserve() { ++opens; return mode=="open-error" ? ESP_FAIL : ESP_OK; }
 int Write(const uint8_t* data, size_t size, uint32_t ms) {
     if (ms>50) std::abort();
+    if (bad_control_complete && size>=8 &&
+        (std::memcmp(data,"WQNT1 D ",8)==0 || std::memcmp(data,"WQNT1 F ",8)==0))
+        output_after_bad_control=true;
     if (mode=="zero-write") return 0;
     if (mode=="write-error") return -1;
     if (mode=="late-fail" && size>=8 && std::memcmp(data,"WQNT1 F",7)==0) return -1;
     return ::write(1,data,std::min<size_t>(size,mode=="partial" ? 7 : 128));
 }
 int Read(uint8_t* data, size_t size, uint32_t ms) {
+    if (mode.rfind("nul-",0)==0 && bad_control_complete && !output_after_bad_control) {
+        control_clock_offset=30000000;
+        return 0;
+    }
     fd_set set; FD_ZERO(&set); FD_SET(0,&set);
     timeval time{0,static_cast<long>(ms*1000)};
     const int selected=select(1,&set,nullptr,nullptr,&time);
     if (selected<0) return -1;
     if (selected==0) return 0;
     const int count=::read(0,data,std::min<size_t>(size,13));
+    for (int i=0;i<count;++i) {
+        if (data[i]==0) control_has_nul=true;
+        if (data[i]=='\n') {
+            if (control_has_nul) { bad_control_complete=true; output_after_bad_control=false; }
+            control_has_nul=false;
+        }
+    }
     return count==0 ? -1 : count;
 }
 }
