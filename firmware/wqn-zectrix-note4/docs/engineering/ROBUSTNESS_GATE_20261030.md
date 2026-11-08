@@ -18,8 +18,8 @@ git -c core.whitespace=cr-at-eol diff --check
 
 [`run_robustness_gate.py`](../../scripts/run_robustness_gate.py) 的 `--list` 输出命令与
 故障模型映射，可用 `--group runtime|ui|controls` 运行受影响分组。完整门禁共
-151 个执行项：54 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
-87 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
+160 个执行项：56 个运行时回归、10 个 UI 检查（9 个功能脚本、1 个静态栈门禁自测）、
+94 个选定的语义变异。R-21 初始清单为 44 项；R-04 复核、R-25 修复各增加
 1 个运行时入口与 4 个负例；R-18 增加 schema、两种 tick 频率恢复链路和 3 个负例。
 R-18 另补充实际 SPIFFS 挂载证明的生产入口回归与语义负例；invalid-state 本身不能当作已挂载。
 参见 [挂载判定及未挂载导出依赖](STORAGE_MOUNT_GUARD_20261107.md)。
@@ -40,6 +40,9 @@ deck-scope 入口再增加四个负例，保护 generation 不截断、异常标
 离线 NVS 计划接入另增加两个入口与七个负例，验证同源绑定、原文重验、false
 暂停、候选/复验参数、输入隔离和终止重放顺序；详见
 [NVS 计划与原生候选](OFFLINE_NVS_PLAN_20261108.md)。
+R-09 再增加 Problem 实际 SDK codec/CRC 与查询缓存两个入口、六个保全负对照及
+一个 Problem 导出遗漏负对照，保护原文、副本容量、ACK 路径、同步与发布前复验；
+详见 [Problem 原文保全](PROBLEM_OUTBOX_PRESERVATION_20261108.md)。
 
 清单数量不是一次执行结果。每批记录本次新跑与按源码未变继承的证据，交付新的
 实机候选前再运行整套门禁；不得把继承结果称为一次完整新跑。

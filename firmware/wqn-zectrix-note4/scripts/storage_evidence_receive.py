@@ -23,6 +23,10 @@ HEADER = struct.Struct('<4sBHI')
 ENTITY = struct.Struct('<HBBBiQB')
 FINISH = struct.Struct('<HQi32sBB')
 FIXED = set(forensic.source_names('word')) | set(forensic.source_names('note'))
+PROBLEM_FIXED = {'po_outbox.jsonl', 'po_outbox.tmp', 'po_outbox.bak',
+                 'po_rejected.jsonl', 'po_parked.jsonl'} | {
+    f'po_outbox.jsonl.raw{slot}{suffix}' for slot in range(4) for suffix in ('', '.tmp')}
+SELECTED_FIXED = FIXED | PROBLEM_FIXED
 KEYS = {'cur_seq', 'cur_rnd', 'cur_dic', 'cur_rev', 'cur_int', 'cur_shf',
         'cur_mis', 'word_deck_gen', 'word_deck_chg', 'word_deck', 'word_seq_idx'}
 SCALAR_BYTES = {1: 1, 17: 1, 2: 2, 18: 2, 4: 4, 20: 4, 8: 8, 24: 8}
@@ -44,7 +48,7 @@ def pin(text, count):
 
 
 def selected(name):
-    return (os.fsdecode(name) in FIXED or name.startswith((b'wl', b'we', b'wp_', b'np_')))
+    return (os.fsdecode(name) in SELECTED_FIXED or name.startswith((b'wl', b'we', b'wp_', b'np_')))
 
 
 def private(path, data):
@@ -239,6 +243,12 @@ class Receiver:
             expected = {(0, os.fsencode(name)) for name in FIXED} | {(1, key.encode()) for key in KEYS}
             if not expected <= self.names:
                 raise ValueError('evidence inventory missing required entries')
+            # Legacy WQE1 streams predate Problem export. Do not invent an
+            # absence claim for them; a new Problem group must be complete.
+            problem = {(0, name.encode()) for name in PROBLEM_FIXED}
+            seen_problem = self.names & problem
+            if seen_problem and seen_problem != problem:
+                raise ValueError('partial Problem evidence inventory')
             nvs = [item for item in self.entities if item['domain'] == 1]
             if (error != 0 or unchanged != 1 or complete != 1 or any(item['error'] for item in self.entities)
                     or self.identity['namespace_error'] != 0 or

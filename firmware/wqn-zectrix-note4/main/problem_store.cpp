@@ -20,6 +20,7 @@
 #include "device_protocol/json_depth_guard.h"
 #include "device_protocol/json_syntax_probe.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 #include "runtime/sleep_coordinator.h"
 #include "services/storage_service.h"
 
@@ -37,6 +38,8 @@ constexpr char kRejectedPath[] = "/storage/po_rejected.jsonl";
 // the parked verdicts (server rejects them again) rather than lose data.
 constexpr char kParkedPath[] = "/storage/po_parked.jsonl";
 constexpr size_t kMaxRejectedRecords = 50;
+constexpr unsigned kProblemEvidenceSlots = 4;
+constexpr size_t kMaxProblemEvidenceBytes = 128 * 1024;
 constexpr size_t kMaxParkedRecords = wqn::kProblemObservationOutboxCapacity;
 constexpr size_t kMaxLineBytes = 512;
 constexpr size_t kMaxParkedLineBytes = 96;
@@ -177,9 +180,136 @@ ObservationDecode DecodeObservationLine(
         ? ObservationDecode::kValid : ObservationDecode::kMalformed;
 }
 
-// Reads every journal line (bounded); malformed lines are dropped so one
-// corrupt record cannot wedge the queue forever. Only newline-framed, fully
-// decoded records are eligible for idempotence or a later rewrite.
+// Reads every journal line (bounded); only healthy frames are uploadable.
+// A lossy rewrite first preserves the complete source, using an
+// owner-scoped proof and bounded, non-overwriting evidence slots.
+// The read proof detects drift within one owner transaction. Its SDK CRC is
+// not an identity/authentication claim; preservation also compares all bytes.
+struct OutboxReadProof {
+    bool present = false;
+    bool needs_repair = false;
+    size_t bytes = 0;
+    size_t discarded_frames = 0;
+    uint32_t crc = 0;
+};
+
+esp_err_t SameEvidenceSource(const char* evidence, const OutboxReadProof& proof)
+{
+    FILE* source = std::fopen(kOutboxPath, "rb");
+    if (source == nullptr) return ESP_FAIL;
+    FILE* saved = std::fopen(evidence, "rb");
+    if (saved == nullptr) { std::fclose(source); return ESP_FAIL; }
+    uint8_t left[256], right[256];
+    size_t total = 0;
+    uint32_t crc = UINT32_MAX;
+    bool equal = true;
+    while (equal) {
+        const size_t a = std::fread(left, 1, sizeof(left), source);
+        const size_t b = std::fread(right, 1, sizeof(right), saved);
+        if (a != b || total + a > kMaxProblemEvidenceBytes ||
+            std::memcmp(left, right, a) != 0) { equal = false; break; }
+        total += a;
+        crc = esp_rom_crc32_le(crc, left, a);
+        if (a == 0) break;
+    }
+    bool ok = std::ferror(source) == 0 && std::ferror(saved) == 0;
+    if (std::fclose(source) != 0) ok = false;
+    if (std::fclose(saved) != 0) ok = false;
+    if (!ok) return ESP_FAIL;
+    if (!equal || total != proof.bytes || (crc ^ UINT32_MAX) != proof.crc) return ESP_ERR_INVALID_STATE;
+    return ESP_OK;
+}
+
+esp_err_t EvidenceSlotState(const char* path, bool* exists, size_t* bytes)
+{
+    struct stat info = {};
+#ifdef ESP_PLATFORM
+    // Flat SPIFFS has no links/lstat. Host checks reject links explicitly.
+    const int result = ::stat(path, &info);
+#else
+    const int result = ::lstat(path, &info);
+#endif
+    if (result != 0) {
+        if (errno != ENOENT) return ESP_FAIL;
+        *exists = false; *bytes = 0; return ESP_OK;
+    }
+    if (!S_ISREG(info.st_mode) || info.st_size < 0) return ESP_ERR_INVALID_STATE;
+    *exists = true; *bytes = static_cast<size_t>(info.st_size);
+    return ESP_OK;
+}
+
+esp_err_t PreserveOutboxSource(
+    const OutboxReadProof& proof, char* selected, size_t capacity)
+{
+    if (!proof.present || proof.bytes == 0 || proof.bytes > kMaxProblemEvidenceBytes)
+        return ESP_ERR_INVALID_STATE;
+    char path[sizeof(kOutboxPath) + 16], temporary[sizeof(kOutboxPath) + 16];
+    unsigned free_slot = kProblemEvidenceSlots;
+    for (unsigned slot = 0; slot < kProblemEvidenceSlots; ++slot) {
+        std::snprintf(path, sizeof(path), "%s.raw%u", kOutboxPath, slot);
+        std::snprintf(temporary, sizeof(temporary), "%s.raw%u.tmp", kOutboxPath, slot);
+        bool final_exists = false, temp_exists = false; size_t bytes = 0, temp_bytes = 0;
+        esp_err_t result = EvidenceSlotState(path, &final_exists, &bytes);
+        if (result != ESP_OK) return result;
+        result = EvidenceSlotState(temporary, &temp_exists, &temp_bytes);
+        if (result != ESP_OK) return result;
+        if (final_exists && bytes == proof.bytes) {
+            // Equality, never length alone, authorizes reuse after a failed
+            // publication. A different/opaque generation remains untouched.
+            result = SameEvidenceSource(path, proof);
+            if (result == ESP_OK) {
+                std::snprintf(selected, capacity, "%s", path);
+                return ESP_OK;
+            }
+            if (result != ESP_ERR_INVALID_STATE) return result;
+        }
+        if (!final_exists && !temp_exists && free_slot == kProblemEvidenceSlots) free_slot = slot;
+    }
+    if (free_slot == kProblemEvidenceSlots) {
+        ESP_LOGW(kTag, "problem repair held: evidence slots full; export retained originals");
+        return ESP_ERR_INVALID_STATE;
+    }
+    std::snprintf(path, sizeof(path), "%s.raw%u", kOutboxPath, free_slot);
+    std::snprintf(temporary, sizeof(temporary), "%s.raw%u.tmp", kOutboxPath, free_slot);
+    FILE* source = std::fopen(kOutboxPath, "rb");
+    if (source == nullptr) return ESP_FAIL;
+    // Never replace a pre-existing or newly raced staging file. Interrupted
+    // stages occupy their slot and are not automatically promoted/deleted.
+    FILE* destination = std::fopen(temporary, "wbx");
+    if (destination == nullptr) { std::fclose(source); return ESP_FAIL; }
+    uint8_t buffer[256]; size_t total = 0;
+    uint32_t crc = UINT32_MAX; bool ok = true;
+    while (ok) {
+        const size_t count = std::fread(buffer, 1, sizeof(buffer), source);
+        if (count == 0) break;
+        if (total + count > kMaxProblemEvidenceBytes) { ok = false; break; }
+        total += count;
+        crc = esp_rom_crc32_le(crc, buffer, count);
+        ok = std::fwrite(buffer, 1, count, destination) == count;
+    }
+    ok = std::ferror(source) == 0 && ok;
+    if (std::fclose(source) != 0) ok = false;
+    if (total != proof.bytes || (crc ^ UINT32_MAX) != proof.crc) ok = false;
+    ok = ok && std::fflush(destination) == 0 && ::fsync(fileno(destination)) == 0;
+    if (std::fclose(destination) != 0) ok = false;
+    if (!ok) return ESP_FAIL;  // Leave this attempt's uncertain copy intact.
+    esp_err_t result = SameEvidenceSource(temporary, proof);
+    if (result != ESP_OK) return result;
+    // Recheck the destination before the owner-only rename as well. SPIFFS
+    // has one writer; no external task may publish a competing generation.
+    bool exists = false; size_t bytes = 0;
+    result = EvidenceSlotState(path, &exists, &bytes);
+    if (result != ESP_OK || exists) return result == ESP_OK ? ESP_ERR_INVALID_STATE : result;
+    if (std::rename(temporary, path) != 0) return ESP_FAIL;
+    result = SameEvidenceSource(path, proof);
+    if (result != ESP_OK) return result;
+    std::snprintf(selected, capacity, "%s", path);
+    ESP_LOGW(kTag, "problem repair preserved: slot=%u source_bytes=%u discarded_frames=%u",
+        free_slot, static_cast<unsigned>(proof.bytes), static_cast<unsigned>(proof.discarded_frames));
+    return ESP_OK;
+}
+
+// Recovery publication remains independent of evidence-slot selection.
 esp_err_t RecoverOutboxPublication()
 {
     struct stat info = {};
@@ -196,11 +326,11 @@ esp_err_t RecoverOutboxPublication()
 
 esp_err_t ReadOutboxLines(
     std::vector<std::string>* lines, bool* physically_empty = nullptr,
-    bool* needs_repair = nullptr)
+    OutboxReadProof* proof = nullptr)
 {
     if (lines == nullptr) return ESP_ERR_INVALID_ARG;
     if (physically_empty != nullptr) *physically_empty = false;
-    if (needs_repair != nullptr) *needs_repair = false;
+    if (proof != nullptr) *proof = {};
     lines->clear();
     const esp_err_t recovery = RecoverOutboxPublication();
     if (recovery != ESP_OK) return recovery;
@@ -212,9 +342,17 @@ esp_err_t ReadOutboxLines(
     std::string line;
     line.reserve(kMaxLineBytes);
     bool saw_bytes = false, discard_line = false, repair = false;
+    size_t source_bytes = 0, discarded_frames = 0;
+    uint32_t source_crc = UINT32_MAX;
     char chunk[128];
     size_t read = 0;
     while ((read = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+        if (source_bytes + read > kMaxProblemEvidenceBytes) {
+            std::fclose(file); lines->clear(); return ESP_ERR_INVALID_SIZE;
+        }
+        source_bytes += read;
+        if (proof != nullptr)
+            source_crc = esp_rom_crc32_le(source_crc, reinterpret_cast<const uint8_t*>(chunk), read);
         for (size_t index = 0; index < read; ++index) {
             const unsigned char ch = static_cast<unsigned char>(chunk[index]);
             saw_bytes = true;
@@ -242,8 +380,8 @@ esp_err_t ReadOutboxLines(
                     // Preserve opaque payload bytes and their CRLF framing.
                     if (decoded == ObservationDecode::kPreserved && had_cr) line.push_back('\r');
                     lines->push_back(line);
-                } else repair = true;
-            }
+                } else { repair = true; ++discarded_frames; }
+            } else { repair = true; ++discarded_frames; }
             line.clear();
             discard_line = false;
             if (lines->size() > wqn::kProblemObservationOutboxCapacity + 8) {
@@ -252,20 +390,28 @@ esp_err_t ReadOutboxLines(
             }
         }
     }
-    repair = repair || discard_line || !line.empty();
+    if (discard_line || !line.empty()) { repair = true; ++discarded_frames; }
     const bool read_ok = std::ferror(file) == 0;
     const bool closed = std::fclose(file) == 0;
     if (!read_ok || !closed) return ESP_FAIL;
     if (physically_empty != nullptr) *physically_empty = !saw_bytes;
-    if (needs_repair != nullptr) *needs_repair = repair;
+    if (proof != nullptr) {
+        proof->present = true; proof->needs_repair = repair; proof->bytes = source_bytes;
+        proof->crc = source_crc ^ UINT32_MAX; proof->discarded_frames = discarded_frames;
+    }
     return ESP_OK;
 }
 
-esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
+esp_err_t WriteOutboxLines(const std::vector<std::string>& lines, const OutboxReadProof& proof)
 {
     g_empty_problem_outbox_known = false;
     const esp_err_t recovery = RecoverOutboxPublication();
     if (recovery != ESP_OK) return recovery;
+    char evidence[sizeof(kOutboxPath) + 16] = {};
+    if (proof.needs_repair) {
+        const esp_err_t retained = PreserveOutboxSource(proof, evidence, sizeof(evidence));
+        if (retained != ESP_OK) return retained;
+    }
     // An empty file is a committed empty generation. Removing it would allow
     // an interrupted cleanup's backup to resurrect already-acknowledged data.
     FILE* file = std::fopen(kOutboxTempPath, "wb");
@@ -280,6 +426,13 @@ esp_err_t WriteOutboxLines(const std::vector<std::string>& lines)
     if (!ok) {
         std::remove(kOutboxTempPath);
         return ESP_FAIL;
+    }
+    if (proof.needs_repair) {
+        const esp_err_t retained = SameEvidenceSource(evidence, proof);
+        if (retained != ESP_OK) {
+            std::remove(kOutboxTempPath);
+            return retained;
+        }
     }
     struct stat info = {};
     const bool had_primary = ::stat(kOutboxPath, &info) == 0;
@@ -448,8 +601,8 @@ esp_err_t CommitTransaction(void* opaque)
     // hide that storage error behind the older successful empty probe.
     g_empty_problem_outbox_known = false;
     std::vector<std::string> lines;
-    bool needs_repair = false;
-    esp_err_t result = ReadOutboxLines(&lines, nullptr, &needs_repair);
+    OutboxReadProof proof;
+    esp_err_t result = ReadOutboxLines(&lines, nullptr, &proof);
     if (result != ESP_OK) return result;
     for (const std::string& line : lines) {
         wqn::DurableProblemObservation parsed;
@@ -471,8 +624,8 @@ esp_err_t CommitTransaction(void* opaque)
     if (encoded.size() > kMaxLineBytes) {
         return ESP_ERR_INVALID_SIZE;
     }
-    if (needs_repair) {
-        result = WriteOutboxLines(lines);
+    if (proof.needs_repair) {
+        result = WriteOutboxLines(lines, proof);
         if (result != ESP_OK) return result;
     }
     FILE* file = std::fopen(kOutboxPath, "ab");
@@ -523,7 +676,8 @@ esp_err_t RemoveTransaction(void* opaque)
     auto* context = static_cast<RequestIdContext*>(opaque);
     g_empty_problem_outbox_known = false;
     std::vector<std::string> lines;
-    esp_err_t result = ReadOutboxLines(&lines);
+    OutboxReadProof proof;
+    esp_err_t result = ReadOutboxLines(&lines, nullptr, &proof);
     if (result != ESP_OK) return result;
     std::vector<std::string> retained;
     retained.reserve(lines.size());
@@ -568,7 +722,7 @@ esp_err_t RemoveTransaction(void* opaque)
             }
         }
     }
-    return WriteOutboxLines(retained);
+    return WriteOutboxLines(retained, proof);
 }
 
 esp_err_t SnapshotTransaction(void* opaque)

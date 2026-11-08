@@ -50,6 +50,8 @@ def cases():
         ('outbox_reconcile', 'R-08 ongoing: pinned raw evidence, authenticated receipts and non-authorizing review plans', ()),
         ('outbox_checkpoint', 'R-08 ongoing: native codec parity and local candidate checkpoint validation', ()),
         ('outbox_candidate', 'R-08 ongoing: native combined replay, append-only candidates and independent verification', ()),
+        ('problem_outbox_recovery', 'R-09: actual SDK JSON/CRC, read proof and durable raw preservation before lossy repair', ()),
+        ('problem_empty_cache', 'Problem owner query cache and preservation failure propagation through libc transactions', ()),
         ('storage_maintenance', 'R-08 ongoing: owner-only raw NVS evidence and no stale cursor fallback', ()),
         ('nvs_typed_presence', 'R-08/R-18: actual SDK typed presence, boot markers, cursor writes and supported volume formats', ()),
         ('nvs_pause_pipeline', 'R-08: actual SDK cursor errors and scope readiness reach the production pause/session loaders', ()),
@@ -168,10 +170,14 @@ def cases():
         result.append(Case(f'maintenance-nvs-{mutation}', 'R-08: raw size, explicit presence and read-only evidence', 'controls',
                            ('test_storage_maintenance.py', '--mutation', mutation), r'^FAIL maintenance-nvs:',
                            r'Storage maintenance NVS: \d+ checks, [1-9]\d* failures \(host ports; NOT HIL\)'))
-    for mutation in ('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility', 'allow-manual-logical'):
+    for mutation in ('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility', 'allow-manual-logical', 'omit-problem'):
         result.append(Case(f'evidence-capture-{mutation}', 'R-08: maintenance admission, raw source recheck, read-only NVS and transcript integrity', 'controls',
                            ('test_storage_evidence_capture.py', '--mutation', mutation), r'^FAIL evidence:',
                            r'Storage evidence: \d+ scenarios, [1-9]\d* failures, 0 errors \(host ports; NOT HIL\)'))
+    for mutation in ('bypass-preservation', 'skip-ack', 'ignore-read-proof', 'ignore-recheck', 'ignore-sync', 'overwrite-partial'):
+        result.append(Case(f'problem-evidence-{mutation}', 'R-09: raw originals, ACK path, read proof, final byte comparison, fsync and exclusive stages', 'controls',
+                           ('test_problem_outbox_recovery.py', '--mutation', f'evidence-{mutation}'), r'^FAIL: evidence:',
+                           r'Problem evidence: \d+ checks, [1-9]\d* failures \(host only; NOT HIL\)'))
     result.append(Case('word-cursor-swallow-error', 'R-08: failed cursor cannot restore an unpaused session', 'controls',
                        ('test_word_session_replay.py', '--mutation', 'swallow-cursor-error'), r'^FAIL: cursor read failure',
                        r'\d+ PASS / [1-9]\d* FAIL \(host storage mocks; NOT power-loss or concurrency HIL\)'))

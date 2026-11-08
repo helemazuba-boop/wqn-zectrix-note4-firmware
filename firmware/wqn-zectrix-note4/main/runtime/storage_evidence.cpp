@@ -146,7 +146,15 @@ public:
     size_t size = 0;
 };
 
+constexpr const char* kProblemEvidenceNames[] = {
+    "po_outbox.jsonl", "po_outbox.tmp", "po_outbox.bak", "po_rejected.jsonl", "po_parked.jsonl",
+    "po_outbox.jsonl.raw0", "po_outbox.jsonl.raw0.tmp",
+    "po_outbox.jsonl.raw1", "po_outbox.jsonl.raw1.tmp",
+    "po_outbox.jsonl.raw2", "po_outbox.jsonl.raw2.tmp",
+    "po_outbox.jsonl.raw3", "po_outbox.jsonl.raw3.tmp",
+};
 bool FixedName(const char* name) {
+    for (const char* candidate : kProblemEvidenceNames) if (std::strcmp(name, candidate) == 0) return true;
     const char* journals[] = {"wout", "nout"};
     const char* sessions[] = {"wsq", "wsr", "wsd", "wsv", "wsi", "wsh", "wsm", "nses", "wrej", "nrej"};
     char buffer[kName];
@@ -194,6 +202,7 @@ esp_err_t List(Inventory* out, Writer* control) {
     // Record genuine absence for all fixed forensic names, without globbing
     // unrelated storage or inspecting credential keys.
     const char* stems[] = {"wout", "nout", "wsq", "wsr", "wsd", "wsv", "wsi", "wsh", "wsm", "nses", "wrej", "nrej"};
+    for (const char* fixed : kProblemEvidenceNames) if (!out->Add(fixed)) return ESP_ERR_INVALID_SIZE;
     char name[kName];
     for (const char* stem : stems) for (const char* ext : {"v1", "tmp", "bak", "rec", "cur", "ctp", "cbk"}) {
         std::snprintf(name, sizeof(name), "%s.%s", stem, ext);

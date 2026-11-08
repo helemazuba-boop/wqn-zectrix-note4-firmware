@@ -75,6 +75,12 @@ def build(root, directory, mutation):
         'write-open': ('NVS_READONLY', 'NVS_READWRITE'),
         'omit-eligibility': ('std::strncmp(name, "we", 2) == 0 ||', 'false ||'),
     }
+    if mutation in ('omit-problem', 'legacy-problem-inventory'):
+        old = 'for (const char* fixed : kProblemEvidenceNames) if (!out->Add(fixed)) return ESP_ERR_INVALID_SIZE;'
+        if source.count(old) != 1: raise RuntimeError('Problem inventory boundary drift')
+        source = source.replace(old, '(void)kProblemEvidenceNames;')
+        source = source.replace('bool Selected(const char* name) {',
+            'bool Selected(const char* name) { if (std::strncmp(name, "po_", 3) == 0) return false;', 1)
     if mutation in changes:
         old, new = changes[mutation]
         expected = 2 if mutation == 'write-open' else 1
@@ -96,7 +102,7 @@ def build(root, directory, mutation):
     return binary
 
 
-def native_case(binary, directory, name, save):
+def native_case(binary, directory, name, save, problem_expected=True):
     path = directory / name
     path.mkdir()
     storage = path / 'storage'
@@ -109,6 +115,10 @@ def native_case(binary, directory, name, save):
         'welig.bak': b'previous personal cache',
         'we00112233445566778899aabb.v1': b'round eligibility\x00\x81',
         'we-future.bad': b'opaque future cache\xff'}
+    problem_names = ['po_outbox.jsonl', 'po_outbox.tmp', 'po_outbox.bak', 'po_rejected.jsonl', 'po_parked.jsonl']
+    problem_names += [f'po_outbox.jsonl.raw{i}{suffix}' for i in range(4) for suffix in ('', '.tmp')]
+    initial.update({name: b'PROBLEM\x00\xff\r\n'+name.encode() for name in problem_names})
+    initial['po_credentials.txt'] = b'DO_NOT_GLOB_PROBLEM_PREFIX'
     for filename, data in initial.items():
         (storage / filename).write_bytes(data)
     if name == 'bigfile':
@@ -145,6 +155,7 @@ def native_case(binary, directory, name, save):
         good = good and hashes == {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in storage.iterdir() if p.is_file() and not p.is_symlink()}
     good = good and b'DO_NOT_EXPORT_CREDENTIAL' not in stream.read_bytes()
+    good = good and b'DO_NOT_GLOB_PROBLEM_PREFIX' not in stream.read_bytes()
     if received:
         manifest = json.loads((path / 'received/manifest.json').read_text())
         good = good and not manifest['repair_authorized'] and not manifest['identity_authenticated']
@@ -152,9 +163,12 @@ def native_case(binary, directory, name, save):
         if name == 'normal':
             good = good and receiver.verify_bundle(path / 'received', receipt['manifest_sha256'])['status'] == 'logical_evidence_verified'
             for filename, data in initial.items():
-                if filename != 'credential.txt':
+                if filename not in ('credential.txt', 'po_credentials.txt'):
                     preserved = path / 'received/files' / filename
-                    good = good and preserved.is_file() and preserved.read_bytes() == data
+                    if filename in problem_names and not problem_expected:
+                        good = good and not preserved.exists()
+                    else:
+                        good = good and preserved.is_file() and preserved.read_bytes() == data
             good = good and (path / 'received/nvs/cur_seq.42.bin').read_bytes() == b'\xa5' * 65
             good = good and (path / 'received/nvs/word_deck_gen.08.bin').read_bytes() == struct.pack('<Q', (1 << 60) + 7)
             good = good and (path / 'received/nvs/word_deck_chg.21.bin').read_bytes() == b'bad\0tail\0'
@@ -180,7 +194,7 @@ def altered(stream, change):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mutation', choices=('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility', 'allow-manual-logical'))
+    parser.add_argument('--mutation', choices=('ignore-mode', 'skip-recheck', 'write-open', 'trust-transcript', 'omit-eligibility', 'allow-manual-logical', 'omit-problem'))
     parser.add_argument('--save-example', type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -218,6 +232,13 @@ def main():
             except Exception:
                 errors += 1
                 raise
+        legacy = directory / 'legacy-tools'
+        legacy.mkdir()
+        legacy_binary = build(root, legacy, 'legacy-problem-inventory')
+        legacy_good, _ = native_case(legacy_binary, legacy, 'normal', None, problem_expected=False)
+        checks += 1
+        failures += not legacy_good
+        print(('PASS' if legacy_good else 'FAIL') + ' evidence: legacy inventory without Problem remains verifiable', flush=True)
         chunks = list(receiver.frames(normal))
         variants = {
             'missing-finish': chunks[:-1],
