@@ -14,12 +14,19 @@ from test_audio_runtime import function
 def main():
     root=Path(__file__).resolve().parents[1]
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--mutation',choices=('allow-build','skip-input','skip-epoch','fabricate-timestamp','hold-old-buffer','skip-note-start'))
+    p.add_argument('--mutation',choices=('allow-build','skip-input','skip-epoch','fabricate-timestamp','hold-old-buffer','skip-note-start','hold-retry'))
     a=p.parse_args()
     clock=(root/'main/ui/clock.cpp').read_text()
     model=(root/'main/ui_model.cpp').read_text()
     word=(root/'main/ui/word_cloud.cpp').read_text()
     note=(root/'main/ui/note_cloud.cpp').read_text()
+    problem=(root/'main/ui/problem_cloud.cpp').read_text()
+    if a.mutation=='hold-retry':
+        old='? CurrentIsoTimestamp() : pending.occurred_at;'
+        assert word.count(old)==note.count(old)==problem.count(old)==1
+        word=word.replace(old,'? CurrentIsoTimestamp() : CurrentIsoTimestamp();')
+        note=note.replace(old,'? CurrentIsoTimestamp() : CurrentIsoTimestamp();')
+        problem=problem.replace(old,'? CurrentIsoTimestamp() : CurrentIsoTimestamp();')
     if a.mutation=='skip-note-start':
         old='!wqn::runtime::IsLearningTimeReady() ||';assert note.count(old)==1;note=note.replace(old,'false ||')
     if a.mutation=='skip-input':
@@ -43,7 +50,7 @@ def main():
         '@@NOTE_START@@':function(note,'bool QueueNoteSessionStart('),
         '@@CLOCK@@':'\n'.join(function(clock,n) for n in ['std::time_t CurrentUnixTime(', 'std::string CurrentDateLabel(', 'std::string CurrentClockLabel(', 'std::string CurrentIsoTimestamp(']),
         '@@NOTICE@@':function(runtime,'UiUpdate UiRuntime::DispatchLearningTimeRequired('),
-        '@@PUMPS@@':function(word,'RefreshSchedule PumpWordObservationCommit(')+'\n'+function((root/'main/ui/note_cloud.cpp').read_text(),'RefreshSchedule PumpNoteObservationCommit(')+'\n'+function((root/'main/ui/problem_cloud.cpp').read_text(),'RefreshSchedule PumpProblemVerdictCommit(')}
+        '@@PUMPS@@':function(word,'RefreshSchedule PumpWordObservationCommit(')+'\n'+function(note,'RefreshSchedule PumpNoteObservationCommit(')+'\n'+function(problem,'RefreshSchedule PumpProblemVerdictCommit(')}
     fixture=(root/'scripts/testdata/learning_time.cpp').read_text()
     for k,v in parts.items():assert fixture.count(k)==1,k;fixture=fixture.replace(k,v)
     with tempfile.TemporaryDirectory(prefix='note4-learning-time-') as t:

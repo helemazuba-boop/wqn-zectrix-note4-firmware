@@ -55,7 +55,10 @@ RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
     RefreshSchedule refresh = RefreshSchedule::kNone;
     const int64_t now_ms = esp_timer_get_time() / 1000;
     if (runtime->state().word_app.session.observation_effect_ready) {
-        const std::string occurred_at = CurrentIsoTimestamp();
+        const auto& pending = runtime->state().word_app.session.pending_observation;
+        // A previously assigned identity/time is an existing fact, not new learning.
+        const std::string occurred_at = pending.request_id.empty()
+            ? CurrentIsoTimestamp() : pending.occurred_at;
         if (occurred_at.empty()) {
             refresh = runtime->DispatchLearningTimeRequired().refresh;
         } else {
@@ -68,9 +71,10 @@ RefreshSchedule PumpWordObservationCommit(UiRuntime* runtime)
                     wqn::runtime::SleepBlocker::kStorage, "word-RAM-buffer", __FILE__, __LINE__);
                 if (!g_word_buffer_sleep_lease) return refresh;
             }
-            const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+            const std::string request_id = pending.request_id.empty()
+                ? wqn::services::MakeDeviceRequestMetadata().request_id : pending.request_id;
             refresh = runtime->DispatchWordObservationBuffered(
-                metadata.request_id, occurred_at, now_ms).refresh;
+                request_id, occurred_at, now_ms).refresh;
         }
     }
     const auto& session = runtime->state().word_app.session;

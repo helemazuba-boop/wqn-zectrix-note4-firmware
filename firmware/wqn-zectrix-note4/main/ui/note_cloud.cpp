@@ -245,17 +245,21 @@ RefreshSchedule PumpNoteObservationCommit(UiRuntime* runtime)
     if (!runtime->state().note_app.session.observation_effect_ready) {
         return RefreshSchedule::kNone;
     }
-    const std::string occurred_at = CurrentIsoTimestamp();
+    const auto& pending = runtime->state().note_app.session.pending_observation;
+    // A previously assigned identity/time is an existing fact, not new learning.
+    const std::string occurred_at = pending.request_id.empty()
+        ? CurrentIsoTimestamp() : pending.occurred_at;
     if (occurred_at.empty()) return runtime->DispatchLearningTimeRequired().refresh;
     PersistTicket ticket = TryReservePersist(PersistKind::kNoteObservation);
     if (!ticket.valid()) {
         return RefreshSchedule::kNone;
     }
-    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+    const std::string request_id = pending.request_id.empty()
+        ? wqn::services::MakeDeviceRequestMetadata().request_id : pending.request_id;
     wqn::DurableNoteObservation observation;
     wqn::PersistedNoteSession advanced;
     if (!runtime->TakeNoteObservationEffect(
-            metadata.request_id, occurred_at, ticket.operation_id,
+            request_id, occurred_at, ticket.operation_id,
             &observation, &advanced)) {
         CancelPersistReservation(ticket);
         return runtime->DispatchNoteObservationTakeFailed().refresh;

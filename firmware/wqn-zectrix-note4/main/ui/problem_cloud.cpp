@@ -171,16 +171,20 @@ RefreshSchedule PumpProblemVerdictCommit(UiRuntime* runtime)
     if (!runtime->state().problem_app.verdict_effect_ready) {
         return RefreshSchedule::kNone;
     }
-    const std::string occurred_at = CurrentIsoTimestamp();
+    const auto& pending = runtime->state().problem_app.pending_verdict;
+    // A previously assigned identity/time is an existing fact, not new learning.
+    const std::string occurred_at = pending.request_id.empty()
+        ? CurrentIsoTimestamp() : pending.occurred_at;
     if (occurred_at.empty()) return runtime->DispatchLearningTimeRequired().refresh;
     PersistTicket ticket = TryReservePersist(PersistKind::kProblemVerdict);
     if (!ticket.valid()) {
         return RefreshSchedule::kNone;
     }
-    const auto metadata = wqn::services::MakeDeviceRequestMetadata();
+    const std::string request_id = pending.request_id.empty()
+        ? wqn::services::MakeDeviceRequestMetadata().request_id : pending.request_id;
     wqn::DurableProblemObservation observation;
     if (!runtime->TakeProblemVerdictEffect(
-            metadata.request_id, occurred_at, ticket.operation_id, &observation)) {
+            request_id, occurred_at, ticket.operation_id, &observation)) {
         CancelPersistReservation(ticket);
         return runtime->DispatchProblemVerdictTakeFailed().refresh;
     }

@@ -38,13 +38,14 @@ struct WordState {
     std::string message;
     struct Session {
         bool observation_effect_ready=false;
+        DurableWordObservation pending_observation;
         std::vector<DurableWordObservation> buffered_observations;
         size_t batch_in_flight=0;int64_t batch_retry_after_ms=0;
         bool batch_flush_requested=true;
     } session;
 };
-struct NoteState {std::string message;struct {bool observation_effect_ready=false;} session;};
-struct ProblemState {std::string message;bool verdict_effect_ready=false,active=false;};
+struct NoteState {std::string message;struct {bool observation_effect_ready=false;DurableNoteObservation pending_observation;} session;};
+struct ProblemState {std::string message;bool verdict_effect_ready=false,active=false;DurableProblemObservation pending_verdict;};
 struct UiState {UiScreen screen=UiScreen::kWord;WordState word_app;NoteState note_app;ProblemState problem_app;};
 @@INPUT_PREFIX@@
 namespace services {struct Metadata{std::string request_id;};Metadata MakeDeviceRequestMetadata(){++metadata_calls;return {"new-request"};}}
@@ -71,10 +72,10 @@ bool IsPersistKindBusy(PersistKind){return persist_busy;}
 PersistTicket TryReservePersist(PersistKind){++reservations;return {};}
 void CancelPersistReservation(PersistTicket){}
 std::vector<wqn::DurableWordObservation> enqueued_word;
-std::string enqueued_note,enqueued_problem;
+std::string enqueued_note,enqueued_problem,enqueued_note_id,enqueued_problem_id;
 void EnqueueReservedWordObservations(PersistTicket,std::vector<wqn::DurableWordObservation> v,wqn::PersistedWordSession){++persist_calls;enqueued_word=std::move(v);}
-void EnqueueReservedNoteObservation(PersistTicket,wqn::DurableNoteObservation o,wqn::PersistedNoteSession){++persist_calls;enqueued_note=o.occurred_at;}
-void EnqueueReservedProblemVerdict(PersistTicket,wqn::DurableProblemObservation o){++persist_calls;enqueued_problem=o.occurred_at;}
+void EnqueueReservedNoteObservation(PersistTicket,wqn::DurableNoteObservation o,wqn::PersistedNoteSession){++persist_calls;enqueued_note=o.occurred_at;enqueued_note_id=o.request_id;}
+void EnqueueReservedProblemVerdict(PersistTicket,wqn::DurableProblemObservation o){++persist_calls;enqueued_problem=o.occurred_at;enqueued_problem_id=o.request_id;}
 wqn::runtime::SleepLease g_word_buffer_sleep_lease;
 class UiRuntime {
 public:
@@ -135,6 +136,16 @@ int main(){
                 Check(notice=="请先联网校正时间","active learning domain receives the calibration notice");
                 Check(screen==UiScreen::kWord?(state.note_app.message.empty()&&state.problem_app.message.empty()):state.word_app.message.empty(),"clock admission does not overwrite unrelated domain notices");
             }
+        }
+        if(!expected){
+            ResetPorts();UiRuntime retry;
+            retry.state_.word_app.session.observation_effect_ready=true;retry.state_.word_app.session.pending_observation={"retry-word","2026-11-01T00:00:00Z",0};
+            retry.state_.note_app.session.observation_effect_ready=true;retry.state_.note_app.session.pending_observation={"retry-note","2026-11-01T00:00:00Z"};
+            retry.state_.problem_app.verdict_effect_ready=true;retry.state_.problem_app.pending_verdict={"retry-problem","2026-11-01T00:00:00Z"};
+            PumpWordObservationCommit(&retry);PumpNoteObservationCommit(&retry);PumpProblemVerdictCommit(&retry);
+            Check(persist_calls==3&&metadata_calls==0,"previously assigned facts in all three domains may retry without a new clock or identity");
+            Check(enqueued_word.size()==1&&enqueued_word[0].request_id=="retry-word"&&enqueued_word[0].occurred_at=="2026-11-01T00:00:00Z"&&enqueued_note_id=="retry-note"&&enqueued_problem_id=="retry-problem"&&enqueued_note=="2026-11-01T00:00:00Z"&&enqueued_problem==enqueued_note,
+                "retry preserves every existing identity and timestamp rather than correcting history");
         }
         ResetPorts();UiRuntime r;r.state_.word_app.session.observation_effect_ready=true;
         r.state_.note_app.session.observation_effect_ready=true;r.state_.problem_app.verdict_effect_ready=true;

@@ -30,7 +30,7 @@ def cases():
     for name in ('learning_time', 'word_session_start', 'rtc_timekeep', 'time_retention'):
         result.append(Case(name, 'R-11: calibrated-time admission, provenance/epoch, existing fact preservation and RTC/timer producers',
                            'runtime', (f'test_{name}.py',)))
-    for mutation in ('allow-build', 'skip-input', 'skip-epoch', 'fabricate-timestamp', 'hold-old-buffer', 'skip-note-start'):
+    for mutation in ('allow-build', 'skip-input', 'skip-epoch', 'fabricate-timestamp', 'hold-old-buffer', 'skip-note-start', 'hold-retry'):
         result.append(Case(f'learning-time-{mutation}', 'R-11: reject approximate time, missing admission, mixed epochs, fake timestamps and held accepted facts',
                            'controls', ('test_learning_time.py', '--mutation', mutation), r'^FAIL learning-time:',
                            r'Learning time: \d+ checks, [1-9]\d* failures \(production clock/input admission/pumps; host ports; NOT HIL\)'))
