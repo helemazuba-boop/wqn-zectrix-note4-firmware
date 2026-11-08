@@ -47,7 +47,11 @@ def main():
                             if 'bool g_empty_problem_outbox_known' in source
                             else '// Original source has no RAM cache.'),
         '@@EVIDENCE@@': (root/'scripts/testdata/problem_outbox_evidence.cpp').read_text(),
+        '@@PARKED@@': (root/'scripts/testdata/problem_park_journal.cpp').read_text(),
+        '@@PARK_UPLOAD@@': '',
     }
+    if 'bool g_problem_park_sync_pending' in source:
+        pieces['@@RESET_CACHE@@'] += 'g_problem_park_sync_pending=false;'
     template = (root / 'scripts/testdata/problem_empty_cache.cpp').read_text(
         encoding='utf-8')
     for marker, body in pieces.items():

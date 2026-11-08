@@ -202,6 +202,11 @@ def cases():
     result.append(Case('json_string_boundaries-bad-hex', 'N-04/N-06: malformed Unicode guard', 'controls',
                        ('test_json_string_boundaries.py', '--mutation', 'bad-hex'), r'^FAIL ',
                        r'JSON string boundaries: \d+ protocol cases, \d+ checks, [1-9]\d* failures'))
+    for mutation in ('ignore-invalid', 'strip-cr', 'ignore-record-limit', 'skip-ack-guard',
+                     'skip-pending-sync', 'ignore-probe-close', 'truncate-confirm'):
+        result.append(Case(f'problem-park-{mutation}', 'Problem park: strict bounded frames, upload admission and uncertain-write confirmation', 'controls',
+                           ('test_problem_outbox_recovery.py', '--mutation', f'park-{mutation}'), r'^FAIL: park',
+                           r'Problem park total: \d+ checks, [1-9]\d* failures \(real SDK/transactions/upload; NOT HIL\)'))
     return result
 
 

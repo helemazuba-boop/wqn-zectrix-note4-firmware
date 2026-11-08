@@ -18,6 +18,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source',type=Path,default=root/'main/problem_store.cpp')
     parser.add_argument('--evidence-only',action='store_true')
+    parser.add_argument('--park-only',action='store_true')
+    parser.add_argument('--sync-source',type=Path,default=root/'main/services/sync_service.cpp')
     parser.add_argument('--mutation',choices=('delete-primary','substring-id',
                                              'skip-tail-repair','allow-trailing-json',
                                              'unchecked-request','unchecked-problem',
@@ -29,7 +31,10 @@ def main():
                                              'hide-opaque-count','truncate-producer-time',
                                              'evidence-bypass-preservation','evidence-skip-ack',
                                              'evidence-ignore-read-proof','evidence-ignore-recheck',
-                                             'evidence-ignore-sync','evidence-overwrite-partial'))
+                                             'evidence-ignore-sync','evidence-overwrite-partial',
+                                             'park-ignore-invalid','park-strip-cr','park-ignore-record-limit',
+                                             'park-skip-ack-guard','park-skip-pending-sync',
+                                             'park-ignore-probe-close','park-truncate-confirm'))
     parser.add_argument('--idf-path',type=Path,default=Path(os.environ.get('IDF_PATH','/home/unknow/esp/esp-idf-v5.5')))
     args=parser.parse_args()
     cjson=args.idf_path/'components/json/cJSON'
@@ -40,10 +45,24 @@ def main():
         raise SystemExit('gcc/g++ unavailable')
     body=args.source.read_text()
     if args.mutation:
-        if args.mutation.startswith('evidence-'):
+        if args.mutation.startswith('park-'):
+            args.park_only=True
+            mutations={
+                'park-ignore-invalid': ('if (!DecodeParkedLine(line, &request_id))', 'if (false)'),
+                'park-strip-cr': ("if (ch == '\\n') break; // park frame boundary", "if (ch == '\\n') break;\n            if (ch == '\\r') continue; // park frame boundary"),
+                'park-ignore-record-limit': ('if (++records > kMaxParkedRecords)', 'if ((++records, false))'),
+                'park-skip-ack-guard': ('esp_err_t result = ReadParkedRequestIds(&parked); // ACK admission', 'esp_err_t result = ESP_OK; // removed ACK admission'),
+                'park-skip-pending-sync': ('result = SyncParkedJournal(bytes, crc ^ UINT32_MAX);', 'result = ESP_OK;'),
+                'park-ignore-probe-close': ('if (std::fclose(probe) != 0) return ESP_FAIL; // park separator', 'std::fclose(probe); // removed park separator close check'),
+                'park-truncate-confirm': ('std::fopen(kParkedPath, "r+b")', 'std::fopen(kParkedPath, "w+b")'),
+            }
+            old,new=mutations[args.mutation]
+        elif args.mutation.startswith('evidence-'):
             args.evidence_only=True
             if args.mutation=='evidence-bypass-preservation':
-                old=section(body,'esp_err_t WriteOutboxLines(', '\n// Reads the parked request_ids')
+                end=('\n// Confirm an uncertain in-boot append' if 'esp_err_t SyncParkedJournal(' in body
+                     else '\n// Reads the parked request_ids')
+                old=section(body,'esp_err_t WriteOutboxLines(', end)
                 if old.count('if (proof.needs_repair)')!=2:raise ValueError('preservation boundary drift')
                 new=old.replace('if (proof.needs_repair)','if (false)')
             elif args.mutation=='evidence-skip-ack':
@@ -146,7 +165,16 @@ namespace wqn::protocol::problem_study_v1 {
         '@@TRANSACTIONS@@':section(body,'struct CommitContext {','\nesp_err_t ExecuteWithStorageLease('),
         '@@RESET_CACHE@@':'g_empty_problem_outbox_known=false;',
         '@@EVIDENCE@@':(root/'scripts/testdata/problem_outbox_evidence.cpp').read_text(),
+        '@@PARKED@@':(root/'scripts/testdata/problem_park_journal.cpp').read_text(),
     }
+    if 'bool g_problem_park_sync_pending' in body:
+        parts['@@RESET_CACHE@@']+='g_problem_park_sync_pending=false;'
+    upload=(root/'scripts/testdata/problem_park_upload.cpp').read_text()
+    upload=upload.replace('@@PUBLIC@@',section(body,'namespace wqn {','}  // namespace wqn')+'}  // namespace wqn\n')
+    upload=upload.replace('@@UPLOAD@@',section(args.sync_source.read_text(),
+        'WordOutboxUploadState UploadPendingProblemObservations(',
+        '\nWordOutboxUploadState UploadPendingNoteObservations('))
+    parts['@@PARK_UPLOAD@@']=upload
     for marker,value in parts.items():
         assert fixture.count(marker)==1,marker
         fixture=fixture.replace(marker,value)
@@ -170,7 +198,7 @@ namespace wqn::protocol::problem_study_v1 {
                         '-I',str(cjson),str(unit),str(directory/'cJSON.o'),str(directory/'crc.o'),'-o',str(binary),
                         '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=fflush,--wrap=fsync,--wrap=cJSON_CreateObject,--wrap=cJSON_ParseWithOpts'],
                        check=True,timeout=60)
-        return subprocess.run([str(binary),tmp,*(['evidence'] if args.evidence_only else [])],timeout=30,env=dict(os.environ,
+        return subprocess.run([str(binary),tmp,*(['park'] if args.park_only else ['evidence'] if args.evidence_only else [])],timeout=30,env=dict(os.environ,
                               ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1')).returncode
 
 

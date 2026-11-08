@@ -43,6 +43,8 @@ constexpr size_t kMaxProblemEvidenceBytes = 128 * 1024;
 constexpr size_t kMaxParkedRecords = wqn::kProblemObservationOutboxCapacity;
 constexpr size_t kMaxLineBytes = 512;
 constexpr size_t kMaxParkedLineBytes = 96;
+constexpr size_t kMaxParkedJournalBytes =
+    kMaxParkedRecords * (kMaxParkedLineBytes + 2);
 
 // Owner-task-only negative cache, not a count of uploadable records. Publish
 // only after successful reads of both journals find no payload bytes. Parked
@@ -50,6 +52,11 @@ constexpr size_t kMaxParkedLineBytes = 96;
 // Every payload/marker write primitive invalidates this BEFORE attempting I/O,
 // including failures that may already have appended partial bytes.
 bool g_empty_problem_outbox_known = false;
+// Storage-owner only. An append/flush/sync/close failure may leave complete
+// bytes behind. Reading those bytes cannot confirm the failed transaction.
+// Reconfirm the existing file without truncation before publishing any IDs.
+// Malformed tails remain errors and require separately controlled recovery.
+bool g_problem_park_sync_pending = false;
 
 bool IsValidRequestId(const std::string& value)
 {
@@ -461,54 +468,113 @@ esp_err_t WriteOutboxLines(const std::vector<std::string>& lines, const OutboxRe
     return ESP_OK;
 }
 
-// Reads the parked request_ids from the park journal (bounded). A missing
-// file means nothing is parked.
-esp_err_t ReadParkedRequestIds(std::vector<std::string>* request_ids)
+// Confirm an uncertain in-boot append against the complete validated read.
+// CRC detects drift during this confirmation; it is not an on-disk checksum
+// or authentication for legacy park markers. No create/truncate is allowed.
+esp_err_t SyncParkedJournal(size_t expected_bytes, uint32_t expected_crc)
+{
+    FILE* file = std::fopen(kParkedPath, "r+b");
+    if (file == nullptr) return ESP_FAIL;
+    // Confirmation must reread storage after fsync, not a stdio read buffer.
+    const bool unbuffered = std::setvbuf(file, nullptr, _IONBF, 0) == 0;
+    const auto matches = [&]() {
+        uint8_t buffer[128];
+        size_t total = 0;
+        uint32_t crc = UINT32_MAX;
+        size_t count = 0;
+        while ((count = std::fread(buffer, 1, sizeof(buffer), file)) != 0) {
+            if (count > kMaxParkedJournalBytes - total) return false;
+            total += count;
+            crc = esp_rom_crc32_le(crc, buffer, count);
+        }
+        return std::ferror(file) == 0 && total == expected_bytes &&
+            (crc ^ UINT32_MAX) == expected_crc;
+    };
+    const bool confirmed = unbuffered && matches() &&
+        ::fsync(fileno(file)) == 0 && std::fseek(file, 0, SEEK_SET) == 0 &&
+        matches();
+    const bool closed = std::fclose(file) == 0;
+    return confirmed && closed ? ESP_OK : ESP_FAIL;
+}
+
+// Validate every physical frame before publishing any parked identity. Legacy
+// LF, CRLF and complete EOF records remain supported; a torn/unknown frame
+// holds upload admission rather than silently reviving a suspended verdict.
+esp_err_t ReadParkedRequestIds(
+    std::vector<std::string>* request_ids, size_t* physical_records = nullptr)
 {
     if (request_ids == nullptr) return ESP_ERR_INVALID_ARG;
     request_ids->clear();
+    if (physical_records != nullptr) *physical_records = 0;
+    bool exists = false;
+    size_t stored_bytes = 0;
+    esp_err_t result = EvidenceSlotState(kParkedPath, &exists, &stored_bytes);
+    if (result != ESP_OK) return result;
+    if (stored_bytes > kMaxParkedJournalBytes) return ESP_ERR_INVALID_SIZE;
     FILE* file = std::fopen(kParkedPath, "rb");
     if (file == nullptr) {
-        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+        if (errno != ENOENT) return ESP_FAIL;
+        return !exists && !g_problem_park_sync_pending
+            ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
-    while (true) {
+    size_t records = 0, bytes = 0;
+    uint32_t crc = UINT32_MAX;
+    while (result == ESP_OK) {
         std::string line;
-        bool overlong = false;
         bool saw_byte = false;
         int ch = 0;
         while ((ch = std::fgetc(file)) != EOF) {
             saw_byte = true;
-            if (ch == '\n') break;
-            if (ch == '\r') continue;
-            if (line.size() < kMaxParkedLineBytes) {
-                line.push_back(static_cast<char>(ch));
-            } else {
-                overlong = true;
+            if (++bytes > kMaxParkedJournalBytes) {
+                result = ESP_ERR_INVALID_SIZE;
+                break;
             }
+            if (g_problem_park_sync_pending) {
+                const uint8_t byte = static_cast<uint8_t>(ch);
+                crc = esp_rom_crc32_le(crc, &byte, 1);
+            }
+            if (ch == '\n') break; // park frame boundary
+            if (line.size() >= kMaxParkedLineBytes + 1) {
+                result = ESP_ERR_INVALID_SIZE;
+                break;
+            }
+            line.push_back(static_cast<char>(ch));
         }
-        if (!saw_byte && ch == EOF) break;
+        if (result != ESP_OK || (!saw_byte && ch == EOF)) break;
+        if (++records > kMaxParkedRecords) {
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        if (ch == '\n' && !line.empty() && line.back() == '\r')
+            line.pop_back();
         std::string request_id;
-        if (!overlong && DecodeParkedLine(line, &request_id) &&
-            std::find(request_ids->begin(), request_ids->end(), request_id) ==
-                request_ids->end()) {
-            // A valid EOF-terminated final record is accepted. An incomplete
-            // crash tail fails DecodeParkedLine and is ignored.
-            request_ids->push_back(request_id);
-        } else if (!line.empty()) {
-            ESP_LOGW(kTag, "ignoring malformed problem park marker");
+        if (!DecodeParkedLine(line, &request_id)) {
+            result = ESP_ERR_INVALID_RESPONSE;
+            break;
         }
-        if (request_ids->size() > kMaxParkedRecords) {
-            std::fclose(file);
-            return ESP_ERR_INVALID_SIZE;
-        }
+        if (std::find(request_ids->begin(), request_ids->end(), request_id) ==
+            request_ids->end()) request_ids->push_back(request_id);
         if (ch == EOF) break;
     }
     const bool read_ok = std::ferror(file) == 0;
     const bool closed = std::fclose(file) == 0;
-    return read_ok && closed ? ESP_OK : ESP_FAIL;
+    if (!read_ok || !closed) result = ESP_FAIL;
+    if (result == ESP_OK && bytes != stored_bytes) result = ESP_ERR_INVALID_STATE;
+    if (result == ESP_OK && g_problem_park_sync_pending) {
+        result = SyncParkedJournal(bytes, crc ^ UINT32_MAX);
+        if (result == ESP_OK) g_problem_park_sync_pending = false;
+    }
+    if (result != ESP_OK) {
+        request_ids->clear();
+        ESP_LOGW(kTag, "problem park journal unavailable: bytes=%u frames=%u",
+                 static_cast<unsigned>(bytes), static_cast<unsigned>(records));
+        return result;
+    }
+    if (physical_records != nullptr) *physical_records = records;
+    return ESP_OK;
 }
 
-// Best-effort bounded append of one park marker. Returns ESP_ERR_NO_MEM when
+// Bounded durable append of one park marker. Returns ESP_ERR_NO_MEM when
 // the journal is full so the caller can fail the park transaction instead of
 // silently losing the marker (the verdict then keeps its queue place).
 esp_err_t AppendParkedEntry(
@@ -520,12 +586,13 @@ esp_err_t AppendParkedEntry(
         return ESP_ERR_INVALID_ARG;
     }
     std::vector<std::string> parked;
-    const esp_err_t read_result = ReadParkedRequestIds(&parked);
+    size_t physical_records = 0;
+    const esp_err_t read_result = ReadParkedRequestIds(&parked, &physical_records);
     if (read_result != ESP_OK) return read_result;
     if (std::find(parked.begin(), parked.end(), request_id) != parked.end()) {
         return ESP_OK;
     }
-    if (parked.size() >= kMaxParkedRecords) {
+    if (physical_records >= kMaxParkedRecords) {
         return ESP_ERR_NO_MEM;
     }
     bool needs_separator = false;
@@ -552,12 +619,13 @@ esp_err_t AppendParkedEntry(
             }
             needs_separator = last != '\n';
         }
-        std::fclose(probe);
+        if (std::fclose(probe) != 0) return ESP_FAIL; // park separator
     } else if (errno != ENOENT) {
         return ESP_FAIL;
     }
     FILE* journal = std::fopen(kParkedPath, "ab");
     if (journal == nullptr) return ESP_FAIL;
+    g_problem_park_sync_pending = true;
     const std::string entry = request_id + ' ' + reason_name;
     const bool separated = !needs_separator || std::fputc('\n', journal) != EOF;
     const bool ok = separated &&
@@ -566,6 +634,7 @@ esp_err_t AppendParkedEntry(
         std::fputc('\n', journal) != EOF && std::fflush(journal) == 0 &&
         ::fsync(fileno(journal)) == 0;
     if (std::fclose(journal) != 0 || !ok) return ESP_FAIL;
+    g_problem_park_sync_pending = false;
     return ESP_OK;
 }
 
@@ -580,7 +649,11 @@ esp_err_t ReadOutboxForQuery(
     esp_err_t result = ReadOutboxLines(lines, &physically_empty);
     if (result != ESP_OK) return result;
     result = ReadParkedRequestIds(parked);
-    if (result != ESP_OK) return result;
+    if (result != ESP_OK) {
+        lines->clear();
+        parked->clear();
+        return result;
+    }
     g_empty_problem_outbox_known = physically_empty;
     ESP_LOGI(
         kTag, "problem outbox query read: lines=%u parked=%u empty_cached=%u",
@@ -675,9 +748,12 @@ esp_err_t RemoveTransaction(void* opaque)
 {
     auto* context = static_cast<RequestIdContext*>(opaque);
     g_empty_problem_outbox_known = false;
+    std::vector<std::string> parked;
+    esp_err_t result = ReadParkedRequestIds(&parked); // ACK admission
+    if (result != ESP_OK) return result;
     std::vector<std::string> lines;
     OutboxReadProof proof;
-    esp_err_t result = ReadOutboxLines(&lines, nullptr, &proof);
+    result = ReadOutboxLines(&lines, nullptr, &proof);
     if (result != ESP_OK) return result;
     std::vector<std::string> retained;
     retained.reserve(lines.size());

@@ -17,10 +17,12 @@ constexpr esp_err_t ESP_OK = 0, ESP_FAIL = -1;
 constexpr esp_err_t ESP_ERR_INVALID_ARG = 0x102, ESP_ERR_NOT_FOUND = 0x105;
 constexpr esp_err_t ESP_ERR_INVALID_STATE = 0x103;
 constexpr esp_err_t ESP_ERR_NO_MEM = 0x101, ESP_ERR_INVALID_SIZE = 0x104;
+constexpr esp_err_t ESP_ERR_INVALID_RESPONSE = 0x108;
 constexpr const char* kTag = "problem-fixture";
 void FixtureLog(const char*, const char*, ...) {}
 #define ESP_LOGW(...) FixtureLog(__VA_ARGS__)
 #define ESP_LOGI(...) FixtureLog(__VA_ARGS__)
+#define ESP_LOGE(...) FixtureLog(__VA_ARGS__)
 
 namespace wqn {
 enum class OutboxSuspendReason { kActorOwnership };
@@ -48,6 +50,14 @@ bool proof_copy_read_error=false, proof_copy_close_error=false;
 int proof_source_opens=0, proof_crash=0;
 FILE* proof_stream=nullptr;
 void ProofOpenHook(const char*,const char*);
+bool park_fail_sync=false,park_fail_update_open=false,park_fail_write_close=false;
+bool park_remove_before_update=false,park_change_before_update=false,park_change_during_sync=false;
+int park_read_opens=0,park_update_opens=0,park_fail_read_close_at=0,park_sync_calls=0;
+FILE* park_stream=nullptr;
+bool park_stream_update=false;
+std::string park_drift_bytes;
+void ParkOpenHook(const char*,const char*);
+void ParkSyncHook();
 struct PublicationStop {};
 extern "C" FILE* __real_fopen(const char*, const char*);
 extern "C" int __real_fclose(FILE*);
@@ -64,7 +74,10 @@ extern "C" int __wrap_fflush(FILE* file) {
 extern "C" int __wrap_fsync(int fd) {
     const bool evidence=proof_stream && fileno(proof_stream)==fd;
     if(proof_fail_sync && evidence) { errno=EIO; return -1; }
+    const bool parked=park_stream && fileno(park_stream)==fd;
+    if(parked) { ++park_sync_calls;if(park_fail_sync) { errno=EIO;return -1; } }
     const int result=__real_fsync(fd);
+    if(parked && result==0) ParkSyncHook();
     if(result==0 && evidence && proof_crash==1) _exit(73);
     return result;
 }
@@ -90,8 +103,12 @@ extern "C" int __wrap_fputc(int ch, FILE* file) {
 ssize_t FailRead(void*, char*, size_t) { errno = EIO; return -1; }
 extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
     ProofOpenHook(path,mode);
+    ParkOpenHook(path,mode);
     const bool reading = std::strcmp(mode, "rb") == 0;
     reading ? ++read_opens : ++write_opens;
+    if(std::strcmp(path,kParkedPath)==0 && std::strcmp(mode,"r+b")==0 && park_fail_update_open) {
+        errno=EIO;return nullptr;
+    }
     if (bad_open_path == path) { errno = EIO; return nullptr; }
     FILE* file;
     if (reading && bad_read_path == path) {
@@ -104,6 +121,13 @@ extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
     if (file != nullptr && bad_close_path == path) bad_close_stream = file;
     if (file != nullptr && !reading && partial_write_path == path) partial_write_stream = file;
     if(file && std::strstr(path,".raw") && std::strchr(mode,'w')) proof_stream=file;
+    if(file && std::strcmp(path,kParkedPath)==0) {
+        if(reading && park_fail_read_close_at==park_read_opens) bad_close_stream=file;
+        if(!reading) {
+            park_stream=file;park_stream_update=std::strchr(mode,'+')!=nullptr;
+            if(park_fail_write_close) bad_close_stream=file;
+        }
+    }
     return file;
 }
 extern "C" int __wrap_fclose(FILE* file) {
@@ -111,6 +135,7 @@ extern "C" int __wrap_fclose(FILE* file) {
     if (fail) bad_close_stream = nullptr;
     if (file == partial_write_stream) partial_write_stream = nullptr;
     if(file==proof_stream) proof_stream=nullptr;
+    if(file==park_stream) { park_stream=nullptr;park_stream_update=false; }
     const int result = __real_fclose(file);
     if (fail) { errno = EIO; return EOF; }
     return result;
@@ -148,6 +173,10 @@ void Check(bool condition, const char* name) {
     condition ? ++passes : ++failures;
 }
 void Reset() {
+    park_fail_sync=park_fail_update_open=park_fail_write_close=false;
+    park_remove_before_update=park_change_before_update=park_change_during_sync=false;
+    park_read_opens=park_update_opens=park_fail_read_close_at=park_sync_calls=0;
+    park_stream=nullptr;park_stream_update=false;park_drift_bytes.clear();
     proof_fail_flush=proof_fail_sync=proof_fail_rename=proof_race_stage=false;
     proof_drift_copy=proof_drift_publish=proof_corrupt_saved=false;
     proof_copy_read_error=proof_copy_close_error=false;
@@ -512,6 +541,8 @@ static void DecoderAllocationCases() {
 }
 #endif
 @@EVIDENCE@@
+@@PARKED@@
+@@PARK_UPLOAD@@
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc != 2 && argc != 3) return 2;
@@ -520,7 +551,16 @@ int main(int argc, char** argv) {
     std::snprintf(kOutboxBackupPath, sizeof(kOutboxBackupPath), "%s/outbox.bak", argv[1]);
     std::snprintf(kParkedPath, sizeof(kParkedPath), "%s/parked", argv[1]);
     std::snprintf(kRejectedPath, sizeof(kRejectedPath), "%s/rejected", argv[1]);
-    if(argc==3) { EvidenceCases();return failures?1:0; }
+    if(argc==3) {
+        if(std::strcmp(argv[2],"park")==0) {
+            ParkJournalCases();
+#if REAL_CODEC
+            ParkUploadCases();
+#endif
+            std::printf("Problem park total: %d checks, %d failures (real SDK/transactions/upload; NOT HIL)\n",passes+failures,failures);
+        } else EvidenceCases();
+        return failures?1:0;
+    }
     Observation out, a = Value(), b = Value("B");
     wqn::ProblemOutboxSnapshot snapshot;
     Reset();
@@ -621,7 +661,9 @@ int main(int argc, char** argv) {
           "failed park preparatory read invalidates older empty evidence");
     RecoveryCases();
     EvidenceCases();
+    ParkJournalCases();
 #if REAL_CODEC
+    ParkUploadCases();
     EncoderAllocationCases();
     DecoderAllocationCases();
 #endif
