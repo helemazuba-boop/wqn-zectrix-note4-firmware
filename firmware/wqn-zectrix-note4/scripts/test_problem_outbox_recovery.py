@@ -17,6 +17,7 @@ def main():
     root=Path(__file__).resolve().parents[1]
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source',type=Path,default=root/'main/problem_store.cpp')
+    parser.add_argument('--evidence-only',action='store_true')
     parser.add_argument('--mutation',choices=('delete-primary','substring-id',
                                              'skip-tail-repair','allow-trailing-json',
                                              'unchecked-request','unchecked-problem',
@@ -25,7 +26,10 @@ def main():
                                              'ignore-read-oom','ignore-commit-oom','ignore-peek-oom',
                                              'ignore-remove-oom','ignore-snapshot-oom','ignore-suspend-oom',
                                              'accept-opaque','drop-read-opaque','drop-ack-opaque',
-                                             'hide-opaque-count','truncate-producer-time'))
+                                             'hide-opaque-count','truncate-producer-time',
+                                             'evidence-bypass-preservation','evidence-skip-ack',
+                                             'evidence-ignore-read-proof','evidence-ignore-recheck',
+                                             'evidence-ignore-sync','evidence-overwrite-partial'))
     parser.add_argument('--idf-path',type=Path,default=Path(os.environ.get('IDF_PATH','/home/unknow/esp/esp-idf-v5.5')))
     args=parser.parse_args()
     cjson=args.idf_path/'components/json/cJSON'
@@ -36,7 +40,25 @@ def main():
         raise SystemExit('gcc/g++ unavailable')
     body=args.source.read_text()
     if args.mutation:
-        if args.mutation in ('accept-opaque','drop-read-opaque','drop-ack-opaque','hide-opaque-count','truncate-producer-time'):
+        if args.mutation.startswith('evidence-'):
+            args.evidence_only=True
+            if args.mutation=='evidence-bypass-preservation':
+                old=section(body,'esp_err_t WriteOutboxLines(', '\n// Reads the parked request_ids')
+                if old.count('if (proof.needs_repair)')!=2:raise ValueError('preservation boundary drift')
+                new=old.replace('if (proof.needs_repair)','if (false)')
+            elif args.mutation=='evidence-skip-ack':
+                old,new='return WriteOutboxLines(retained, proof);','return WriteOutboxLines(retained, OutboxReadProof{});'
+            elif args.mutation=='evidence-ignore-read-proof':
+                old,new='(crc ^ UINT32_MAX) != proof.crc','false'
+                if body.count(old)!=2:raise ValueError('proof boundary drift')
+                body=body.replace(old,new);old=new=''
+            elif args.mutation=='evidence-ignore-recheck':
+                old,new='const esp_err_t retained = SameEvidenceSource(evidence, proof);','const esp_err_t retained = ESP_OK;'
+            elif args.mutation=='evidence-ignore-sync':
+                old,new='::fsync(fileno(destination)) == 0','true'
+            else:
+                old,new='std::fopen(temporary, "wbx")','std::fopen(temporary, "wb")'
+        elif args.mutation in ('accept-opaque','drop-read-opaque','drop-ack-opaque','hide-opaque-count','truncate-producer-time'):
             if args.mutation=='accept-opaque':
                 old,new='if (!wqn::protocol::JsonStringsRepresentable(line.data(), line.size()))','if (false)'
             elif args.mutation=='drop-read-opaque':
@@ -94,9 +116,9 @@ def main():
         if (line.find(context->observation->request_id) != std::string::npos) return ESP_OK;
     }
 '''
-        if body.count(old)!=1:
+        if old and body.count(old)!=1:
             raise ValueError('problem mutation boundary drift')
-        body=body.replace(old,new)
+        if old:body=body.replace(old,new)
     fixture=(root/'scripts/testdata/problem_empty_cache.cpp').read_text()
     a=fixture.index('using esp_err_t = int;'); b=fixture.index('constexpr const char* kTag',a)
     fixture=fixture[:a]+'#include "esp_err.h"\n#define REAL_CODEC 1\n'+fixture[b:]
@@ -123,6 +145,7 @@ namespace wqn::protocol::problem_study_v1 {
         '@@IO@@':section(body,'// Reads every journal line (bounded);','\nstruct CommitContext {'),
         '@@TRANSACTIONS@@':section(body,'struct CommitContext {','\nesp_err_t ExecuteWithStorageLease('),
         '@@RESET_CACHE@@':'g_empty_problem_outbox_known=false;',
+        '@@EVIDENCE@@':(root/'scripts/testdata/problem_outbox_evidence.cpp').read_text(),
     }
     for marker,value in parts.items():
         assert fixture.count(marker)==1,marker
@@ -135,14 +158,19 @@ namespace wqn::protocol::problem_study_v1 {
         unit=directory/'problem.cpp'; unit.write_text(fixture)
         flags=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer','-fno-pie']
         subprocess.run([cc,'-std=c99',*flags,'-I',str(cjson),'-c',str(cjson/'cJSON.c'),'-o',str(directory/'cJSON.o')],check=True,timeout=30)
+        subprocess.run([cc,*flags,'-I'+str(args.idf_path/'components/esp_rom/include'),
+                        '-c',str(args.idf_path/'components/esp_rom/linux/esp_rom_crc.c'),
+                        '-o',str(directory/'crc.o')],check=True,timeout=30)
         binary=directory/'test'
         subprocess.run([cxx,'-std=c++17','-Wall','-Wextra','-Werror','-fno-builtin',*flags,'-no-pie',
                         '-DWQN_DEVICE_CONTROL_SCHEMA_SHA256="host"','-DWQN_PROBLEM_STUDY_SCHEMA_SHA256="host"',
+                        *(['-DPROBLEM_EVIDENCE_API=1'] if 'struct OutboxReadProof {' in body else []),
+                        '-I'+str(args.idf_path/'components/esp_rom/include'),
                         '-I',str(directory),'-I',str(root/'main'),'-I',str(root/'components/device_protocol/include'),
-                        '-I',str(cjson),str(unit),str(directory/'cJSON.o'),'-o',str(binary),
-                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=cJSON_CreateObject,--wrap=cJSON_ParseWithOpts'],
+                        '-I',str(cjson),str(unit),str(directory/'cJSON.o'),str(directory/'crc.o'),'-o',str(binary),
+                        '-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=rename,--wrap=remove,--wrap=fputc,--wrap=fflush,--wrap=fsync,--wrap=cJSON_CreateObject,--wrap=cJSON_ParseWithOpts'],
                        check=True,timeout=60)
-        return subprocess.run([str(binary),tmp],timeout=30,env=dict(os.environ,
+        return subprocess.run([str(binary),tmp,*(['evidence'] if args.evidence_only else [])],timeout=30,env=dict(os.environ,
                               ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1')).returncode
 
 

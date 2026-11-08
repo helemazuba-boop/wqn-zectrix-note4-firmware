@@ -149,6 +149,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/OUTBOX_RECOVERY_20261105.md` — ongoing R-08 offline raw
   preservation, native CRC inspection, pinned receipt collection/review plans,
   and remaining controlled repair/device work.
+- `docs/engineering/PROBLEM_OUTBOX_PRESERVATION_20261108.md` - R-09 raw source
+  retention before Problem repair, bounded slots, export compatibility and HIL.
 - `docs/engineering/RAW_FLASH_OFFLINE_IMPORT_20261107.md` - pinned raw images,
   read-only SDK import, forensic/receipt bridge and unresolved repair context.
 - `docs/engineering/OFFLINE_NVS_CONTEXT_20261107.md` - pinned raw NVS context,

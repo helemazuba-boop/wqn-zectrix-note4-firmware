@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include "esp_rom_crc.h"
 
 using esp_err_t = int;
 constexpr esp_err_t ESP_OK = 0, ESP_FAIL = -1;
@@ -41,6 +42,12 @@ FILE* bad_close_stream = nullptr;
 FILE* partial_write_stream = nullptr;
 bool fail_publish=false, fail_restore=false, stop_after_rotate=false;
 bool fail_empty_backup_cleanup=false, fail_newline=false;
+bool proof_fail_flush=false, proof_fail_sync=false, proof_fail_rename=false;
+bool proof_race_stage=false, proof_drift_copy=false, proof_drift_publish=false, proof_corrupt_saved=false;
+bool proof_copy_read_error=false, proof_copy_close_error=false;
+int proof_source_opens=0, proof_crash=0;
+FILE* proof_stream=nullptr;
+void ProofOpenHook(const char*,const char*);
 struct PublicationStop {};
 extern "C" FILE* __real_fopen(const char*, const char*);
 extern "C" int __real_fclose(FILE*);
@@ -48,10 +55,25 @@ extern "C" size_t __real_fwrite(const void*, size_t, size_t, FILE*);
 extern "C" int __real_rename(const char*, const char*);
 extern "C" int __real_remove(const char*);
 extern "C" int __real_fputc(int, FILE*);
+extern "C" int __real_fflush(FILE*);
+extern "C" int __real_fsync(int);
+extern "C" int __wrap_fflush(FILE* file) {
+    if(proof_fail_flush && file==proof_stream) { errno=EIO; return EOF; }
+    return __real_fflush(file);
+}
+extern "C" int __wrap_fsync(int fd) {
+    const bool evidence=proof_stream && fileno(proof_stream)==fd;
+    if(proof_fail_sync && evidence) { errno=EIO; return -1; }
+    const int result=__real_fsync(fd);
+    if(result==0 && evidence && proof_crash==1) _exit(73);
+    return result;
+}
 extern "C" int __wrap_rename(const char* from, const char* to) {
+    if(proof_fail_rename && std::strstr(from,".raw")) { errno=EIO; return -1; }
     if ((fail_publish && std::strcmp(from,kOutboxTempPath)==0) ||
         (fail_restore && std::strcmp(from,kOutboxBackupPath)==0)) { errno=EIO; return -1; }
     const int result=__real_rename(from,to);
+    if(result==0 && proof_crash==2 && std::strstr(from,".raw")) _exit(73);
     if(result==0 && stop_after_rotate && std::strcmp(from,kOutboxPath)==0 &&
        std::strcmp(to,kOutboxBackupPath)==0) throw PublicationStop{};
     return result;
@@ -67,6 +89,7 @@ extern "C" int __wrap_fputc(int ch, FILE* file) {
 }
 ssize_t FailRead(void*, char*, size_t) { errno = EIO; return -1; }
 extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
+    ProofOpenHook(path,mode);
     const bool reading = std::strcmp(mode, "rb") == 0;
     reading ? ++read_opens : ++write_opens;
     if (bad_open_path == path) { errno = EIO; return nullptr; }
@@ -80,12 +103,14 @@ extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
     }
     if (file != nullptr && bad_close_path == path) bad_close_stream = file;
     if (file != nullptr && !reading && partial_write_path == path) partial_write_stream = file;
+    if(file && std::strstr(path,".raw") && std::strchr(mode,'w')) proof_stream=file;
     return file;
 }
 extern "C" int __wrap_fclose(FILE* file) {
     const bool fail = file == bad_close_stream;
     if (fail) bad_close_stream = nullptr;
     if (file == partial_write_stream) partial_write_stream = nullptr;
+    if(file==proof_stream) proof_stream=nullptr;
     const int result = __real_fclose(file);
     if (fail) { errno = EIO; return EOF; }
     return result;
@@ -123,11 +148,19 @@ void Check(bool condition, const char* name) {
     condition ? ++passes : ++failures;
 }
 void Reset() {
+    proof_fail_flush=proof_fail_sync=proof_fail_rename=proof_race_stage=false;
+    proof_drift_copy=proof_drift_publish=proof_corrupt_saved=false;
+    proof_copy_read_error=proof_copy_close_error=false;
+    proof_source_opens=proof_crash=0; proof_stream=nullptr;
     fail_publish=fail_restore=stop_after_rotate=fail_empty_backup_cleanup=fail_newline=false;
     bad_open_path.clear(); bad_read_path.clear(); bad_close_path.clear(); partial_write_path.clear();
     bad_close_stream = partial_write_stream = nullptr;
     for (const char* path : {kOutboxPath, kOutboxTempPath, kOutboxBackupPath, kParkedPath, kRejectedPath}) {
         if (std::remove(path) != 0 && errno != ENOENT) std::abort();
+    }
+    for(unsigned i=0;i<4;++i) for(const char* suffix:{"",".tmp"}) {
+        const auto path=std::string(kOutboxPath)+".raw"+std::to_string(i)+suffix;
+        if(std::remove(path.c_str())!=0 && errno!=ENOENT) std::abort();
     }
     read_opens = write_opens = 0;
     @@RESET_CACHE@@
@@ -155,6 +188,13 @@ esp_err_t Snapshot(wqn::ProblemOutboxSnapshot* out) { *out = {}; return Snapshot
 bool PrimeEmpty() {
     Observation value;
     return Peek(&value) == ESP_ERR_NOT_FOUND;
+}
+esp_err_t RewriteForFixture(const std::vector<std::string>& lines) {
+#ifdef PROBLEM_EVIDENCE_API
+    return WriteOutboxLines(lines, OutboxReadProof{});
+#else
+    return WriteOutboxLines(lines);
+#endif
 }
 void RecoveryCases() {
     const auto a=Value("A"), b=Value("B"); Observation out;
@@ -471,14 +511,16 @@ static void DecoderAllocationCases() {
     Reset(); watched_lines.clear(); cJSON_InitHooks(nullptr);
 }
 #endif
+@@EVIDENCE@@
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
     std::snprintf(kOutboxPath, sizeof(kOutboxPath), "%s/outbox", argv[1]);
     std::snprintf(kOutboxTempPath, sizeof(kOutboxTempPath), "%s/temp", argv[1]);
     std::snprintf(kOutboxBackupPath, sizeof(kOutboxBackupPath), "%s/outbox.bak", argv[1]);
     std::snprintf(kParkedPath, sizeof(kParkedPath), "%s/parked", argv[1]);
     std::snprintf(kRejectedPath, sizeof(kRejectedPath), "%s/rejected", argv[1]);
+    if(argc==3) { EvidenceCases();return failures?1:0; }
     Observation out, a = Value(), b = Value("B");
     wqn::ProblemOutboxSnapshot snapshot;
     Reset();
@@ -526,18 +568,18 @@ int main(int argc, char** argv) {
     Check(Peek(&out) == ESP_ERR_NOT_FOUND && read_opens > previous_reads,
           "malformed nonempty payload never establishes empty evidence");
     Reset();
-    Check(WriteOutboxLines({""}) == ESP_OK && PrimeEmpty(), "blank-only payload has no uploadable record");
+    Check(RewriteForFixture({""}) == ESP_OK && PrimeEmpty(), "blank-only payload has no uploadable record");
     previous_reads = read_opens;
     Check(Peek(&out) == ESP_ERR_NOT_FOUND && read_opens > previous_reads,
           "discarded blank bytes do not count as a physically empty file");
     Reset();
-    Check(WriteOutboxLines({std::string(kMaxLineBytes + 1, 'x')}) == ESP_OK && PrimeEmpty(),
+    Check(RewriteForFixture({std::string(kMaxLineBytes + 1, 'x')}) == ESP_OK && PrimeEmpty(),
           "overlong-only payload follows the existing malformed-line policy");
     previous_reads = read_opens;
     Check(Peek(&out) == ESP_ERR_NOT_FOUND && read_opens > previous_reads,
           "discarded overlong bytes cannot establish physically empty evidence");
     Reset(); PrimeEmpty(); bad_open_path = kOutboxPath;
-    Check(WriteOutboxLines({EncodeObservationLine(a)}) == ESP_OK,
+    Check(RewriteForFixture({EncodeObservationLine(a)}) == ESP_OK,
           "direct rewrite invalidates empty evidence independently of public transaction");
     Check(Peek(&out) == ESP_FAIL, "read failure after rewrite cannot be masked by old empty cache");
     bad_open_path.clear();
@@ -566,7 +608,7 @@ int main(int argc, char** argv) {
           "bytes landed on failed append close are not hidden by stale cache");
     Reset(); PrimeEmpty(); bad_open_path = kParkedPath;
     // Successful payload rewrite and failed marker append are separate failures.
-    Check(WriteOutboxLines({EncodeObservationLine(a)}) == ESP_OK && Suspend(a) == ESP_FAIL,
+    Check(RewriteForFixture({EncodeObservationLine(a)}) == ESP_OK && Suspend(a) == ESP_FAIL,
           "failed park attempt preserves the payload and reports error");
     bad_open_path.clear();
     Check(Peek(&out) == ESP_OK && out.request_id == a.request_id,
@@ -578,6 +620,7 @@ int main(int argc, char** argv) {
     Check(Suspend(a) == ESP_FAIL && Peek(&out) == ESP_FAIL,
           "failed park preparatory read invalidates older empty evidence");
     RecoveryCases();
+    EvidenceCases();
 #if REAL_CODEC
     EncoderAllocationCases();
     DecoderAllocationCases();
