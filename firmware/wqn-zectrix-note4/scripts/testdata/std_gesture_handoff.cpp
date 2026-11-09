@@ -53,6 +53,43 @@ int main()
         RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress},3000,&state);
         check(std_status_bar_calls==calls+1,"idle status editor remains available");
     }
+    // Producer emits HoldPress at 200 ms and still emits ShortPress on release
+    // before 650 ms. Its raw Release is deferred to the following poll.
+    for(int duration:{200,400,649}) {
+        state={};state.ai.tier=wqn::AiTier::kStd;
+        state.ai.status=wqn::AiSessionStatus::kAwaitingConfirmation;
+        state.ai.pending_input="synthetic unsent input";state.ai.input_armed_at_ms=5000;
+        wqn::std_backend=state.ai;const int before=wqn::std_sends;
+        RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress},6000,&state);
+        RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kHoldPress},6200,&state);
+        RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress},6000+duration,&state);
+        RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kRelease},6010+duration,&state);
+        check(wqn::std_sends==before+1,"producer short press after 200ms hold must still confirm");
+    }
+    state={};state.ai.tier=wqn::AiTier::kStd;state.ai.status=wqn::AiSessionStatus::kTranscribing;
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress},6000,&state);
+    snapshot=state.ai;snapshot.status=wqn::AiSessionStatus::kAwaitingConfirmation;
+    snapshot.pending_input="synthetic unsent input";snapshot.input_armed_at_ms=6250;
+    state.ai=snapshot;wqn::std_backend=snapshot;const int tail_sends=wqn::std_sends;
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kHoldPress},6300,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress},6400,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kRelease},6410,&state);
+    check(wqn::std_sends==tail_sends,"a held PTT tail still has no fresh confirmation press");
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress},7000,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kHoldPress},7200,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kLongPress},7650,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kLongRelease},7700,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kRelease},7710,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress},7720,&state);
+    check(wqn::std_sends==tail_sends,"a long decision gesture and its tail cannot submit");
+    state={};state.ai.tier=wqn::AiTier::kStd;state.ai.status=wqn::AiSessionStatus::kAwaitingDecision;
+    state.ai.interaction.id="synthetic-question";state.ai.interaction.armed_at_ms=5000;
+    state.ai.interaction.options={{"yes","Yes"}};wqn::std_backend=state.ai;const int answers=wqn::std_answers;
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kPress},6000,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kHoldPress},6200,&state);
+    RouteStdOrStatusBar({wqn::ButtonId::kConfirm,wqn::ButtonEventType::kShortPress},6400,&state);
+    check(wqn::std_answers==answers+1&&state.ai.interaction.sending,"mid-length short press can answer a decision once");
+
     std::printf("STD handoff: %d checks, %d failures (production UI dispatch/snapshot; host ports; NOT HIL)\n",total,failed);
     return failed?1:0;
 }

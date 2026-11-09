@@ -86,7 +86,12 @@ bool ApplyStdAiInteractionEvent(const wqn::ButtonEvent& event, int64_t now_ms, w
             pressed_at = now_ms >= armed_at ? now_ms : 0;
             return true;
         }
-        if (event.type == wqn::ButtonEventType::kHoldPress ||
+        // The 200 ms PTT hold edge also precedes legitimate short presses
+        // (up to the producer's 650 ms long-press threshold). Keep a fresh
+        // decision press armed through that edge; only a long/released gesture
+        // retires it. A PTT tail has no post-armed press and still cannot send.
+        if (event.type == wqn::ButtonEventType::kLongPress ||
+            event.type == wqn::ButtonEventType::kLongRelease ||
             event.type == wqn::ButtonEventType::kRelease)
             pressed_at = 0;
         if (event.type == wqn::ButtonEventType::kShortPress ||

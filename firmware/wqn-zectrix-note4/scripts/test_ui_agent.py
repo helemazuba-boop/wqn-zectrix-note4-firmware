@@ -20,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--render-dir', type=Path)
     parser.add_argument('--handoff-only', action='store_true')
-    parser.add_argument('--mutation', choices=('bypass-transcribing-modal', 'keep-transcribing-editor'))
+    parser.add_argument('--mutation', choices=('bypass-transcribing-modal', 'keep-transcribing-editor', 'lose-midlength-short'))
     args = parser.parse_args()
     if args.mutation and not args.handoff_only:
         parser.error('--mutation requires --handoff-only')
@@ -38,6 +38,10 @@ def main():
         needle = 'state.ai.status == wqn::AiSessionStatus::kTranscribing ||'
         assert std_ui.count(needle) == 1
         std_ui = std_ui.replace(needle, 'false ||')
+    if args.mutation == 'lose-midlength-short':
+        needle = 'event.type == wqn::ButtonEventType::kLongPress ||'
+        assert std_ui.count(needle) == 1
+        std_ui = std_ui.replace(needle, 'event.type == wqn::ButtonEventType::kHoldPress ||')
     if args.mutation == 'keep-transcribing-editor':
         needle = 'snapshot.status == wqn::AiSessionStatus::kTranscribing ||'
         assert runtime.count(needle) == 1

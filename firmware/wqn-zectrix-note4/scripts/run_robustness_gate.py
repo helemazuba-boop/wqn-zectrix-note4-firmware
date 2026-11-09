@@ -47,7 +47,7 @@ def cases():
                        'runtime', ('test_std_ai.py',)))
     result.append(Case('std_gesture_handoff', 'STD: transcribing owns status-bar gestures and confirmation needs a fresh press',
                        'runtime', ('test_ui_agent.py', '--handoff-only')))
-    for mutation in ('bypass-transcribing-modal', 'keep-transcribing-editor'):
+    for mutation in ('bypass-transcribing-modal', 'keep-transcribing-editor', 'lose-midlength-short'):
         result.append(Case(f'std-{mutation}', 'STD: editor routing and snapshot handoff cannot escape transcribing ownership',
                            'controls', ('test_ui_agent.py', '--handoff-only', '--mutation', mutation), r'^FAIL STD handoff:',
                            r'STD handoff: \d+ checks, [1-9]\d* failures \(production UI dispatch/snapshot; host ports; NOT HIL\)'))
