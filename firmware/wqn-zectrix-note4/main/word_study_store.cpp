@@ -1069,7 +1069,7 @@ esp_err_t CheckOutboxAppendBudget(const OutboxScan& scan, bool observation)
 // [word-batch] One open/write/flush/sync/close for a bounded contiguous batch.
 // Every record keeps the existing v1 CRC and identity. A failed call may leave
 // a complete prefix plus a torn tail: callers must rescan before any retry.
-constexpr size_t kOutboxAppendBatchCapacity = 10;
+constexpr size_t kOutboxAppendBatchCapacity = wqn::kWordOutboxJournalBatchCapacity;
 
 esp_err_t AppendOutboxRecordsTo(
     const char* path,
@@ -1985,7 +1985,7 @@ esp_err_t PeekObservationExcludingTransaction(void* opaque)
 {
     auto* context = static_cast<PeekBatchContext*>(opaque);
     if (context == nullptr || context->observation == nullptr ||
-        (context->excluded != nullptr && context->excluded->size() > kOutboxAppendBatchCapacity))
+        (context->excluded != nullptr && context->excluded->size() > wqn::kWordOutboxReadExclusionCapacity))
         return ESP_ERR_INVALID_ARG;
     auto* observation = context->observation;
     OutboxScan* scan = nullptr;

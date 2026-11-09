@@ -27,6 +27,12 @@ class Case:
 
 def cases():
     result = []
+    result.append(Case('word_upload_store', 'Word upload: full store/protocol/selection, ACK groups and local retry deadline',
+                       'runtime', ('test_word_upload_store.py',)))
+    for mutation in ('small-peek', 'oversized-ack', 'no-read-backoff'):
+        result.append(Case(f'word-upload-store-{mutation}', 'Word upload: reject incompatible read/write limits and cursorless local retry',
+                           'controls', ('test_word_upload_store.py', '--mutation', mutation), r'^FAIL upload-store:',
+                           r'Word upload/store: \d+ checks, [1-9]\d* failures \(full production store/upload/protocol/retry; libc \+ worker/transport ports; NOT HIL\)'))
     for name in ('learning_time', 'word_session_start', 'rtc_timekeep', 'time_retention'):
         result.append(Case(name, 'R-11: calibrated-time admission, provenance/epoch, existing fact preservation and RTC/timer producers',
                            'runtime', (f'test_{name}.py',)))

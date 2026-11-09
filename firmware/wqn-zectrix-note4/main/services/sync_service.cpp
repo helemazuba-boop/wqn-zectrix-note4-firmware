@@ -1090,7 +1090,7 @@ std::string g_local_registered_session_id;
 // One batch request is bounded by the contract's 64-observation cap. A round
 // never re-sends a failing batch for every head: after one request-level
 // failure we fall back to the single-observation path for the rest of the round.
-constexpr size_t kMaxWordObservationBatchSize = 64;
+constexpr size_t kMaxWordObservationBatchSize = wqn::kWordOutboxReadExclusionCapacity;
 
 enum class SyncRoundOutcome : uint8_t {
     kSucceeded,
@@ -2290,15 +2290,22 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
     const auto flush_acknowledgements = [&]() -> esp_err_t {
         if (acknowledgements.empty()) return ESP_OK;
         if (ack_flush_failed) return ESP_FAIL;
-        const esp_err_t result = wqn::AcknowledgeWordObservations(acknowledgements, maintenance_gate);
-        if (result != ESP_OK) {
-            ack_flush_failed = true;
-            ScheduleWordOutboxRetry(acknowledgements.front(), 0, OutboxRetryCause::kLocalStorage);
-            ESP_LOGW(kTag, "word ACK batch failed: count=%u error=%s; durable payloads retained",
-                static_cast<unsigned>(acknowledgements.size()), esp_err_to_name(result));
-            return result;
+        while (!acknowledgements.empty()) {
+            const size_t count = std::min(acknowledgements.size(), wqn::kWordOutboxJournalBatchCapacity);
+            const std::vector<std::string> group(acknowledgements.begin(), acknowledgements.begin() + count);
+            const esp_err_t result = wqn::AcknowledgeWordObservations(group, maintenance_gate);
+            if (result != ESP_OK) {
+                ack_flush_failed = true;
+                ScheduleWordOutboxRetry(acknowledgements.front(), 0, OutboxRetryCause::kLocalStorage);
+                ESP_LOGW(kTag, "word ACK batch failed: count=%u remaining=%u error=%s; durable payloads retained",
+                    static_cast<unsigned>(count), static_cast<unsigned>(acknowledgements.size()),
+                    esp_err_to_name(result));
+                return result;
+            }
+            // Only the durably acknowledged prefix leaves this RAM list. A
+            // later write failure retries the first still-pending identity.
+            acknowledgements.erase(acknowledgements.begin(), acknowledgements.begin() + count);
         }
-        acknowledgements.clear();
         oldest_ack_ms = 0;
         return ESP_OK;
     };
@@ -2439,7 +2446,12 @@ WordOutboxUploadState UploadPendingWordObservations(const std::string& token)
                 wqn::DurableWordObservation next;
                 const esp_err_t peek = wqn::PeekPendingWordObservationExcluding(excluded, &next);
                 if (peek == ESP_ERR_NOT_FOUND) break;
-                if (peek != ESP_OK) return WordOutboxUploadState::kPending;
+                if (peek != ESP_OK) {
+                    ESP_LOGW(kTag, "word outbox batch selection failed: selected=%u error=%s; retry deferred",
+                        static_cast<unsigned>(records.size()), esp_err_to_name(peek));
+                    ScheduleWordOutboxRetry(pending.request_id, 0, OutboxRetryCause::kLocalStorage);
+                    return WordOutboxUploadState::kPending;
+                }
                 if (next.session_id != pending.session_id ||
                     next.sequence != records.back().sequence + 1) break;
                 excluded.push_back(next.request_id);

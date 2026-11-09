@@ -166,6 +166,8 @@ by code, `AGENTS.md`, and the architecture/product references above.
 - `docs/engineering/WIFI_CONNECTIVITY_REPAIR.md` — provisioning and network
   switching repair record.
 
+- `docs/engineering/WORD_UPLOAD_BATCH_BOUNDARY_20261109.md` - separate 64-ID upload selection from 10-record journal writes and defer local selection faults.
+
 ## Release
 
 - `docs/release/RELEASE_INTEGRATION_20261027.md` — current cloud/firmware integration,

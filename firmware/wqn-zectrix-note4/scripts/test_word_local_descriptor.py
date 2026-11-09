@@ -8,6 +8,8 @@ and link-time --wrap redirects /storage/* to a temp dir. StorageService
 transactions run inline (the seam), so the 4 durable APIs are exercised end to
 end on real libc files. No SPIFFS/power-loss/concurrency HIL proof.
 """
+import argparse
+import os
 import shutil
 import subprocess
 import tempfile
@@ -165,7 +167,7 @@ inline void WqnFixtureLog(const char*, const char*, ...) {}
 '''
 
 
-def main(fixture_source=None):
+def main(fixture_source=None, *, source=None, mutation=None, real_protocol=False):
     root = Path(__file__).resolve().parents[1]
     gpp = shutil.which('g++')
     if not gpp:
@@ -191,6 +193,13 @@ def main(fixture_source=None):
         for name in ('word_study_store.h', 'word_local_session.h',
                      'word_study_store.cpp', 'word_local_session.cpp'):
             shutil.copy(root / 'main' / name, d / name)
+        store_source = (source or root / 'main/word_study_store.cpp').read_text(encoding='utf-8')
+        if mutation == 'ignore-eligibility-readiness':
+            old = 'if (!wqn::IsWordDeckScopeReady() ||\n        e.deck_scope_generation != wqn::GetDeckScopeGeneration())'
+            if store_source.count(old) != 1:
+                raise RuntimeError('eligibility readiness mutation boundary drift')
+            store_source = store_source.replace(old, 'if (e.deck_scope_generation != wqn::GetDeckScopeGeneration())')
+        (d / 'word_study_store.cpp').write_text(store_source, encoding='utf-8')
         fixture = fixture_source if fixture_source is not None else (
             root / 'scripts/testdata/word_local_descriptor.cpp').read_text(encoding='utf-8')
         (d / 'fixture.cpp').write_text(fixture, encoding='utf-8')
@@ -209,6 +218,13 @@ const char* CandidatePolicyVersionName(Ordering o){
   } return "";
 }}
 ''', encoding='utf-8')
+        extra_sources = []
+        if real_protocol:
+            cjson = Path(os.environ.get('IDF_PATH', '/home/unknow/esp/esp-idf-v5.5'))/'components/json/cJSON'
+            (d / 'policy.cpp').write_text('', encoding='utf-8')
+            extra_sources = ['-I'+str(cjson), '-I'+str(root/'components/device_protocol/include'),
+                             str(root/'components/device_protocol/word_study.cpp'),
+                             str(cjson/'cJSON.c')]
         cmd = [
             gpp, '-std=c++17', '-Wall', '-Wextra', '-Werror',
             '-include', str(d / 'wqn_macros.h'),
@@ -220,6 +236,7 @@ const char* CandidatePolicyVersionName(Ordering o){
             str(d / 'word_local_session.cpp'),
             str(d / 'policy.cpp'),
             str(d / 'fixture.cpp'),
+            *extra_sources,
             '-Wl,--wrap=fopen,--wrap=rename,--wrap=remove,--wrap=stat,--wrap=opendir',
             '-lcrypto', '-o', str(d / 'test'),
         ]
@@ -236,4 +253,8 @@ const char* CandidatePolicyVersionName(Ordering o){
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path)
+    parser.add_argument('--mutation', choices=('ignore-eligibility-readiness',))
+    args = parser.parse_args()
+    raise SystemExit(main(source=args.source, mutation=args.mutation))

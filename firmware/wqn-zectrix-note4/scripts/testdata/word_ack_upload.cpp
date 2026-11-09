@@ -82,6 +82,7 @@ esp_err_t SubmitWordStudyObservationBatchV1(const std::string&,
 }
 namespace wqn {
 esp_err_t PeekPendingWordObservationExcluding(const std::vector<std::string>& excluded,DurableWordObservation* out) {
+    if(excluded.size()>kWordOutboxReadExclusionCapacity) return ESP_ERR_INVALID_ARG;
     for(const auto& entry:queue) if(std::find(excluded.begin(),excluded.end(),entry.request_id)==excluded.end() &&
         (!model_suspension_fence || std::none_of(parked.begin(),parked.end(),[&](const auto& old){return old.session_id==entry.session_id;}))) {
         *out=entry; return ESP_OK;
@@ -90,6 +91,7 @@ esp_err_t PeekPendingWordObservationExcluding(const std::vector<std::string>& ex
 }
 esp_err_t AcknowledgeWordObservations(const std::vector<std::string>& ids) {
     ++ack_calls; ack_sizes.push_back(ids.size()); order.push_back("ack");
+    if(ids.empty() || ids.size()>kWordOutboxJournalBatchCapacity) return ESP_ERR_INVALID_ARG;
     if(ack_calls==fail_ack_at) return ESP_FAIL;
     queue.erase(std::remove_if(queue.begin(),queue.end(),[&](const auto& entry) {
         return std::find(ids.begin(),ids.end(),entry.request_id)!=ids.end();
@@ -217,8 +219,8 @@ int main() {
         x.item_id="22222222-2222-4222-8222-222222222222";
         x.occurred_at="2026-11-05T10:00:00Z";}enable_batch=true;};
     ValidQueue(64); Check(UploadPendingWordObservations("fixture")==S::kDrained &&
-        batch_calls==1 && attempts==0 && ack_sizes==std::vector<size_t>{64},
-        "64 facts use one validated batch and one durable ACK");
+        batch_calls==1 && attempts==0 && ack_sizes==std::vector<size_t>{10,10,10,10,10,10,4},
+        "64 facts use one validated batch and bounded durable ACK groups");
     ValidQueue(4);batch_prefix=2;
     Check(UploadPendingWordObservations("fixture")==S::kPending && ack_sizes==std::vector<size_t>{2} &&
         queue.size()==2 && queue.front().sequence==2,"partial receipt ACKs only prefix and preserves failed item/tail");

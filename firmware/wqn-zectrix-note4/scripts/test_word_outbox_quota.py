@@ -29,7 +29,9 @@ def main():
     quota = 'constexpr size_t kOutboxMaxRecords =' in source
     batch = 'constexpr size_t kOutboxAppendBatchCapacity =' in source
     pieces = {
-        '@@BATCH_ENABLED@@': f'#define FIXTURE_BATCH {int(batch)}\n',
+        '@@BATCH_ENABLED@@': f'#define FIXTURE_BATCH {int(batch)}\nnamespace wqn {{\n' +
+            '\n'.join(n for n in (root/'main/word_study_store.h').read_text().splitlines()
+                       if n.startswith('inline constexpr size_t kWordOutbox')) + '\n}\n',
         '@@RECORDS@@': section(source, '#pragma pack(push, 1)\nstruct SessionHeader {',
                               '\n// Every public operation below'),
         '@@UTILITIES@@': section(source, 'uint32_t Crc32(',

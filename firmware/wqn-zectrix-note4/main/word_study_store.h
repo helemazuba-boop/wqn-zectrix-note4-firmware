@@ -13,6 +13,11 @@
 
 namespace wqn {
 
+// Upload selection is read-only and may span a full protocol batch. Journal
+// appends/ACK writes remain small, independently bounded storage operations.
+inline constexpr size_t kWordOutboxReadExclusionCapacity = 64;
+inline constexpr size_t kWordOutboxJournalBatchCapacity = 10;
+
 enum class WordPresentationPhase : uint8_t {
     kFront = 0,
     kBack = 1,
@@ -198,8 +203,9 @@ esp_err_t CommitWordObservations(
     const std::vector<DurableWordObservation>& observations,
     const PersistedWordSession& advanced_session);
 esp_err_t PeekPendingWordObservation(DurableWordObservation* observation);
-// Skip only the bounded list already accepted by the server in this upload
-// round. They remain durable pending records until the batch ACK succeeds.
+// Read-only selection skips at most kWordOutboxReadExclusionCapacity identities
+// already selected or accepted in this upload round. They stay durable pending
+// records until their separately bounded journal ACK succeeds.
 esp_err_t PeekPendingWordObservationExcluding(
     const std::vector<std::string>& request_ids, DurableWordObservation* observation);
 // Advisory admission for routine maintenance only. StorageService invokes
