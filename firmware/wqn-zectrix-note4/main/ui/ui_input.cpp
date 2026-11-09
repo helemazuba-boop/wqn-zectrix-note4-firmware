@@ -1445,7 +1445,8 @@ RefreshSchedule ApplyButtonEvent(
     if (navigation == wqn::NavigationAction::kConsumed) return RefreshSchedule::kNone;
 
     // [shell] Status-bar edit mode intercepts all input on the AI page.
-    if (state->screen == wqn::UiScreen::kAi && state->status_edit.active) {
+    if (state->screen == wqn::UiScreen::kAi && state->status_edit.active &&
+        !StdAiInteractionOwnsInput(*state)) {
         return ApplyStatusBarEditEvent(event, event_time_ms, state);
     }
 

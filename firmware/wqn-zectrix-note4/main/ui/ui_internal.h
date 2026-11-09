@@ -791,6 +791,7 @@ int StdAiBottomReserve(const wqn::AiSessionState& ai);
 void DrawStdAiInteraction(const wqn::UiFrame& frame);
 void DrawAgentPendingBubble(const std::string& text, const char* title, size_t max_lines = 3);
 void DrawAgentOptionBar(AgentOptionMode mode, uint8_t focused, const wqn::AgentSessionState& agent);
+bool StdAiInteractionOwnsInput(const wqn::UiState& state);
 bool ApplyStdAiInteractionEvent(const wqn::ButtonEvent& event, int64_t now_ms, wqn::UiState* state,
                                 RefreshSchedule* schedule);
 int AiBottomReserve(const wqn::AgentSessionState& agent);

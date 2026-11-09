@@ -33,6 +33,19 @@ def cases():
         result.append(Case(f'word-upload-store-{mutation}', 'Word upload: reject incompatible read/write limits and cursorless local retry',
                            'controls', ('test_word_upload_store.py', '--mutation', mutation), r'^FAIL upload-store:',
                            r'Word upload/store: \d+ checks, [1-9]\d* failures \(full production store/upload/protocol/retry; libc \+ worker/transport ports; NOT HIL\)'))
+    result.append(Case('sdk_stream_poll', 'STD ASR: installed SDK read cannot widen a short poll in its data callback',
+                       'runtime', ('test_sdk_stream_poll.py',)))
+    result.append(Case('sdk-stream-full-read-budget', 'STD ASR: detect the post-terminal SDK fill-buffer stall', 'controls',
+                       ('test_sdk_stream_poll.py', '--mutation', 'full-read-budget'), r'^FAIL sdk-poll:',
+                       r'SDK stream poll: \d+ checks, [1-9]\d* failures \(installed SDK read \+ production helper; parser/TCP/clock ports; NOT HIL\)'))
+    result.append(Case('std_ai', 'STD: transcription error never becomes a send confirmation',
+                       'runtime', ('test_std_ai.py',)))
+    result.append(Case('std_gesture_handoff', 'STD: transcribing owns status-bar gestures and confirmation needs a fresh press',
+                       'runtime', ('test_ui_agent.py', '--handoff-only')))
+    for mutation in ('bypass-transcribing-modal', 'keep-transcribing-editor'):
+        result.append(Case(f'std-{mutation}', 'STD: editor routing and snapshot handoff cannot escape transcribing ownership',
+                           'controls', ('test_ui_agent.py', '--handoff-only', '--mutation', mutation), r'^FAIL STD handoff:',
+                           r'STD handoff: \d+ checks, [1-9]\d* failures \(production UI dispatch/snapshot; host ports; NOT HIL\)'))
     for name in ('learning_time', 'word_session_start', 'rtc_timekeep', 'time_retention'):
         result.append(Case(name, 'R-11: calibrated-time admission, provenance/epoch, existing fact preservation and RTC/timer producers',
                            'runtime', (f'test_{name}.py',)))

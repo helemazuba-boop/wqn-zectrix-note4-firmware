@@ -1188,7 +1188,8 @@ UiUpdate UiRuntime::DispatchAiSessionSnapshot(const wqn::AiSessionState& snapsho
         state_.agent_option.focused = 0;
         state_.gestures.std_decision_press_ms = 0;
     }
-    if (snapshot.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+    if (snapshot.status == wqn::AiSessionStatus::kTranscribing ||
+        snapshot.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
         snapshot.status == wqn::AiSessionStatus::kAwaitingDecision) {
         state_.status_edit.active = false;
         state_.gestures.last_ai_confirm_tap_ms = 0;

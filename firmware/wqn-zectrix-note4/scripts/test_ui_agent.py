@@ -19,7 +19,11 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--render-dir', type=Path)
+    parser.add_argument('--handoff-only', action='store_true')
+    parser.add_argument('--mutation', choices=('bypass-transcribing-modal', 'keep-transcribing-editor'))
     args = parser.parse_args()
+    if args.mutation and not args.handoff_only:
+        parser.error('--mutation requires --handoff-only')
     page = (root/'main/ui/page_ai_agent.cpp').read_text()
     display = (root/'components/display_service/display_service.cpp').read_text()
     refresh = (root/'main/ui/ui_refresh.cpp').read_text()
@@ -29,9 +33,22 @@ def main():
     ai_model = ai_model[ai_model.index('enum class AiSessionStatus'):ai_model.index('enum class TodoSyncStatus')]
     std_ui = (root/'main/ui/ai_std_interaction.cpp').read_text()
     std_ui = std_ui[std_ui.index('wqn::AgentSessionState StdDecisionSurface('):std_ui.rfind('\n}')]
+    runtime = (root/'main/ui/ui_runtime.cpp').read_text()
+    if args.mutation == 'bypass-transcribing-modal':
+        needle = 'state.ai.status == wqn::AiSessionStatus::kTranscribing ||'
+        assert std_ui.count(needle) == 1
+        std_ui = std_ui.replace(needle, 'false ||')
+    if args.mutation == 'keep-transcribing-editor':
+        needle = 'snapshot.status == wqn::AiSessionStatus::kTranscribing ||'
+        assert runtime.count(needle) == 1
+        runtime = runtime.replace(needle, 'false ||')
     replacements = {
         '@@AI_MODEL@@': ai_model,
+        '@@SNAPSHOT@@': section(runtime, 'UiUpdate UiRuntime::DispatchAiSessionSnapshot(', '// [follow] Per-tick auto-follow.'),
         '@@STD_UI@@': std_ui,
+        '@@STD_ROUTING@@': section(input_source,
+            '    // [shell] Status-bar edit mode intercepts all input on the AI page.',
+            '    RefreshSchedule agent_schedule ='),
         '@@FONT_LOOKUP@@': section(display, 'const lv_font_fmt_txt_glyph_dsc_t* FindGlyphInFont(', 'int MeasureCodepointWidth('),
         '@@FONT_DRAW@@': section(display, 'void DrawGlyphFromFont(', 'void DrawCjkGlyph('),
         '@@FONT_MEASURE@@': section(display, 'int MeasureTextWithFont(', 'std::string TruncateUtf8TextToWidth('),
@@ -46,6 +63,10 @@ def main():
     for key, value in replacements.items():
         assert fixture.count(key) == 1, key
         fixture = fixture.replace(key, value)
+    if args.handoff_only:
+        assert fixture.count('int main(') == 1
+        fixture = fixture.replace('int main(', 'int LegacyUiMain(')
+        fixture += (root/'scripts/testdata/std_gesture_handoff.cpp').read_text()
     with tempfile.TemporaryDirectory(prefix='wqn-agent-host-') as temp:
         folder = Path(temp)
         (folder/'esp_err.h').write_text('#pragma once\nusing esp_err_t = int;\nconstexpr int ESP_OK=0;\n')
@@ -68,8 +89,8 @@ def main():
         if args.render_dir:
             args.render_dir.mkdir(parents=True,exist_ok=True)
             command.append(str(args.render_dir.resolve()))
-        subprocess.run(command,check=True,timeout=30)
+        return subprocess.run(command,check=False,timeout=30).returncode
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

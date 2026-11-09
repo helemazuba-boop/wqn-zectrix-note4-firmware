@@ -8,13 +8,13 @@
 #include <vector>
 #include "wqn_api.h"
 #include "agent_round_policy.h"
+#define ESP_LOGI(...) do {} while (0)
 
 static int checks=0;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); std::abort(); } } while(0)
 #define ESP_RETURN_ON_ERROR(call,tag,message) do { auto result=(call); if(result!=ESP_OK) return result; } while(0)
 #define ESP_LOGW(...) do {} while(0)
 constexpr int portMAX_DELAY=0;
-constexpr esp_err_t ESP_ERR_INVALID_SIZE=0x104;
 int64_t esp_timer_get_time() { return 1000000; }
 void xSemaphoreTake(void*,int) {}
 void xSemaphoreGive(void*) {}
@@ -78,9 +78,10 @@ bool AgentVoiceCancelRequested() { return cancelled; }
 void AgentVoiceClearCancel() { cancelled=false; }
 esp_err_t AgentVoiceTurnFinalize(int,uint32_t,std::string* transcript) { *transcript=recognized;return asr_result; }
 esp_err_t LoadAccessTokenFromStorageService(std::string* token) { *token="fixture";return ESP_OK; }
+std::string server_asr_error;
 esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,WqnAiChatResponse* response) {
     CHECK(request.transcribe_only);CHECK(request.confirmed_text.empty());
-    ++asr_uploads;response->transcript=recognized;return ESP_OK;
+    ++asr_uploads;response->transcript=recognized;response->error_code=server_asr_error;return ESP_OK;
 }
 esp_err_t PostAiInteractionReply(const std::string&,const std::string& id,const std::string& answer,std::string* error) {
     ++replies;sent_id=id;sent_answer=answer;*error="fixture loss";
@@ -115,6 +116,11 @@ int main() {
     g_state.status=AiSessionStatus::kTranscribing;g_worker_command=AiWorkerCommand::kSubmitSession;
     asr_result=ESP_ERR_INVALID_STATE;TranscribeInput();
     CHECK(asr_uploads==1&&g_state.status==AiSessionStatus::kAwaitingConfirmation);
+    g_state={};g_state.status=AiSessionStatus::kTranscribing;g_worker_command=AiWorkerCommand::kSubmitSession;
+    server_asr_error="asr_failed";TranscribeInput();
+    CHECK(g_state.status==AiSessionStatus::kError&&g_state.pending_input.empty());
+    CHECK(g_worker_command==AiWorkerCommand::kNone);
+    server_asr_error.clear();
     g_state.status=AiSessionStatus::kTranscribing;g_worker_command=AiWorkerCommand::kSubmitSession;
     asr_result=ESP_OK;cancelled=true;TranscribeInput();
     CHECK(g_state.pending_input.empty()&&g_state.status==AiSessionStatus::kIdle);

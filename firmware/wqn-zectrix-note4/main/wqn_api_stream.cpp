@@ -283,7 +283,20 @@ bool ApplyRemainingTimeout(StreamContext* ctx, esp_http_client_handle_t client)
     CheckDeadline(ctx);
     return false;
   }
-  return esp_http_client_set_timeout_ms(client, static_cast<int>(remaining_ms)) == ESP_OK;
+  // The SDK may perform another transport read after ON_DATA returns. Keep
+  // its fill-buffer loop on the same short poll even when a data callback
+  // updates the remaining budget; otherwise that callback restores a 120 s
+  // socket wait after the caller selected a 500 ms cancellation/terminal poll.
+  const int timeout_ms = std::strcmp(ctx->phase, "read") == 0
+      ? static_cast<int>(std::min<int64_t>(500, remaining_ms))
+      : static_cast<int>(remaining_ms);
+  if (esp_http_client_set_timeout_ms(client, timeout_ms) != ESP_OK) {
+    ctx->fatal = true;
+    ctx->error_code = "transport_failed";
+    ctx->error_message = "stream timeout configuration failed";
+    return false;
+  }
+  return true;
 }
 
 void CloseStream(StreamContext* ctx, esp_http_client_handle_t client)
@@ -375,8 +388,11 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
         LogHttpTrace(ctx, "first_data", ESP_OK);
       }
       CaptureHttpStatus(ctx, evt->client);
-      if (!CheckDeadline(ctx) || ctx->fatal || ctx->terminal_event_seen) {
+      if (!CheckDeadline(ctx) || ctx->fatal) {
         CloseStream(ctx, evt->client);
+        return ESP_OK;
+      }
+      if (ctx->terminal_event_seen) {
         return ESP_OK;
       }
       if (!ctx->parser.feed(static_cast<const char*>(evt->data), evt->data_len)) {
@@ -411,7 +427,10 @@ esp_err_t OnHttpEvent(esp_http_client_event_t* evt)
           break;
         }
       }
-      if (ctx->fatal || ctx->terminal_event_seen || !ApplyRemainingTimeout(ctx, evt->client)) {
+      // A normal terminal is closed by the owner after the SDK read returns.
+      // Fatal/deadline paths still interrupt the transport here: a continuous
+      // stream must not fill another SDK buffer beyond the absolute budget.
+      if (ctx->fatal || !ApplyRemainingTimeout(ctx, evt->client)) {
         CloseStream(ctx, evt->client);
       }
       break;
@@ -613,8 +632,7 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
         request.pump(request.pump_ctx);
       if (!CheckDeadline(&ctx))
         break;
-      const bool interactive_poll = request.pump != nullptr || request.cancelled != nullptr;
-      if (interactive_poll) {
+      {
         // IDF returns -ESP_ERR_HTTP_EAGAIN on a quiet socket. Keep one
         // absolute turn budget, but give its owner a bounded chance to drain
         // decisions/cancellation even while the model is silent.
@@ -631,7 +649,7 @@ esp_err_t UploadAiAudioChatStream(const WqnAiStreamRequest& request,
       if (ctx.terminal_event_seen || ctx.fatal) {
         LogHttpTrace(&ctx, "read_return", r < 0 ? ESP_FAIL : ESP_OK);
       }
-      if (interactive_poll && r == -ESP_ERR_HTTP_EAGAIN)
+      if (r == -ESP_ERR_HTTP_EAGAIN)
         continue;
       if (r < 0) {
         err = ESP_FAIL;

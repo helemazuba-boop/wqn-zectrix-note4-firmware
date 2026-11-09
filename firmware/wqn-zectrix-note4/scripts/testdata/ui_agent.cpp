@@ -51,8 +51,9 @@ struct UiState {
     UiScreen screen=UiScreen::kAi;
     AiSessionState ai = []{ AiSessionState value; value.tier=AiTier::kAgent; return value; }();
     AgentSessionState agent;
+    StatusBarEditState status_edit;
     struct { uint8_t focused=0; } agent_option;
-    struct { int64_t last_agent_confirm_tap_ms=0; int64_t std_decision_press_ms=0; } gestures;
+    struct { int64_t last_agent_confirm_tap_ms=0; int64_t std_decision_press_ms=0; int64_t last_ai_confirm_tap_ms=0; } gestures;
 };
 int sends=0, discards=0, approvals=0, denials=0, answers=0, interrupts=0, creates=0, locks=0, observes=0, moves=0;
 int answer_index=-1;
@@ -117,6 +118,24 @@ void SyncAgentSnapshot(wqn::UiState*) {}
 @@PICKER@@
 @@STATUS@@
 @@STD_UI@@
+int std_status_bar_calls=0;
+RefreshSchedule ApplyStatusBarEditEvent(const wqn::ButtonEvent&,int64_t,wqn::UiState*) {
+    ++std_status_bar_calls;
+    return RefreshSchedule::kAi;
+}
+RefreshSchedule RouteStdOrStatusBar(const wqn::ButtonEvent& event,int64_t event_time_ms,wqn::UiState* state) {
+@@STD_ROUTING@@
+    return RefreshSchedule::kNone;
+}
+struct UiUpdate {};
+enum class AppEventKind { kAiSessionSnapshot };
+class UiRuntime {
+public:
+    wqn::UiState state_;
+    UiUpdate FinishEvent(AppEventKind,RefreshSchedule,bool) { return {}; }
+    UiUpdate DispatchAiSessionSnapshot(const wqn::AiSessionState&);
+};
+@@SNAPSHOT@@
 std::string AgentSignature(const wqn::UiFrame& frame) {
     std::string signature;
 @@SIGNATURE@@
@@ -234,6 +253,21 @@ int main(int argc,char**argv) {
     for(int i=0;i<5;++i)wqn::ScrollOpenCodeResponse(-1,-10,40,step);
     CHECK(wqn::backend.ui.scroll_offset_lines==-10);CHECK(!wqn::ScrollOpenCodeResponse(-1,-10,40,step));
     // STD uses the same pixels/option window, with a separate backend adapter.
+    for(int selected:{0,4}) {
+        for(auto type:{wqn::ButtonEventType::kPress,wqn::ButtonEventType::kHoldPress,
+                      wqn::ButtonEventType::kShortPress,wqn::ButtonEventType::kDoublePress,
+                      wqn::ButtonEventType::kLongPress,wqn::ButtonEventType::kLongRelease,
+                      wqn::ButtonEventType::kRelease}) {
+            state={};state.ai.tier=wqn::AiTier::kStd;state.ai.status=wqn::AiSessionStatus::kTranscribing;
+            state.status_edit.active=true;state.status_edit.selected=selected;
+            state.gestures.std_decision_press_ms=1000;state.gestures.last_ai_confirm_tap_ms=1000;
+            const int before=std_status_bar_calls;
+            RouteStdOrStatusBar({wqn::ButtonId::kConfirm,type},2000,&state);
+            CHECK(std_status_bar_calls==before);
+            CHECK(state.ai.tier==wqn::AiTier::kStd&&state.ai.status==wqn::AiSessionStatus::kTranscribing);
+            CHECK(!state.status_edit.active&&state.gestures.std_decision_press_ms==0&&state.gestures.last_ai_confirm_tap_ms==0);
+        }
+    }
     state={};state.ai.tier=wqn::AiTier::kStd;state.ai.status=wqn::AiSessionStatus::kAwaitingConfirmation;
     state.ai.pending_input="这句话还没有发送";wqn::std_backend=state.ai;
     RefreshSchedule std_schedule=RefreshSchedule::kNone;
@@ -268,4 +302,5 @@ int main(int argc,char**argv) {
     auto std_surface=StdDecisionSurface(std_frame.ai);CHECK(AgentQuestionItemCount(std_surface)==2);
     wqn::ClearEpdFramebuffer();DrawStdAiInteraction(std_frame);CheckBounds();Save(folder,"std-write-confirmation");
     std::printf("Agent and STD production UI: %d assertions passed\n",checks);
+    return 0;
 }

@@ -19,6 +19,14 @@ wqn::AgentSessionState StdDecisionSurface(const wqn::AiSessionState& ai)
     return surface;
 }
 
+bool StdAiInteractionOwnsInput(const wqn::UiState& state)
+{
+    return state.screen == wqn::UiScreen::kAi && state.ai.tier == wqn::AiTier::kStd &&
+        (state.ai.status == wqn::AiSessionStatus::kTranscribing ||
+         state.ai.status == wqn::AiSessionStatus::kAwaitingConfirmation ||
+         !state.ai.interaction.id.empty());
+}
+
 int StdAiBottomReserve(const wqn::AiSessionState& ai)
 {
     return ai.status == wqn::AiSessionStatus::kAwaitingConfirmation || !ai.interaction.id.empty()
@@ -52,12 +60,22 @@ void DrawStdAiInteraction(const wqn::UiFrame& frame)
 bool ApplyStdAiInteractionEvent(const wqn::ButtonEvent& event, int64_t now_ms, wqn::UiState* state,
                                 RefreshSchedule* schedule)
 {
-    if (state->screen != wqn::UiScreen::kAi || state->ai.tier != wqn::AiTier::kStd)
+    if (!StdAiInteractionOwnsInput(*state))
         return false;
     const bool input = state->ai.status == wqn::AiSessionStatus::kAwaitingConfirmation;
-    if (!input && state->ai.interaction.id.empty())
-        return false;
     *schedule = RefreshSchedule::kNone;
+    if (state->status_edit.active) {
+        state->status_edit.active = false;
+        *schedule = RefreshSchedule::kAi;
+    }
+    state->gestures.last_ai_confirm_tap_ms = 0;
+    if (state->ai.status == wqn::AiSessionStatus::kTranscribing) {
+        // Transcription owns the whole gesture, including the release tail
+        // of PTT and attempted status-bar shortcuts. Only a later fresh press
+        // may answer the confirmation armed by the finished transcript.
+        state->gestures.std_decision_press_ms = 0;
+        return true;
+    }
     if (state->ai.interaction.sending)
         return true;
     const int64_t armed_at =

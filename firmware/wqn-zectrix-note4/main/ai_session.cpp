@@ -998,6 +998,9 @@ void TranscribeInput()
                 request.cancelled = &wqn::AgentVoiceCancelRequested;
                 wqn::WqnAiChatResponse response;
                 result = wqn::UploadAiAudioChatStream(request, &response);
+                // Stream completion alone is not ASR success: an error frame
+                // can close an otherwise valid SSE/HTTP exchange.
+                if (result == ESP_OK && !response.error_code.empty()) result = ESP_FAIL;
                 transcript = response.transcript;
             }
         }
@@ -1031,6 +1034,9 @@ void TranscribeInput()
     }
     g_state.user_partial.clear();
     g_state.toast_visible = false;
+    ESP_LOGI(kTag, "STD transcription settled: status=%d pending_bytes=%u result=%s cancelled=%d",
+             static_cast<int>(g_state.status), static_cast<unsigned>(g_state.pending_input.size()),
+             esp_err_to_name(result), g_state.status == wqn::AiSessionStatus::kIdle ? 1 : 0);
     MarkChanged();
     FinishSubmitTaskLocked();
     xSemaphoreGive(g_lock);
