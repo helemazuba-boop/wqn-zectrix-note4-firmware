@@ -13,6 +13,8 @@ from test_audio_runtime import function
 
 
 PORTS = {
+    'freertos/FreeRTOS.h': '#pragma once\n#include <cstdint>\nusing TickType_t=uint32_t;\n#define pdMS_TO_TICKS(x) (x)\n',
+    'freertos/task.h': '#pragma once\n#include "freertos/FreeRTOS.h"\nvoid vTaskDelay(TickType_t);\n',
     'esp_err.h': '''#pragma once
 using esp_err_t=int;
 constexpr int ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NO_MEM=257, ESP_ERR_INVALID_ARG=258;
@@ -68,7 +70,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--before', help='compile the client from a git revision')
     parser.add_argument('--mutation', choices=('no-deadline','ignore-waiting','failed-reply-clears',
-                                               'ignore-reply-session','unvalidated-progress','wire-unbounded-budget'))
+                                               'ignore-reply-session','unvalidated-progress','wire-unbounded-budget','no-header-wait'))
     args = parser.parse_args()
     code = (subprocess.check_output(['git', 'show', f'{args.before}:firmware/wqn-zectrix-note4/main/opencode_client.cpp'],
                                    cwd=root, text=True) if args.before else (root/'main/opencode_client.cpp').read_text())
@@ -96,9 +98,10 @@ def main():
                                      'if (DispatchAgentEvent(event_name, event_data, request.callback, request.callback_ctx, &event) || true)'),
             'wire-unbounded-budget': ('kAgentStreamIdleTimeoutMs * 1000LL',
                                       'kAgentStreamIdleTimeoutMs * 1000000000LL'),
+            'no-header-wait': ('if (fetched != -ESP_ERR_HTTP_EAGAIN)', 'if (fetched < 0)'),
         }
         needle, replacement = mutations[args.mutation]
-        client_mutation = args.mutation in ('unvalidated-progress', 'wire-unbounded-budget')
+        client_mutation = args.mutation in ('unvalidated-progress', 'wire-unbounded-budget', 'no-header-wait')
         target = code if client_mutation else policy
         if target.count(needle) != 1:
             raise SystemExit('FAIL: Agent progress mutation boundary drift')

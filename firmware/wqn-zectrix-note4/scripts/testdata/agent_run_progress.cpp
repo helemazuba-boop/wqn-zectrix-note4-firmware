@@ -14,6 +14,7 @@
 #include "agent_run_progress.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "freertos/task.h"
 
 constexpr int64_t first_ms = wqn::AgentRunProgress::kFirstEventUs / 1000;
 constexpr int64_t progress_ms = wqn::AgentRunProgress::kProgressUs / 1000;
@@ -21,6 +22,7 @@ constexpr char request_id[] = "0011223344556677";
 int64_t clock_ms = 0;
 int inits = 0, stream_opens = 0, run_posts = 0, reply_posts = 0, interrupts = 0;
 int closes = 0, cleanups = 0, live_clients = 0, peak_clients = 0, failed_replies = 0;
+int header_calls = 0, json_opens = 0, json_written_bytes = 0, json_cleanups = 0;
 size_t checks = 0, failures = 0;
 std::string submitted_body, reply_url;
 std::vector<wqn::OpenCodeEvent> delivered;
@@ -33,6 +35,7 @@ std::vector<Packet> packets;
 std::vector<Action> actions;
 struct Scenario {
     int reads = 0, max_reads = 7202, status = 200, reply_failures = 0;
+    int header_egains = 0, header_step_ms = 1;
     bool fail_init = false, fail_headers = false, fail_timeout_config = false;
     std::function<void()> reply_hook;
 } scenario;
@@ -52,6 +55,7 @@ void Check(bool pass, const char* message)
 }
 void HostLog(const char*, const char*, ...) {}
 int64_t esp_timer_get_time() { return clock_ms * 1000; }
+void vTaskDelay(TickType_t ticks) { clock_ms += ticks; }
 
 HostClient* esp_http_client_init(const esp_http_client_config_t* config)
 {
@@ -76,10 +80,12 @@ int esp_http_client_set_timeout_ms(HostClient* client, int ms)
 int esp_http_client_open(HostClient* client, int)
 {
     if (client->stream) ++stream_opens;
+    else ++json_opens;
     return ESP_OK;
 }
 int esp_http_client_write(HostClient* client, const char* bytes, int size)
 {
+    if (!client->stream) json_written_bytes += size;
     if (client->stream) { ++run_posts; submitted_body.assign(bytes, size); }
     else if (client->url.find("/interrupt") != std::string::npos) ++interrupts;
     else { ++reply_posts; reply_url = client->url; }
@@ -87,15 +93,23 @@ int esp_http_client_write(HostClient* client, const char* bytes, int size)
 }
 int64_t esp_http_client_fetch_headers(HostClient* client)
 {
+    ++header_calls;
+    if (scenario.header_egains > 0) {
+        --scenario.header_egains;
+        clock_ms += std::min(scenario.header_step_ms, client->timeout_ms);
+        return -ESP_ERR_HTTP_EAGAIN;
+    }
+    if (scenario.fail_headers) return -1;
     if (client->stream) {
         client->status = scenario.status;
-        if (scenario.fail_headers) return -1;
         if (client->status != 200) client->response = "{\"success\":false,\"error\":{\"code\":\"run_in_progress\",\"message\":\"already running\"}}";
     } else {
         if (scenario.reply_hook && client->url.find("/interrupt") == std::string::npos) {
             auto hook = std::move(scenario.reply_hook); scenario.reply_hook = {}; hook();
         }
-        if (client->url.find("/interrupt") != std::string::npos) {
+        if (client->url.find("/agent/transcribe") != std::string::npos) {
+            client->response = "{\"success\":true,\"data\":{\"transcript\":\"recognized synthetic input\"}}";
+        } else if (client->url.find("/interrupt") != std::string::npos) {
             client->response = "{\"success\":true,\"data\":{\"interrupted\":false}}";
         } else if (scenario.reply_failures > 0) {
             --scenario.reply_failures;
@@ -139,6 +153,7 @@ int esp_http_client_close(HostClient* client) { if (client->stream) ++closes; re
 int esp_http_client_cleanup(HostClient* client)
 {
     if (client->stream) ++cleanups;
+    else ++json_cleanups;
     --live_clients;
     delete client;
     return ESP_OK;
@@ -167,6 +182,7 @@ void Reset()
     Check(live_clients == 0, "prior stream released all HTTP clients");
     clock_ms = 0;
     inits = stream_opens = run_posts = reply_posts = interrupts = closes = cleanups = peak_clients = failed_replies = 0;
+    header_calls = json_opens = json_written_bytes = json_cleanups = 0;
     scenario = {};
     submitted_body.clear(); reply_url.clear(); delivered.clear(); packets.clear(); actions.clear();
     cancel_requested = cancel_delivered = switch_requested = switch_delivered = false;
@@ -410,6 +426,28 @@ int main()
         Check(inits == 0, "partial run body never reaches network initialization");
     }
     cJSON_InitHooks(nullptr);
+    Reset();
+    scenario.header_egains = 2;
+    std::vector<int16_t> samples(16000, 123);
+    wqn::AudioCaptureChunk audio;audio.samples=samples.data();audio.sample_count=samples.size();audio.duration_ms=1000;
+    std::string transcript;
+    Check(wqn::TranscribeOpenCodeAudio("synthetic-device-token",audio,&transcript,&result)==ESP_OK &&
+          transcript=="recognized synthetic input", "temporary ASR response-header wait continues the same request");
+    Check(header_calls==3 && inits==1 && json_opens==1 && json_written_bytes==32000 && json_cleanups==1 && live_clients==0,
+          "header wait never reopens or resends captured PCM");
+    Reset();scenario.header_egains=2;
+    Event(1000,"agent.accepted");Event(2000,"agent.status",R"({"status":"idle"})");
+    Check(Run(&result)==ESP_OK && header_calls==3 && run_posts==1 && stream_opens==1,
+          "temporary stream response-header wait never resubmits a run");
+    OneRunOnly();
+    Reset();scenario.header_egains=1000;scenario.header_step_ms=1000;
+    Check(wqn::TranscribeOpenCodeAudio("synthetic-device-token",audio,&transcript,&result)==ESP_ERR_TIMEOUT &&
+          clock_ms>=120000 && clock_ms<=120002, "ASR header retries obey one absolute 120 second budget");
+    Check(inits==1 && json_opens==1 && json_written_bytes==32000 && json_cleanups==1 && live_clients==0,
+          "exhausted header wait preserves one submitted exchange and cleans its client");
+    Reset();scenario.fail_headers=true;
+    Check(wqn::TranscribeOpenCodeAudio("synthetic-device-token",audio,&transcript,&result)==ESP_FAIL && header_calls==1,
+          "permanent header failure is not mistaken for temporary waiting");
     owner_probe::Test();
     std::printf("Agent stream/client: %zu checks, %zu failures; %zu builder allocation sites (virtual HTTP/time; NOT HIL)\n", checks, failures, sites);
     return failures == 0 ? 0 : 1;

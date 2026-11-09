@@ -33,6 +33,11 @@ def cases():
         result.append(Case(f'word-upload-store-{mutation}', 'Word upload: reject incompatible read/write limits and cursorless local retry',
                            'controls', ('test_word_upload_store.py', '--mutation', mutation), r'^FAIL upload-store:',
                            r'Word upload/store: \d+ checks, [1-9]\d* failures \(full production store/upload/protocol/retry; libc \+ worker/transport ports; NOT HIL\)'))
+    result.append(Case('sdk_header_resume', 'Agent: installed SDK parser retains partial headers across temporary waiting',
+                       'runtime', ('test_sdk_header_resume.py',)))
+    result.append(Case('agent-no-header-wait', 'Agent: temporary header waiting cannot fail or resubmit accepted requests', 'controls',
+                       ('test_agent_run_progress.py', '--mutation', 'no-header-wait'), r'^FAIL ',
+                       r'Agent stream/client: \d+ checks, [1-9]\d* failures;'))
     result.append(Case('sdk_stream_poll', 'STD ASR: installed SDK read cannot widen a short poll in its data callback',
                        'runtime', ('test_sdk_stream_poll.py',)))
     result.append(Case('sdk-stream-full-read-budget', 'STD ASR: detect the post-terminal SDK fill-buffer stall', 'controls',

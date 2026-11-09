@@ -18,6 +18,8 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "agent_run_progress.h"
 #include "services/connectivity_service.h"
 #include "sse_chunk.h"
@@ -220,16 +222,51 @@ void ParseErrorBody(const std::string& body, wqn::OpenCodeResult* result)
     cJSON_Delete(root);
 }
 
+esp_err_t WaitForResponseHeaders(
+    esp_http_client_handle_t client,
+    int64_t deadline_us,
+    wqn::OpenCodeResult* result)
+{
+    uint32_t polls = 0;
+    for (;;) {
+        if (!wqn::services::IsConnectivityOnline()) {
+            SetResultError(result, 0, "network_lost", "网络已断开，请重试");
+            return ESP_FAIL;
+        }
+        const int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            SetResultError(result, 0, "network_error", "等待服务器响应超时，请重试");
+            ESP_LOGW(kTag, "Agent response header deadline: polls=%lu", static_cast<unsigned long>(polls));
+            return ESP_ERR_TIMEOUT;
+        }
+        if (esp_http_client_set_timeout_ms(client, static_cast<int>(remaining_ms)) != ESP_OK) {
+            SetResultError(result, 0, "network_error", "连接暂时不可用，请重试");
+            return ESP_FAIL;
+        }
+        ++polls;
+        const int64_t fetched = esp_http_client_fetch_headers(client);
+        if (fetched >= 0) return ESP_OK;
+        // ESP-IDF preserves its parser across a timed/quiet header read.
+        // Continue the SAME exchange; replaying open/write could duplicate a
+        // session, transcription or run that the server already accepted.
+        if (fetched != -ESP_ERR_HTTP_EAGAIN) {
+            SetResultError(result, 0, "network_error", "服务器响应中断，请重试");
+            ESP_LOGW(kTag, "Agent response headers failed: result=%lld polls=%lu",
+                     static_cast<long long>(fetched), static_cast<unsigned long>(polls));
+            return ESP_FAIL;
+        }
+        vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(1)));
+    }
+}
+
 esp_err_t FinishJsonRequest(
     esp_http_client_handle_t client,
     std::string* body,
-    wqn::OpenCodeResult* result)
+    wqn::OpenCodeResult* result,
+    int64_t deadline_us)
 {
-    const int content_length = esp_http_client_fetch_headers(client);
-    if (content_length < 0) {
-        SetResultError(result, 0, "network_error", "Response headers are incomplete");
-        return ESP_FAIL;
-    }
+    const esp_err_t headers = WaitForResponseHeaders(client, deadline_us, result);
+    if (headers != ESP_OK) return headers;
     const int status = esp_http_client_get_status_code(client);
     if (result != nullptr) {
         result->http_status = status;
@@ -257,6 +294,7 @@ esp_err_t OpenJsonRequest(
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.buffer_size = 2048;
     config.buffer_size_tx = 1024;
+    const int64_t header_deadline_us = esp_timer_get_time() + config.timeout_ms * 1000LL;
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {
         return ESP_ERR_NO_MEM;
@@ -276,7 +314,7 @@ esp_err_t OpenJsonRequest(
         }
     }
     if (request_result == ESP_OK) {
-        request_result = FinishJsonRequest(client, response_body, result);
+        request_result = FinishJsonRequest(client, response_body, result, header_deadline_us);
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
@@ -475,8 +513,8 @@ esp_err_t ReadAgentEventStream(const AgentStreamRequest& request)
         }
     }
     if (request_result == ESP_OK) {
-        const int64_t header_result = esp_http_client_fetch_headers(client);
-        request_result = header_result < 0 ? ESP_FAIL : ESP_OK;
+        const int64_t header_deadline_us = esp_timer_get_time() + config.timeout_ms * 1000LL;
+        request_result = WaitForResponseHeaders(client, header_deadline_us, request.result);
         request.result->http_status = esp_http_client_get_status_code(client);
         if (request_result == ESP_OK &&
             (request.result->http_status < 200 ||
@@ -790,6 +828,7 @@ esp_err_t TranscribeOpenCodeAudio(
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.buffer_size = 2048;
     config.buffer_size_tx = 2048;
+    const int64_t header_deadline_us = esp_timer_get_time() + config.timeout_ms * 1000LL;
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {
         return ESP_ERR_NO_MEM;
@@ -829,7 +868,7 @@ esp_err_t TranscribeOpenCodeAudio(
     }
     std::string body;
     if (request_result == ESP_OK) {
-        request_result = FinishJsonRequest(client, &body, result);
+        request_result = FinishJsonRequest(client, &body, result, header_deadline_us);
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
